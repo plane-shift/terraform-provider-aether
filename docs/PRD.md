@@ -27,12 +27,13 @@ Every API resource maps to a Terraform resource or data source:
 |---|---|---|---|
 | Organization | `aether_organization` | `aether_organization` (by slug) | name, slug, billing_email, vat_id |
 | Cluster | `aether_cluster` | `aether_cluster` / `aether_clusters` | name, region, k8s_version, endpoint (computed) |
-| Node Pool | `aether_node_pool` | `aether_node_pool` / `aether_node_pools` | cluster_id, name, machine_tier, min_nodes, max_nodes, desired_nodes |
+| Node Pool | `aether_node_pool` | `aether_node_pool` / `aether_node_pools` | cluster_id, name, vcpus, memory_gb, disk_gb, plan (optional), desired_nodes, min/max_nodes, autoscaling budget (min/max_vcpus, min/max_memory_gb), node_labels, node_taints, drain_timeout_seconds (optional, 30–3600, unset ⇒ platform default 600) |
 | Cluster Network | `aether_cluster_network` | `aether_cluster_network` | cluster_id, authorized_cidrs |
 | Member | `aether_organization_member` | `aether_organization_members` | org_id, email, role |
 | API Token | `aether_api_token` | — | org_id, name, scopes, token (sensitive, computed, write-once) |
 | Webhook | `aether_webhook` | `aether_webhooks` | org_id, url, events, secret (sensitive) |
-| Registry Robot Account | `aether_harbor_robot_account` | `aether_harbor_robot_accounts` | cluster_id, name, permissions |
+| Registry | `aether_registry` | `aether_registries` | org_id, quota_gb, status (computed) |
+| Registry Robot Account | `aether_harbor_robot_account` | `aether_harbor_robot_accounts` | org_id, name, permissions |
 
 **Read-only data sources** (no corresponding resource — not user-creatable):
 
@@ -83,17 +84,21 @@ resource "aether_node_pool" "workers" {
   organization_id = data.aether_organization.main.id
   cluster_id      = aether_cluster.production.id
   name            = "default-workers"
-  machine_tier    = "medium"        # 4 vCPU, 16 GB
+  vcpus           = 4
+  memory_gb       = 16
+  disk_gb         = 100
   min_nodes       = 2
   max_nodes       = 8
   desired_nodes   = 3
 }
 
-resource "aether_node_pool" "highmen" {
+resource "aether_node_pool" "highmem" {
   organization_id = data.aether_organization.main.id
   cluster_id      = aether_cluster.production.id
   name            = "highmem"
-  machine_tier    = "large"         # 8 vCPU, 32 GB
+  vcpus           = 8
+  memory_gb       = 32
+  disk_gb         = 200
   min_nodes       = 1
   max_nodes       = 4
   desired_nodes   = 1
@@ -159,10 +164,10 @@ Every mutable resource response follows this structure:
   },
 
   "_computed": {
-    "endpoint": "https://production.k8s.eu-de.aether.cloud:6443",
+    "endpoint": "https://production.k8s.eu-de.aetherplatform.cloud:6443",
     "status": "running",
     "keycloak_realm": "production",
-    "harbor_project": "production",
+    "harbor_project": "production",  // deprecated — registry is now org-scoped
     "lb_subnet": "10.100.3.0/24"
   }
 }
