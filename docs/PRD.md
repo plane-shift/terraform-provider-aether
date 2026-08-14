@@ -164,7 +164,7 @@ Every mutable resource response follows this structure:
   },
 
   "_computed": {
-    "endpoint": "https://production.k8s.eu-fi.aetherplatform.cloud:6443",
+    "endpoint": "https://production.acme.eu-fi.aetherplatform.cloud:6443",
     "status": "running",
     "keycloak_realm": "production",
     "harbor_project": "production",  // deprecated — registry is now org-scoped
