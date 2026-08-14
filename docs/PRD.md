@@ -61,7 +61,7 @@ terraform {
 
 provider "aether" {
   api_token = var.aether_api_token
-  region    = "eu-de"               # regional API endpoint
+  region    = "eu-fi"               # regional API endpoint
 }
 
 # Organization is typically imported, not created via Terraform
@@ -73,7 +73,7 @@ data "aether_organization" "main" {
 resource "aether_cluster" "production" {
   organization_id = data.aether_organization.main.id
   name            = "production"
-  region          = "eu-de"
+  region          = "eu-fi"
   k8s_version     = "1.31"
 
   # No node pools here — they are separate resources
@@ -159,12 +159,12 @@ Every mutable resource response follows this structure:
 
   "_configured": {
     "name": "production",
-    "region": "eu-de",
+    "region": "eu-fi",
     "k8s_version": "1.31"
   },
 
   "_computed": {
-    "endpoint": "https://production.k8s.eu-de.aetherplatform.cloud:6443",
+    "endpoint": "https://production.k8s.eu-fi.aetherplatform.cloud:6443",
     "status": "running",
     "keycloak_realm": "production",
     "harbor_project": "production",  // deprecated — registry is now org-scoped
