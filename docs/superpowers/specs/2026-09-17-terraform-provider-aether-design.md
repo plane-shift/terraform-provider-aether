@@ -114,7 +114,10 @@ validation error into an attribute-scoped diagnostic (path from `field`), a 409 
 conflict diagnostic on the resource, 401/403 into one provider-level message ("check
 api_token / organization_id"), 404 on a **resource** Read into "remove from state", 404 on
 a **data source** Read into a "not found" error. Transport: 429 is retried for every method
-(the server rejected the request before acting); 5xx and transport errors are retried 3× with
+because it is always pre-execution — aether-api's rate limiter is a router-level middleware
+mounted before any handler (`internal/api/router.go`: `r.Use(middleware.RateLimiter(…))`), so a
+429 never reaches a handler and cannot have side effects; the provider's contract test pins this
+by asserting the middleware is still mounted at the router level when the spec is re-vendored; 5xx and transport errors are retried 3× with
 backoff **only for idempotent methods** (GET/PUT/DELETE/HEAD). POST (`/clusters`, `/upgrade`,
 `/rotate-secret`, `/registry`, robot accounts, policies) is never replayed: a POST that fails
 after the server may have acted surfaces the error, and the next `terraform apply` reconciles
