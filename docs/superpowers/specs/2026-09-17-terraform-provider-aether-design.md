@@ -116,8 +116,10 @@ api_token / organization_id"), 404 on a **resource** Read into "remove from stat
 a **data source** Read into a "not found" error. Transport: 429 is retried for every method
 because it is always pre-execution — aether-api's rate limiter is a router-level middleware
 mounted before any handler (`internal/api/router.go`: `r.Use(middleware.RateLimiter(…))`), so a
-429 never reaches a handler and cannot have side effects; the provider's contract test pins this
-by asserting the middleware is still mounted at the router level when the spec is re-vendored; 5xx and transport errors are retried 3× with
+429 never reaches a handler and cannot have side effects. That invariant belongs to aether-api
+and is guarded THERE (router-level test, aether-api follow-up issue), not by this provider —
+the provider documents its reliance on it in the retry code and in the changelog for any
+`OPENAPI_REF` bump; 5xx and transport errors are retried 3× with
 backoff **only for idempotent methods** (GET/PUT/DELETE/HEAD). POST (`/clusters`, `/upgrade`,
 `/rotate-secret`, `/registry`, robot accounts, policies) is never replayed: a POST that fails
 after the server may have acted surfaces the error, and the next `terraform apply` reconciles
