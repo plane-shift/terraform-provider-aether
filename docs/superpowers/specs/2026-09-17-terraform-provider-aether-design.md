@@ -75,10 +75,13 @@ provider "aether" {
 }
 ```
 
-`Configure` builds the client with `Authorization: Bearer <token>`, then resolves the
-organization: if `organization_id` is set it is used as-is; otherwise `GET /api/v1/organizations`
-must return exactly one organization, which is used; zero or several → a diagnostic naming
-the count and asking for `organization_id`. Two organizations in one root module use two
+`api_token` is `Sensitive` in the schema (masked in CLI output) and is never written to
+diagnostics or logs — messages name the attribute, never its value. `Configure` builds the
+client with `Authorization: Bearer <token>`, then resolves the organization: if
+`organization_id` is set it is **validated** with `GET /api/v1/organizations/{id}` (a 403/404
+means the token does not belong to that organization → diagnostic); otherwise
+`GET /api/v1/organizations` must return exactly one organization, which is used; zero or
+several → a diagnostic naming the count and asking for `organization_id`. Two organizations in one root module use two
 provider aliases with two tokens (tokens are per-organization by construction).
 
 ### 3.2 Generated client
@@ -98,8 +101,8 @@ polls until the read returns 404. Timeouts come from the framework `timeouts` bl
 ### 3.4 Version helper
 
 `versions.SemanticallyEqual(configured, actual string) bool`: true when both parse as
-`MAJOR.MINOR[.PATCH]` and the minor matches, and either the configured value has no patch
-or the patches are equal. Used as the `k8s_version` semantic-equality function so `1.37`
+`MAJOR.MINOR[.PATCH]`, the **major and minor** both match, and either the configured value
+has no patch or the patches are equal. Used as the `k8s_version` semantic-equality function so `1.37`
 in HCL versus `1.37.0` from the API is not drift. `versions.IsForward(from, to)` guards
 upgrades (§4.1).
 
@@ -109,9 +112,14 @@ The API answers 4xx with `ErrorResponse{error{code, message, details?}}` and 422
 `ValidationError{…, errors[]{field, code, message}}`. `errors.ToDiagnostics` turns each
 validation error into an attribute-scoped diagnostic (path from `field`), a 409 into a
 conflict diagnostic on the resource, 401/403 into one provider-level message ("check
-api_token / organization_id"), 404 on Read into "remove from state". Transport: 429 retried
-honouring `Retry-After`, 5xx/transport errors retried 3× with backoff, then surfaced with
-the request id when present.
+api_token / organization_id"), 404 on a **resource** Read into "remove from state", 404 on
+a **data source** Read into a "not found" error. Transport: 429 is retried for every method
+(the server rejected the request before acting); 5xx and transport errors are retried 3× with
+backoff **only for idempotent methods** (GET/PUT/DELETE/HEAD). POST (`/clusters`, `/upgrade`,
+`/rotate-secret`, `/registry`, robot accounts, policies) is never replayed: a POST that fails
+after the server may have acted surfaces the error, and the next `terraform apply` reconciles
+through Read (a 409 on a name-based create is surfaced with the API's message — adopting an
+existing resource is `terraform import`, never an automatic merge).
 
 ## 4. Resources
 
@@ -130,7 +138,9 @@ Configured: `name`, `region` (**replace**), `k8s_version`, `public_endpoint` (de
 - Create: `POST /clusters` → wait until status is `running` (success) or `failed`. Live
   `ClusterStatus` = `provisioning | running | upgrading | degraded | deleting | failed`;
   `degraded` is treated as terminal-with-warning (the resource is usable; a warning
-  diagnostic carries `status_message`).
+  diagnostic carries `status_message`). The same rule applies after an upgrade. PRD §7.2.5
+  still lists `deleted` and omits `degraded`/`upgrading`; it is corrected in the docs wave
+  (Task 17) to the live enum, and the wait helper's tests cover the warning path.
 - Update: `name`/`public_endpoint` via `PUT`. A `k8s_version` change goes through
   `POST /upgrade` with `target_version`, then waits; the plan phase refuses a backwards
   change (`IsForward` false) with a diagnostic. `k8s_version` is stored as configured and
@@ -169,8 +179,9 @@ documented on the resource.
 
 The token's organization. Configured: `name`, `slug`, `billing_email`, `vat_id`; computed
 `plan`, timestamps. Create is **refused** ("organizations are created at registration;
-import yours") and Delete is refused likewise; the resource exists to manage the mutable
-fields and always enters state via import.
+import yours"). Delete is **state-only**: it succeeds and removes the resource from state
+without calling the API (an organization is never deleted by Terraform), and the docs say so.
+The resource exists to manage the mutable fields and always enters state via import.
 
 ### 4.5 `aether_organization_member`
 
@@ -193,6 +204,10 @@ Singleton per organization. Create = `POST /registry` (enable); Delete = `DELETE
 
 ### 4.8 `aether_registry_robot_account`
 
+Named `registry_…`, not the PRD's `aether_harbor_robot_account`: the platform rule is to never
+expose the underlying technology in names (same reason resources are `aether-*`, not `ceph-*`).
+Intentional rename; PRD §7.2.2 is corrected in the docs wave.
+
 `name`, `permissions`; computed `secret` (sensitive, write-once), `harbor_id`,
 `last_used_at`. No update endpoint → every change forces replacement.
 
@@ -210,8 +225,10 @@ Singleton: `monthly_limit_eur`, `thresholds_pct`. Create/Update `PUT`, Delete `D
 `aether_organization`, `aether_regions`, `aether_k8s_versions` (`version`, `label`,
 `patch`), `aether_cluster` (by `id` or by `name`), `aether_clusters`, `aether_node_pool`,
 `aether_node_pools`, `aether_node_pool_machines`, `aether_cluster_network`,
-`aether_kubeconfig` (`content`, sensitive — the admin kubeconfig that converges on the
-public endpoint), `aether_loadbalancers`, `aether_cluster_volumes`,
+`aether_kubeconfig` (`content`, sensitive — the cluster's **admin** kubeconfig, the same
+artefact the portal downloads, which converges on the public endpoint; it is privileged, so the
+docs say to treat the state file as a secret. PRD §7.2.4 calls it "OIDC" and is corrected in the
+docs wave), `aether_loadbalancers`, `aether_cluster_volumes`,
 `aether_organization_members`, `aether_webhooks`, `aether_registry`,
 `aether_registry_repositories`, `aether_registry_repository_tags`,
 `aether_registry_robot_accounts`, `aether_registry_cleanup_policies`, `aether_audit_log`,
@@ -232,7 +249,8 @@ Framework `timeouts` block on cluster and node pool: create 30 m, update 30 m, d
 | 422 validation | attribute-scoped diagnostics from `errors[].field` |
 | 409 conflict | resource-level diagnostic with the API message |
 | 401 / 403 | one provider-level diagnostic: check `api_token` / `organization_id` |
-| 404 on Read | remove from state (also the delete-completion signal) |
+| 404 on a resource Read | remove from state (also the delete-completion signal) |
+| 404 on a data source Read | error "not found" (never silently empty) |
 | 429 | retry honouring `Retry-After` |
 | 5xx / transport | 3 retries with backoff, then surface with request id |
 | terminal `failed` | error with `status_message`; resource stays in state |

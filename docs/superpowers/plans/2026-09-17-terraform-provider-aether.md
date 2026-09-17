@@ -246,6 +246,22 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/organizations/") && strings.Count(path, "/") == 2:
+		id := strings.TrimPrefix(path, "/organizations/")
+		s.mu.Lock()
+		var found *Org
+		for i := range s.orgs {
+			if s.orgs[i].ID == id {
+				found = &s.orgs[i]
+			}
+		}
+		s.mu.Unlock()
+		if found == nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "organization not found"}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": found.ID, "name": found.Name, "slug": found.Slug, "plan": "free",
+			"created_at": "2026-09-17T00:00:00Z", "updated_at": "2026-09-17T00:00:00Z"})
 	case r.Method == http.MethodGet && path == "/organizations":
 		s.mu.Lock()
 		items := make([]map[string]any, 0, len(s.orgs))
@@ -321,8 +337,9 @@ func TestConfigure_ResolvesTheSingleOrganization(t *testing.T) {
 	}
 }
 
-func TestConfigure_ExplicitOrganizationSkipsLookup(t *testing.T) {
+func TestConfigure_ExplicitOrganizationIsValidatedNotListed(t *testing.T) {
 	api := fakeapi.New(t)
+	api.AddOrg("org-explicit", "Acme", "acme")
 	resp, pd := configure(t, api.URL(), api.Token(), "org-explicit")
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("diagnostics: %v", resp.Diagnostics)
@@ -330,10 +347,26 @@ func TestConfigure_ExplicitOrganizationSkipsLookup(t *testing.T) {
 	if pd.OrgID != "org-explicit" {
 		t.Fatalf("OrgID = %q", pd.OrgID)
 	}
+	var listed, validated bool
 	for _, r := range api.Requests() {
 		if r.Path == "/organizations" {
-			t.Fatalf("organizations were listed although organization_id was set")
+			listed = true
 		}
+		if r.Path == "/organizations/org-explicit" {
+			validated = true
+		}
+	}
+	if listed || !validated {
+		t.Fatalf("listed=%v validated=%v; want GET /organizations/{id} only", listed, validated)
+	}
+}
+
+func TestConfigure_ExplicitOrganizationTheTokenCannotSeeIsRejected(t *testing.T) {
+	api := fakeapi.New(t)
+	api.AddOrg("org-1", "Acme", "acme")
+	resp, _ := configure(t, api.URL(), api.Token(), "org-other") // fake answers 404 for unknown orgs
+	if !resp.Diagnostics.HasError() || !contains(resp.Diagnostics.Errors()[0].Detail(), "organization_id") {
+		t.Fatalf("expected an organization_id error, got %v", resp.Diagnostics)
 	}
 }
 
@@ -495,7 +528,19 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		return
 	}
 
-	if orgID == "" {
+	if orgID != "" {
+		// Validate the override: the token belongs to exactly one organization.
+		g, err := c.GetOrganizationWithResponse(ctx, orgID)
+		if err != nil {
+			resp.Diagnostics.AddError("Cannot reach the Aether API", fmt.Sprintf("GET %s/api/v1/organizations/%s: %s", endpoint, orgID, err))
+			return
+		}
+		if g.StatusCode() != http.StatusOK {
+			resp.Diagnostics.AddAttributeError(path.Root("organization_id"), "organization_id is not visible to this token",
+				fmt.Sprintf("The API answered %s for organization %s. The token belongs to one organization; omit organization_id to use it.", g.Status(), orgID))
+			return
+		}
+	} else {
 		list, err := c.ListOrganizationsWithResponse(ctx, nil)
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot reach the Aether API", fmt.Sprintf("GET %s/api/v1/organizations: %s", endpoint, err))
@@ -2090,11 +2135,11 @@ Adjust to the generated types: if `CreatedAt` is `time.Time` use `.Format`, if `
 
 **Files:** Create `resource_organization.go`, `resource_organization_member.go`; register; tests + fake routes (`GET/PUT /organizations/{id}`; members CRUD under `/organizations/{id}/members[/{mid}]`).
 
-**Organization schema:** `id` P · `name`, `slug`, `billing_email`, `vat_id` Optional+Computed String (UseStateForUnknown) · `plan`, `created_at`, `updated_at` P. Create is REFUSED: `resp.Diagnostics.AddError("Organizations are created at registration", "Import your organization instead: terraform import aether_organization.<name> <organization id> (data.aether_organization exposes the id).")`. Delete is REFUSED with a parallel message (removing it from state requires `terraform state rm`). Update → PUT changed fields. Import passthrough.
+**Organization schema:** `id` P · `name`, `slug`, `billing_email`, `vat_id` Optional+Computed String (UseStateForUnknown) · `plan`, `created_at`, `updated_at` P. Create is REFUSED: `resp.Diagnostics.AddError("Organizations are created at registration", "Import your organization instead: terraform import aether_organization.<name> <organization id> (data.aether_organization exposes the id).")`. Delete is STATE-ONLY: it makes no API call and returns success (the framework removes the resource from state); the schema description says "destroy only forgets the organization; it is never deleted". Update → PUT changed fields. Import passthrough.
 
 **Member schema:** `id` P · `email` Required+R · `role` Required, `stringvalidator.OneOf("owner","admin","member","viewer")` · `invited_by`, `accepted_at`, `created_at` P.
 
-- [ ] **Step 1 [TEST-WRITER]:** organization: `resource "aether_organization" "o" { name = "Acme" }` without import → `ExpectError` "created at registration"; import then update `name` → PUT; destroy step expects an error. Member: create → POST body `{email, role}`; role change → PUT; email change → replace; delete → DELETE; import by id.
+- [ ] **Step 1 [TEST-WRITER]:** organization: `resource "aether_organization" "o" { name = "Acme" }` without import → `ExpectError` "created at registration"; import then update `name` → PUT; destroy succeeds and makes NO DELETE request (assert on `api.Requests()`). Member: create → POST body `{email, role}`; role change → PUT; email change → replace; delete → DELETE; import by id.
 - [ ] **Step 2:** RED. **Step 3 [CODER]:** implement. **Step 4:** PASS. **Step 5:** commit `feat: aether_organization (import-only) and aether_organization_member`.
 
 ---
@@ -2274,7 +2319,7 @@ func (d *regionsDataSource) Read(ctx context.Context, _ datasource.ReadRequest, 
 | `aether_cost_breakdown` | `GetCostBreakdownWithResponse` | — | fields of `CostBreakdown` |
 | `aether_invoices` | `collectAll(ListInvoices…)` | — | `invoices[]` (fields of `Invoice`) |
 
-Same reference implementation as Task 13. The implementer reads the exact nested field names from `client.gen.go` for `Repository`, `Tag`, `VulnSummary`, `AuditEvent`, `UsageSummary`, `CostBreakdown`, `Invoice` and mirrors them 1:1 in snake_case.
+Same reference implementation as Task 13. A 404 from any data-source read is an ERROR ("not found"), never an empty result. The implementer reads the exact nested field names from `client.gen.go` for `Repository`, `Tag`, `VulnSummary`, `AuditEvent`, `UsageSummary`, `CostBreakdown`, `Invoice` and mirrors them 1:1 in snake_case.
 
 - [ ] **Steps 1–5** as Task 13; commit `feat: organization, registry and billing data sources`.
 
@@ -2510,6 +2555,8 @@ jobs:
 ### Task 17: aether-docs Terraform/OpenTofu section + PRD §7.2 correction
 
 **Files (aether-docs repo, worktree off `origin/main`):** Create `site/src/content/docs/guides/terraform.md` (getting started: install for Terraform and OpenTofu, create an API token in the portal, provider block, cluster + pool example, import your organization, dev endpoint note); Modify `docs/PRD.md` §7.2.2–7.2.4 (resource table: drop `aether_api_token`, `machine_tier`; region `eu-fi`; provider-level org; live field names; note that `readOnly` is not what marks computed fields — the provider decides); re-extract §7 into `aether-api/docs/PRD.md` and `terraform-provider-aether/docs/PRD.md` per CLAUDE.md's PRD workflow; `docs/progress.md` + `progress.html` session row.
+
+Also in PRD §7.2: terminal states per the live enum (`running`, `degraded`, `failed`; `deleting` transient; no `deleted`), the `registry_` naming of robot accounts (never expose the underlying technology), and `aether_kubeconfig` = the admin kubeconfig (privileged), not "OIDC".
 
 - [ ] **Step 1 [CODER]:** edits + commits in each repo (docs PR to aether-docs; PRD-mirror PRs to aether-api and the provider). **Step 2 [TEST-RUNNER]:** `grep -rn 'machine_tier\|eu-de\|aether_api_token' aether-docs/docs/PRD.md terraform-provider-aether/docs/PRD.md` → no output. **Step 3:** PRs.
 
