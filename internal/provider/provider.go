@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -14,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/client"
+	"github.com/plane-shift/terraform-provider-aether/internal/provider/apierr"
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/transport"
 )
 
@@ -22,7 +24,16 @@ const defaultEndpoint = "https://api.aetherplatform.cloud"
 // providerData is what every resource and data source receives from Configure.
 type providerData struct {
 	Client *client.ClientWithResponses
-	OrgID  string
+	// OrgID is canonical UUID TEXT. Resource models carry ids as strings, so
+	// this is the form they copy into state.
+	OrgID string
+	// orgID is the same id in the form the generated client demands
+	// (client.OrgID = openapi_types.UUID). Parsed ONCE here, on whichever
+	// path resolved it, so no resource re-parses a value Configure has
+	// already validated and no call site needs error handling for it. Ids
+	// that arrive from STATE are a different case and are parsed per call:
+	// state is data from outside this process.
+	orgID client.OrgID
 }
 
 type aetherProvider struct{ version string }
@@ -68,6 +79,33 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	// An unknown value is not an absent one, and ValueString() flattens the
+	// difference to "". Left unchecked, an unknown api_token is reported as
+	// "missing" (wrong: it is not yet known) and an unknown organization_id
+	// falls through to auto-resolution, reaching the API before the value the
+	// practitioner configured even exists. Checked BEFORE the env fallback,
+	// because falling back to the environment would silently use a different
+	// organization than the one being configured.
+	for _, u := range []struct {
+		attr  string
+		value types.String
+		env   string
+	}{
+		{"api_token", cfg.APIToken, "AETHER_API_TOKEN"},
+		{"endpoint", cfg.Endpoint, "AETHER_ENDPOINT"},
+		{"organization_id", cfg.OrganizationID, "AETHER_ORGANIZATION_ID"},
+	} {
+		if u.value.IsUnknown() {
+			resp.Diagnostics.AddAttributeError(path.Root(u.attr),
+				"Unknown configuration value for "+u.attr,
+				fmt.Sprintf("The provider cannot create the Aether API client: %s is not yet known at configure time. "+
+					"Either target apply the source of the value first, set the value statically, or use the %s environment variable.", u.attr, u.env))
+		}
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	token := firstNonEmpty(cfg.APIToken.ValueString(), os.Getenv("AETHER_API_TOKEN"))
 	endpoint := firstNonEmpty(cfg.Endpoint.ValueString(), os.Getenv("AETHER_ENDPOINT"), defaultEndpoint)
 	orgID := firstNonEmpty(cfg.OrganizationID.ValueString(), os.Getenv("AETHER_ORGANIZATION_ID"))
@@ -77,7 +115,40 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		return
 	}
 
-	httpClient := &http.Client{Transport: transport.New(token, http.DefaultTransport)}
+	// The generated client types every organization id as a UUID, so an id that
+	// is not one cannot even be turned into a request path. Parse it HERE, at
+	// the boundary, before any call: a syntax error belongs on the
+	// organization_id attribute, not in a downstream encoding failure whose
+	// message names neither the attribute nor the value.
+	//
+	// providerData.OrgID stays a string - canonical UUID text - because every
+	// resource carries it around as configuration data; the parsed form rides
+	// alongside it as providerData.orgID, so the parse happens exactly once
+	// per Configure no matter which path below resolved the id.
+	var orgUUID client.OrgID
+	if orgID != "" {
+		if err := orgUUID.UnmarshalText([]byte(orgID)); err != nil {
+			resp.Diagnostics.AddAttributeError(path.Root("organization_id"), "Invalid organization_id",
+				fmt.Sprintf("organization_id must be a UUID: %q is not (%s). Copy the id from the Aether portal, or omit organization_id and the provider resolves the organization the token belongs to.", orgID, err))
+			return
+		}
+		// Canonicalise, so state holds the same text the API round-trips.
+		orgID = orgUUID.String()
+	}
+
+	httpClient := &http.Client{
+		Transport: transport.New(token, apiTransport()),
+		// An API client has no business following a 302, and here it would be
+		// a credential leak rather than merely wasted work: the retrying
+		// transport re-sets the bearer header on EVERY request it sees,
+		// including a redirected one to another host. The stdlib's own
+		// protection does not cover this - it strips Authorization only
+		// across different HOSTNAMES, ignoring the port, and it cannot strip
+		// a header a RoundTripper adds afterwards.
+		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			return fmt.Errorf("refusing to follow a redirect to %s: the Aether API does not redirect, and following one would send the API token to that host", req.URL.Redacted())
+		},
+	}
 	c, err := client.NewClientWithResponses(endpoint, client.WithHTTPClient(httpClient))
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot build API client", err.Error())
@@ -86,14 +157,38 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 
 	if orgID != "" {
 		// Validate the override: the token belongs to exactly one organization.
-		g, err := c.GetOrganizationWithResponse(ctx, orgID)
+		g, err := c.GetOrganizationWithResponse(ctx, orgUUID)
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot reach the Aether API", fmt.Sprintf("GET %s/api/v1/organizations/%s: %s", endpoint, orgID, err))
 			return
 		}
-		if g.StatusCode() != http.StatusOK {
+		// Three different causes, three different diagnostics. One fixed
+		// message blamed organization_id for a rejected token and for a
+		// transient server failure alike, sending the practitioner to edit a
+		// value that was never the problem.
+		switch {
+		case g.StatusCode() == http.StatusOK:
+		case g.StatusCode() == http.StatusUnauthorized || g.StatusCode() == http.StatusForbidden:
+			resp.Diagnostics.AddError("Aether API rejected the token",
+				fmt.Sprintf("The API answered %s. Check api_token (created in the portal): this status means the TOKEN was rejected, not that the organization is unknown.", g.Status()))
+			return
+		case g.StatusCode() == http.StatusNotFound:
 			resp.Diagnostics.AddAttributeError(path.Root("organization_id"), "organization_id is not visible to this token",
 				fmt.Sprintf("The API answered %s for organization %s. The token belongs to one organization; omit organization_id to use it.", g.Status(), orgID))
+			return
+		default:
+			resp.Diagnostics.AddError("Cannot validate the organization",
+				fmt.Sprintf("The Aether API answered %s for GET %s/api/v1/organizations/%s. That is neither a rejected token nor an unknown organization, so nothing in the provider block needs changing; retry, or check the API's status.",
+					g.Status(), endpoint, orgID))
+			return
+		}
+		// The generated parser fills JSON200 only when the response carries a
+		// JSON content type. A 200 of HTML is a captive portal or a proxy
+		// error page, not a confirmation that this organization exists.
+		if g.JSON200 == nil {
+			resp.Diagnostics.AddError("Aether API answered 200 without a JSON body",
+				fmt.Sprintf("GET %s/api/v1/organizations/%s returned %s with content type %q. Check that endpoint points at the Aether API and not at a proxy or login page.",
+					endpoint, orgID, g.Status(), g.HTTPResponse.Header.Get("Content-Type")))
 			return
 		}
 	} else {
@@ -109,7 +204,19 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 				"The API answered "+list.Status()+". Check api_token (created in the portal) and, if set, organization_id.")
 			return
 		default:
-			resp.Diagnostics.AddError("Cannot list organizations", list.Status()+": "+string(list.Body))
+			// Bounded and UTF-8-sanitised: the body here is whatever the far
+			// end sent, and an unbounded error page in a diagnostic is both
+			// unreadable and a protocol hazard.
+			resp.Diagnostics.AddError("Cannot list organizations",
+				list.Status()+": "+apierr.Truncate(string(list.Body), 200))
+			return
+		}
+		// Same guard on the auto-resolution path: without it a 200 carrying
+		// HTML dereferences a nil JSON200 and panics the provider.
+		if list.JSON200 == nil {
+			resp.Diagnostics.AddError("Aether API answered 200 without a JSON body",
+				fmt.Sprintf("GET %s/api/v1/organizations returned %s with content type %q. Check that endpoint points at the Aether API and not at a proxy or login page.",
+					endpoint, list.Status(), list.HTTPResponse.Header.Get("Content-Type")))
 			return
 		}
 		items := list.JSON200.Items
@@ -118,10 +225,13 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 				fmt.Sprintf("The token sees %d organizations; set organization_id explicitly.", len(items)))
 			return
 		}
-		orgID = items[0].Id
+		// Parse once, here, like the explicit path above: the client wants the
+		// UUID, the models want the text, and both come from this one value.
+		orgUUID = items[0].Id
+		orgID = orgUUID.String()
 	}
 
-	data := &providerData{Client: c, OrgID: orgID}
+	data := &providerData{Client: c, OrgID: orgID, orgID: orgUUID}
 	resp.ResourceData = data
 	resp.DataSourceData = data
 }
@@ -132,6 +242,27 @@ func (p *aetherProvider) Resources(context.Context) []func() resource.Resource {
 
 func (p *aetherProvider) DataSources(context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{} // filled task by task
+}
+
+// apiTransport is http.DefaultTransport with a bound on how long a host may
+// hold the connection open without answering. Without it, a host that
+// completes the TCP/TLS handshake and then sends nothing hangs terraform plan
+// forever: DefaultTransport bounds dialling and TLS, not the wait for response
+// headers.
+//
+// Deliberately NOT http.Client.Timeout, which would also bound the body and
+// so cap every long-running call; waiting for a slow operation is the wait
+// package's job, with its own timeouts.
+func apiTransport() http.RoundTripper {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Only reachable if something replaced DefaultTransport. Use it as-is
+		// rather than silently dropping whatever it does.
+		return http.DefaultTransport
+	}
+	t := base.Clone()
+	t.ResponseHeaderTimeout = 60 * time.Second
+	return t
 }
 
 func firstNonEmpty(vals ...string) string {
