@@ -308,7 +308,7 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}:
     parameters:
@@ -352,7 +352,7 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
     delete:
       tags: [Organizations]
       operationId: deleteOrganization
@@ -410,7 +410,7 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/members/{memberID}:
     parameters:
@@ -453,7 +453,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
     delete:
       tags: [Organizations]
       operationId: deleteMember
@@ -508,7 +508,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/api-tokens/{tokenID}:
     parameters:
@@ -593,7 +593,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/webhooks/{webhookID}:
     parameters:
@@ -639,7 +639,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
     delete:
       tags: [Webhooks]
       operationId: deleteWebhook
@@ -777,7 +777,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/tickets/{ticketID}:
     parameters:
@@ -828,7 +828,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/tickets/{ticketID}/messages:
     parameters:
@@ -883,7 +883,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/tickets/{ticketID}/attachments:
     parameters:
@@ -945,7 +945,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
         '503':
           description: Attachment storage is not configured.
 
@@ -1049,7 +1049,7 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
@@ -1096,7 +1096,7 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
     delete:
       tags: [Clusters]
       operationId: deleteCluster
@@ -1167,7 +1167,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/clusters/{clusterID}/kubeconfig:
     parameters:
@@ -1245,7 +1245,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
@@ -1500,7 +1500,7 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/clusters/{clusterID}/nodepools/{poolID}:
     parameters:
@@ -1547,7 +1547,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
     delete:
       tags: [Clusters]
       operationId: deleteNodePool
@@ -1621,7 +1621,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EnableRegistryResponse'
+                $ref: '#/components/schemas/EnableRegistryResult'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -1705,7 +1705,7 @@ paths:
     parameters:
       - $ref: '#/components/parameters/OrgID'
       - $ref: '#/components/parameters/RepoName'
-      - $ref: '#/components/parameters/Tag'
+      - $ref: '#/components/parameters/TagName'
     get:
       tags: [Registry]
       operationId: getTagScan
@@ -1772,7 +1772,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/registry/robot-accounts/{accountID}:
     parameters:
@@ -1845,7 +1845,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/registry/cleanup-policies/{policyID}:
     parameters:
@@ -1873,7 +1873,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
     delete:
       tags: [Registry]
       operationId: deleteCleanupPolicy
@@ -2043,7 +2043,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
     delete:
       tags: [Billing]
       operationId: deleteBudget
@@ -2156,7 +2156,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/organizations/{orgID}/billing/payment-methods/{pmID}:
     parameters:
@@ -2483,7 +2483,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/admin/tickets:
     get:
@@ -2605,7 +2605,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/admin/tickets/{ticketID}/messages:
     parameters:
@@ -2665,7 +2665,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
 
   /api/v1/admin/tickets/{ticketID}/attachments:
     parameters:
@@ -2725,7 +2725,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
-          $ref: '#/components/responses/ValidationError'
+          $ref: '#/components/responses/ValidationErrorResponse'
         '503':
           description: Attachment storage is not configured.
 
@@ -2857,7 +2857,7 @@ components:
       description: Repository name (org-scoped repo path segment).
       schema:
         type: string
-    Tag:
+    TagName:
       name: tag
       in: path
       required: true
@@ -2932,7 +2932,7 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-    ValidationError:
+    ValidationErrorResponse:
       description: Request validation failed.
       content:
         application/json:
@@ -4360,7 +4360,7 @@ components:
           type: string
           description: The robot secret. Shown only once.
 
-    EnableRegistryResponse:
+    EnableRegistryResult:
       type: object
       required: [registry, credentials]
       properties:
