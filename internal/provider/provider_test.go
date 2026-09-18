@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -451,5 +452,39 @@ func TestConfigure_DoesNotLeakADevelopersExportedToken(t *testing.T) {
 	}
 	if got := resp.Diagnostics.Errors()[0].Summary(); got != "Missing API token" {
 		t.Fatalf("summary = %q, want %q - a leaked exported AETHER_API_TOKEN reached the API instead of being rejected as absent", got, "Missing API token")
+	}
+}
+
+// endpointIsSafe decides whether the bearer token may be sent to an endpoint
+// at all, so every shape a practitioner might type is pinned here: the
+// scheme rule (https anywhere, http only on loopback) and the host rule
+// (a URL with no host is a configuration mistake, not a place to send a
+// token; "https:api.example.com" parses with an empty host).
+func TestEndpointIsSafe(t *testing.T) {
+	cases := []struct {
+		endpoint string
+		want     bool
+	}{
+		{"https://api.example.com", true},
+		{"https://api.example.com:8443/base", true},
+		{"http://localhost:8080", true},
+		{"http://127.0.0.1:1", true},
+		{"http://[::1]:1", true},
+		{"http://203.0.113.5", false},
+		{"http://api.example.com", false},
+		{"api.example.com", false},
+		{"https:///api", false},
+		{"https:api.example.com", false},
+		{"ftp://api.example.com", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		u, err := url.Parse(c.endpoint)
+		if err != nil {
+			t.Fatalf("url.Parse(%q): %v", c.endpoint, err)
+		}
+		if got := endpointIsSafe(u); got != c.want {
+			t.Errorf("endpointIsSafe(%q) = %v, want %v", c.endpoint, got, c.want)
+		}
 	}
 }

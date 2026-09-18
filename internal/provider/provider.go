@@ -127,6 +127,14 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 			fmt.Sprintf("endpoint %q is not a valid URL: %s", endpoint, err))
 		return
 	}
+	if endpointURL.Hostname() == "" {
+		// Separated from the insecure-scheme case: telling someone their
+		// endpoint is insecure when what it actually lacks is a host sends
+		// them to fix the wrong half of the string.
+		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Endpoint has no host",
+			fmt.Sprintf("endpoint %q has no host. Give a full URL such as %s — note that %q parses as a URL but names no host to connect to.", endpoint, defaultEndpoint, endpoint))
+		return
+	}
 	if !endpointIsSafe(endpointURL) {
 		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Insecure endpoint",
 			fmt.Sprintf("endpoint %q would send the API token in cleartext; plain http is accepted only for loopback endpoints (localhost or a loopback IP). Use https, or a loopback address when testing against a local API.", endpoint))
@@ -267,7 +275,17 @@ func (p *aetherProvider) DataSources(context.Context) []func() datasource.DataSo
 // or unknown scheme is refused too - "api.example.com" parses as a relative
 // URL with no scheme, which is a configuration mistake worth naming rather
 // than silently defaulting.
+//
+// A HOSTLESS url is refused for both schemes. url.Parse is permissive: it
+// accepts "https:///api" (authority present but empty) and
+// "https:api.example.com" (an OPAQUE url, where the host ends up in u.Opaque
+// and u.Host stays empty). Both used to pass this check and then failed much
+// later as "Cannot reach the Aether API", which names neither the attribute
+// nor the typo that caused it.
 func endpointIsSafe(u *url.URL) bool {
+	if u.Hostname() == "" {
+		return false
+	}
 	switch u.Scheme {
 	case "https":
 		return true

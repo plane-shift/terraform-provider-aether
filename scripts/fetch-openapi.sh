@@ -22,6 +22,15 @@ candidate="${1:-$(tr -d '[:space:]' < OPENAPI_REF)}"
   exit 1
 }
 
+# PyYAML is a hard prerequisite, not an optional nicety: the validation step
+# below is what stands between a truncated or HTML error-page download and a
+# committed spec. Checked BEFORE the fetch, so a missing module fails while
+# nothing has been written yet.
+python3 -c 'import yaml' 2>/dev/null || {
+  echo "PyYAML is required for spec validation (pip install pyyaml)" >&2
+  exit 1
+}
+
 mkdir -p api
 tmp="api/openapi.yaml.new"
 # Leave no half-written file behind on any exit path, including a failed fetch.
