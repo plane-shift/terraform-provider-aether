@@ -14,7 +14,7 @@
 
 - Module path `github.com/plane-shift/terraform-provider-aether`; provider type name `aether`; registry address `plane-shift/aether`; plugin protocol **v6**; supports Terraform 1.x and OpenTofu ≥ 1.6 — no engine-specific features (no ephemeral / write-only attributes).
 - Go `1.26.5` in `go.mod`. Library versions exactly as in Tech Stack (bump only via Dependabot PRs).
-- `internal/client/` is **generated only** (`go generate ./...`); CI fails on a generate diff. The vendored spec `api/openapi.yaml` is never hand-edited; `OPENAPI_REF` holds the full aether-api commit SHA it came from (initial: `03459f8f0c9edd982550e9f6ab3292bab5bb96c7`).
+- `internal/client/` is **generated only** (`go generate ./...`); CI fails on a generate diff. The vendored spec `api/openapi.yaml` is never hand-edited; `OPENAPI_REF` holds the full aether-api commit SHA it came from: **`8e9045a686060112ca27c4f73ce68844322b5c1b`** (aether-api #296). **Two earlier SHAs must never be re-pinned, and each fails at a DIFFERENT stage — measured with aether-api's `api/check-codegen.sh` against each spec:** at `03459f8` the **generator itself** exits 1 (`duplicate typename 'Tag' detected, can't auto-rename`), so no client is produced at all; at `8f03fbb` the generator exits 0 and the **client does not compile** (`client.gen.go: EnableRegistryResponse redeclared in this block`). A generator that succeeds is therefore not evidence the pin is usable — only a compile is.
 - Organization is **provider-level**: resources carry NO `organization_id`. API tokens are created in the portal; there is NO `aether_api_token` resource.
 - Out of scope: payment methods, tickets, admin routes, SSE streams, scan triggers, webhook tests, policy runs, invoice PDFs.
 - Field names are the live API's (`vcpus`, `memory_gb`, `disk_gb`, `min_vcpus`…), never the PRD example's (`machine_tier`, `eu-de`).
@@ -85,7 +85,7 @@ Generated client naming (oapi-codegen, from operationIds): types `client.Cluster
 - Test: `internal/provider/provider_test.go`
 
 **Interfaces:**
-- Produces: `provider.New(version string) func() provider.Provider`; `type providerData struct { Client *client.ClientWithResponses; OrgID string }` stored in `resp.ResourceData`/`resp.DataSourceData`; `fakeapi.New(t) *fakeapi.Server` with `URL()`, `Token()`, `AddOrg(id, name, slug)`; env vars `AETHER_API_TOKEN`, `AETHER_ENDPOINT`, `AETHER_ORGANIZATION_ID`.
+- Produces: `provider.New(version string) func() provider.Provider`; `type providerData struct { Client *client.ClientWithResponses; OrgID string; orgID client.OrgID }` stored in `resp.ResourceData`/`resp.DataSourceData`; `fakeapi.New(t) *fakeapi.Server` with `URL()`, `Token()`, `AddOrg(id, name, slug)`; env vars `AETHER_API_TOKEN`, `AETHER_ENDPOINT`, `AETHER_ORGANIZATION_ID`.
 - `github.com/oapi-codegen/runtime` **v1.7.0** is a required (direct) dependency — the generated client imports it.
 - **`providerData.OrgID` stays a `string`** holding canonical UUID text, because every resource carries it as configuration data; the generated client wants `client.OrgID` (= `openapi_types.UUID`), so `Configure` parses at the boundary. An explicit `organization_id` that is not a UUID is an **attribute error on `organization_id` raised BEFORE any API call** — not a 404 from a request that could never have been well-formed. `fakeapi` therefore registers real UUID text, and the tests assert on it.
 - Consumes: `internal/client` from Task 2 (Task 1 and 2 are executed together in one branch; Task 1's `Configure` compiles only after Task 2's generation — run Task 2 Steps 1–4 first if the tree does not compile, then return).
@@ -499,7 +499,12 @@ const defaultEndpoint = "https://api.aetherplatform.cloud"
 // providerData is what every resource and data source receives from Configure.
 type providerData struct {
 	Client *client.ClientWithResponses
-	OrgID  string
+	// OrgID is canonical UUID TEXT, which is what resource models carry.
+	OrgID string
+	// orgID is the same id in the form the generated client demands. Parsed
+	// ONCE here, so no resource re-parses a value Configure already validated
+	// and no call site needs error handling for it.
+	orgID client.OrgID
 }
 
 type aetherProvider struct{ version string }
@@ -545,6 +550,28 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	// An unknown value is not an absent one, and ValueString() flattens both to
+	// "". Checked BEFORE the env fallback: falling back would silently use a
+	// different organization than the one being configured.
+	for _, u := range []struct {
+		attr  string
+		value types.String
+		env   string
+	}{
+		{"api_token", cfg.APIToken, "AETHER_API_TOKEN"},
+		{"endpoint", cfg.Endpoint, "AETHER_ENDPOINT"},
+		{"organization_id", cfg.OrganizationID, "AETHER_ORGANIZATION_ID"},
+	} {
+		if u.value.IsUnknown() {
+			resp.Diagnostics.AddAttributeError(path.Root(u.attr), "Unknown configuration value for "+u.attr,
+				fmt.Sprintf("The provider cannot create the Aether API client: %s is not yet known at configure time. "+
+					"Either target apply the source of the value first, set the value statically, or use the %s environment variable.", u.attr, u.env))
+		}
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	token := firstNonEmpty(cfg.APIToken.ValueString(), os.Getenv("AETHER_API_TOKEN"))
 	endpoint := firstNonEmpty(cfg.Endpoint.ValueString(), os.Getenv("AETHER_ENDPOINT"), defaultEndpoint)
 	orgID := firstNonEmpty(cfg.OrganizationID.ValueString(), os.Getenv("AETHER_ORGANIZATION_ID"))
@@ -603,16 +630,25 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 			resp.Diagnostics.AddError("Cannot list organizations", list.Status()+": "+string(list.Body))
 			return
 		}
+		// The generated parser fills JSON200 only on a JSON content type. A 200
+		// of HTML is a proxy or login page; dereferencing it panics.
+		if list.JSON200 == nil {
+			resp.Diagnostics.AddError("Aether API answered 200 without a JSON body",
+				fmt.Sprintf("GET %s/api/v1/organizations returned %s with content type %q. Check that endpoint points at the Aether API and not at a proxy or login page.",
+					endpoint, list.Status(), list.HTTPResponse.Header.Get("Content-Type")))
+			return
+		}
 		items := list.JSON200.Items
 		if len(items) != 1 {
 			resp.Diagnostics.AddAttributeError(path.Root("organization_id"), "Cannot resolve the organization",
 				fmt.Sprintf("The token sees %d organizations; set organization_id explicitly.", len(items)))
 			return
 		}
-		orgID = items[0].Id.String()
+		orgUUID = items[0].Id
+		orgID = orgUUID.String()
 	}
 
-	data := &providerData{Client: c, OrgID: orgID}
+	data := &providerData{Client: c, OrgID: orgID, orgID: orgUUID}
 	resp.ResourceData = data
 	resp.DataSourceData = data
 }
@@ -690,7 +726,7 @@ echo "vendored api/openapi.yaml at $REF"
 
 ```bash
 chmod +x scripts/fetch-openapi.sh
-./scripts/fetch-openapi.sh 03459f8f0c9edd982550e9f6ab3292bab5bb96c7
+./scripts/fetch-openapi.sh 8e9045a686060112ca27c4f73ce68844322b5c1b
 ```
 
 - [ ] **Step 2 [CODER]: Generator config**
@@ -800,7 +836,7 @@ func TestContract_OperationsTheProviderCallsExist(t *testing.T) {
 
 - [ ] **Step 4 [TEST-RUNNER]:** `go test ./internal/client/ -count=1 -v` → PASS (field/method names come from the generator; if one is spelled differently than the test expects, the TEST-WRITER adjusts the expectation to the generated spelling and records it — the generator, not the test, is authoritative on spelling).
 
-- [ ] **Step 5 [CODER]: Commit** — `git add OPENAPI_REF api scripts internal/client && git commit -m "feat(client): vendor aether-api OpenAPI at 03459f8 and generate the client"`.
+- [ ] **Step 5 [CODER]: Commit** — `git add OPENAPI_REF api scripts internal/client && git commit -m "feat(client): vendor aether-api OpenAPI at 8e9045a and generate the client"`.
 
 ---
 
@@ -976,6 +1012,13 @@ func TestRetries5xxOnGetButNotOnPost(t *testing.T) {
 	}
 }
 ```
+
+The tree's `apierr_test.go` carries four fixtures beyond the block above; keep them when regenerating it, because each locks a distinct property of the measured contract:
+
+- `TestParse_OldWrongEnvelopeShapeYieldsNoFieldErrors` — a body in the shape the ORIGINAL brief assumed (top-level `errors`, body `request_id`) must yield **zero** field errors and an empty `RequestID`. This is the regression lock: without it, re-adopting the wrong envelope passes silently.
+- `TestParse_NoRequestIDHeaderLeavesRequestIDEmpty` — no `X-Request-Id` header ⇒ `RequestID == ""`, so a missing id is absent rather than invented.
+- `TestToDiagnostics_NoRequestIDHeaderOmitsSuffix` — and the diagnostic then carries no "request id" suffix at all.
+- `TestToDiagnostics_NestedFieldPathAddressesNestedAttribute` — a dotted API field (`node_pools.name`) becomes `path.Root("node_pools").AtName("name")`, not one flat attribute name.
 
 - [ ] **Step 2 [TEST-RUNNER]:** RED (packages do not build).
 
@@ -1879,6 +1922,27 @@ func (r *clusterResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	}
 }
 
+// parseID turns an id the provider holds as canonical UUID TEXT into the
+// openapi_types.UUID the generated client requires. client.OrgID, ClusterID,
+// PoolID and friends are all ALIASES of that one type, so a single helper
+// serves every call. Lives in internal/provider/ids.go and is shared by Tasks
+// 6/7/8+.
+//
+// The organization id is parsed ONCE, in Configure, and carried on
+// providerData as `orgID client.OrgID` beside the canonical-text `OrgID
+// string` the models use — so resource code never re-parses it and the call
+// sites below need no error handling for it. Ids that arrive from STATE
+// (cluster, pool) are parsed per call, because state is data from outside this
+// process: a hand-edited or truncated id must become an attribute diagnostic,
+// not a request that cannot be built.
+func parseID(s string) (client.OrgID, error) {
+	var u client.OrgID
+	if err := u.UnmarshalText([]byte(s)); err != nil {
+		return u, fmt.Errorf("%q is not a UUID: %w", s, err)
+	}
+	return u, nil
+}
+
 func (r *clusterResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan clusterModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -1899,17 +1963,17 @@ func (r *clusterResource) Create(ctx context.Context, req resource.CreateRequest
 		v := plan.Plan.ValueString()
 		body.Plan = &v
 	}
-	res, err := r.pd.Client.CreateClusterWithResponse(ctx, r.pd.OrgID, body)
+	res, err := r.pd.Client.CreateClusterWithResponse(ctx, r.pd.orgID, body)
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot create cluster", err.Error())
 		return
 	}
 	if res.StatusCode() != http.StatusCreated && res.StatusCode() != http.StatusAccepted && res.StatusCode() != http.StatusOK {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
 		return
 	}
 	created := clusterFromResponse(res.Body)
-	plan.ID = types.StringValue(created.Id)
+	plan.ID = types.StringValue(created.Id.String()) // UUID -> canonical text for state
 	// Persist the id immediately so a wait failure leaves an importable resource in state.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 
@@ -1931,7 +1995,12 @@ func (r *clusterResource) Read(ctx context.Context, req resource.ReadRequest, re
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	res, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.OrgID, state.ID.ValueString())
+	clusterID, err := parseID(state.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid cluster id in state", err.Error())
+		return
+	}
+	res, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.orgID, clusterID)
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot read cluster", err.Error())
 		return
@@ -1941,7 +2010,7 @@ func (r *clusterResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 	if res.StatusCode() != http.StatusOK {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
 		return
 	}
 	r.flatten(res.JSON200, &state)
@@ -1957,7 +2026,11 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 	}
 	updateTimeout, d := plan.Timeouts.Update(ctx, 30*time.Minute)
 	resp.Diagnostics.Append(d...)
-	id := state.ID.ValueString()
+	clusterID, err := parseID(state.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid cluster id in state", err.Error())
+		return
+	}
 
 	// 1. mutable scalar fields via PUT
 	if plan.Name != state.Name || plan.PublicEndpoint != state.PublicEndpoint {
@@ -1970,29 +2043,29 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 			v := plan.PublicEndpoint.ValueBool()
 			body.PublicEndpoint = &v
 		}
-		res, err := r.pd.Client.UpdateClusterWithResponse(ctx, r.pd.OrgID, id, body)
+		res, err := r.pd.Client.UpdateClusterWithResponse(ctx, r.pd.orgID, clusterID, body)
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot update cluster", err.Error())
 			return
 		}
 		if res.StatusCode() != http.StatusOK {
-			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
 			return
 		}
 	}
 	// 2. k8s_version via the upgrade endpoint (ModifyPlan already refused backwards moves)
 	if !versions.SemanticallyEqual(plan.K8sVersion.ValueString(), state.K8sVersion.ValueString()) {
-		res, err := r.pd.Client.UpgradeClusterWithResponse(ctx, r.pd.OrgID, id, client.UpgradeClusterJSONRequestBody{TargetVersion: plan.K8sVersion.ValueString()})
+		res, err := r.pd.Client.UpgradeClusterWithResponse(ctx, r.pd.orgID, clusterID, client.UpgradeClusterJSONRequestBody{TargetVersion: plan.K8sVersion.ValueString()})
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot upgrade cluster", err.Error())
 			return
 		}
 		if res.StatusCode() >= 300 {
-			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Root("k8s_version"))
+			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Root("k8s_version"))
 			return
 		}
 	}
-	final, err := r.waitForCluster(ctx, id, updateTimeout)
+	final, err := r.waitForCluster(ctx, clusterID, updateTimeout)
 	if err != nil {
 		resp.Diagnostics.AddError("Cluster did not return to running", err.Error())
 		return
@@ -2013,18 +2086,22 @@ func (r *clusterResource) Delete(ctx context.Context, req resource.DeleteRequest
 	}
 	deleteTimeout, d := state.Timeouts.Delete(ctx, 20*time.Minute)
 	resp.Diagnostics.Append(d...)
-	id := state.ID.ValueString()
-	res, err := r.pd.Client.DeleteClusterWithResponse(ctx, r.pd.OrgID, id)
+	clusterID, err := parseID(state.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid cluster id in state", err.Error())
+		return
+	}
+	res, err := r.pd.Client.DeleteClusterWithResponse(ctx, r.pd.orgID, clusterID)
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot delete cluster", err.Error())
 		return
 	}
 	if res.StatusCode() != http.StatusNotFound && res.StatusCode() >= 300 {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
 		return
 	}
 	err = wait.ForGone(ctx, func(ctx context.Context) (bool, error) {
-		g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.OrgID, id)
+		g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.orgID, clusterID)
 		if err != nil {
 			return false, err
 		}
@@ -2045,15 +2122,15 @@ type clusterWait struct {
 	Warned  bool
 }
 
-func (r *clusterResource) waitForCluster(ctx context.Context, id string, timeout time.Duration) (clusterWait, error) {
+func (r *clusterResource) waitForCluster(ctx context.Context, id client.ClusterID, timeout time.Duration) (clusterWait, error) {
 	var last *client.Cluster
 	res, err := wait.ForStatus(ctx, func(ctx context.Context) (string, string, error) {
-		g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.OrgID, id)
+		g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.orgID, id)
 		if err != nil {
 			return "", "", err
 		}
 		if g.StatusCode() != http.StatusOK {
-			return "", "", apierr.Parse(g.StatusCode(), g.Body)
+			return "", "", apierr.Parse(g.StatusCode(), g.HTTPResponse.Header, g.Body)
 		}
 		last = g.JSON200
 		return string(last.Status), deref(last.StatusMessage), nil
@@ -2065,7 +2142,7 @@ func (r *clusterResource) waitForCluster(ctx context.Context, id string, timeout
 }
 
 func (r *clusterResource) flatten(c *client.Cluster, m *clusterModel) {
-	m.ID = types.StringValue(c.Id)
+	m.ID = types.StringValue(c.Id.String())
 	m.Name = types.StringValue(c.Name)
 	m.Region = types.StringValue(c.Region)
 	// keep the configured spelling when it is semantically equal to what the API holds
@@ -2127,7 +2204,7 @@ Adjust to the generated types: if `CreatedAt` is `time.Time` use `.Format`, if `
   6. `effect = "Sometimes"` fails validation at plan.
 
 - [ ] **Step 2 [TEST-RUNNER]:** RED.
-- [ ] **Step 3 [CODER]:** implement mirroring Task 6's structure: schema with `int64planmodifier.UseStateForUnknown()` on the Optional+Computed ints, `mapplanmodifier.RequiresReplace()` / `listplanmodifier.RequiresReplace()` on labels/taints, `stringvalidator.OneOf("NoSchedule","PreferNoSchedule","NoExecute")` on `effect` (`github.com/hashicorp/terraform-plugin-framework-validators` — add `go get …-validators@latest` and pin), Create → `CreateNodePoolWithResponse(ctx, org, clusterID, body)` building `*int64` only for non-null attributes, wait `Success: ready`, `Failed: failed`; Update → PUT with only changed scalar fields then wait; Delete → DELETE then `ForGone`; `flatten` maps every field (`node_labels` → `types.MapValueFrom`, taints → nested list via `types.ListValueFrom` with an object type `{key,value,effect}`); ImportState passthrough on `id` — Read needs `cluster_id` too, so import id format is `<cluster_id>/<pool_id>` (document it; `ImportState` splits on `/` and sets both).
+- [ ] **Step 3 [CODER]:** implement mirroring Task 6's structure: schema with `int64planmodifier.UseStateForUnknown()` on the Optional+Computed ints, `mapplanmodifier.RequiresReplace()` / `listplanmodifier.RequiresReplace()` on labels/taints, `stringvalidator.OneOf("NoSchedule","PreferNoSchedule","NoExecute")` on `effect` (`github.com/hashicorp/terraform-plugin-framework-validators` — add `go get …-validators@latest` and pin), Create → `CreateNodePoolWithResponse(ctx, r.pd.orgID, clusterID, body)` — `clusterID` (and, in Read/Update/Delete, the pool id) go through `parseID` because they arrive from state or from the import id, while the org id is the already-parsed `r.pd.orgID`; every `<x>.Id` written back to state is `.Id.String()` — building `*int64` only for non-null attributes, wait `Success: ready`, `Failed: failed`; Update → PUT with only changed scalar fields then wait; Delete → DELETE then `ForGone`; `flatten` maps every field (`node_labels` → `types.MapValueFrom`, taints → nested list via `types.ListValueFrom` with an object type `{key,value,effect}`); ImportState passthrough on `id` — Read needs `cluster_id` too, so import id format is `<cluster_id>/<pool_id>` (document it; `ImportState` splits on `/` and sets both).
 - [ ] **Step 4 [TEST-RUNNER]:** PASS. **Step 5:** commit `feat: aether_node_pool resource`.
 
 ---
@@ -2282,7 +2359,7 @@ func (d *regionsDataSource) Read(ctx context.Context, _ datasource.ReadRequest, 
 		return
 	}
 	if res.StatusCode() != http.StatusOK {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
 		return
 	}
 	var out regionsModel
