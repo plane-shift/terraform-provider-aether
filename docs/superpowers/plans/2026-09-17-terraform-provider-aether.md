@@ -72,7 +72,9 @@ docs/                                     # tfplugindocs output (committed)
 .github/workflows/build-test.yml, release.yml, acceptance.yml, dependabot.yml (exists)
 ```
 
-Generated client naming (oapi-codegen, from operationIds): types `client.Cluster`, `client.CreateClusterRequest`, …; request bodies `client.CreateClusterJSONRequestBody` (= alias of the request type); methods on `*client.ClientWithResponses` named `<OperationId>WithResponse`, e.g. `GetClusterWithResponse(ctx, orgID, clusterID)`, `CreateClusterWithResponse(ctx, orgID, body)`, `ListClustersWithResponse(ctx, orgID, &client.ListClustersParams{Cursor: …, Limit: …})`. Responses expose `StatusCode()`, `Body []byte`, and `JSON200 *client.Cluster`-style typed fields. **Implementers verify exact names in `client.gen.go` after Task 2 and use those.**
+Generated client naming (oapi-codegen, from operationIds): types `client.Cluster`, `client.CreateClusterRequest`, …; request bodies `client.CreateClusterJSONRequestBody` (= alias of the request type); methods on `*client.ClientWithResponses` named `<OperationId>WithResponse`, e.g. `GetClusterWithResponse(ctx, orgID, clusterID)`, `CreateClusterWithResponse(ctx, orgID, body)`, `ListClustersWithResponse(ctx, orgID, &client.ListClustersParams{Cursor: …, Limit: …})`. Responses expose `StatusCode()`, `Body []byte`, `HTTPResponse *http.Response` (the source of the `X-Request-ID` header `apierr.Parse` needs) and `JSON200 *client.Cluster`-style typed fields. **Implementers verify exact names in `client.gen.go` after Task 2 and use those.**
+
+**IDs are `openapi_types.UUID`, not strings.** Every `format: uuid` field in the spec is generated as `openapi_types.UUID` (an alias of `google/uuid.UUID`, a `[16]byte`) — path parameters (`client.OrgID`, `client.ClusterID`, `client.PoolID`, …) and struct fields (`Organization.Id`) alike. So: **provider models and `providerData` hold canonical UUID TEXT (`string`), and the parse happens at the client boundary** — `var u client.OrgID; u.UnmarshalText([]byte(s))`, then `u.String()` to canonicalise. A malformed id is an **attribute diagnostic raised before any request is built**, never a downstream encoding failure that names neither the attribute nor the value. Parsing via the generated alias's own `UnmarshalText` keeps `github.com/google/uuid` an INDIRECT dependency. Test fakes serve real UUID text for the same reason — a fake keyed on `"org-1"` exercises a path production never takes.
 
 ---
 
@@ -84,6 +86,8 @@ Generated client naming (oapi-codegen, from operationIds): types `client.Cluster
 
 **Interfaces:**
 - Produces: `provider.New(version string) func() provider.Provider`; `type providerData struct { Client *client.ClientWithResponses; OrgID string }` stored in `resp.ResourceData`/`resp.DataSourceData`; `fakeapi.New(t) *fakeapi.Server` with `URL()`, `Token()`, `AddOrg(id, name, slug)`; env vars `AETHER_API_TOKEN`, `AETHER_ENDPOINT`, `AETHER_ORGANIZATION_ID`.
+- `github.com/oapi-codegen/runtime` **v1.7.0** is a required (direct) dependency — the generated client imports it.
+- **`providerData.OrgID` stays a `string`** holding canonical UUID text, because every resource carries it as configuration data; the generated client wants `client.OrgID` (= `openapi_types.UUID`), so `Configure` parses at the boundary. An explicit `organization_id` that is not a UUID is an **attribute error on `organization_id` raised BEFORE any API call** — not a 404 from a request that could never have been well-formed. `fakeapi` therefore registers real UUID text, and the tests assert on it.
 - Consumes: `internal/client` from Task 2 (Task 1 and 2 are executed together in one branch; Task 1's `Configure` compiles only after Task 2's generation — run Task 2 Steps 1–4 first if the tree does not compile, then return).
 
 - [ ] **Step 1 [CODER]: Scaffold**
@@ -98,6 +102,7 @@ go get github.com/hashicorp/terraform-plugin-framework@v1.19.0 \
        github.com/hashicorp/terraform-plugin-log@v0.11.0 \
        github.com/hashicorp/terraform-plugin-testing@v1.16.0 \
        github.com/oapi-codegen/oapi-codegen/v2@v2.8.0 \
+       github.com/oapi-codegen/runtime@v1.7.0 \
        github.com/hashicorp/terraform-plugin-docs@v0.25.0
 printf '.tmp/\n.worktrees/\ndist/\n*.test\nterraform-provider-aether\n' > .gitignore
 ```
@@ -302,6 +307,16 @@ import (
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/fakeapi"
 )
 
+// Every organization id the generator produces is openapi_types.UUID, and
+// providerData.OrgID holds the canonical text the client round-trips it as.
+// These are real UUIDs rather than opaque labels, so the fixtures exercise the
+// same parse/format path production traffic does.
+const (
+	orgAcme      = "11111111-1111-4111-8111-111111111111"
+	orgSecondary = "22222222-2222-4222-8222-222222222222"
+	orgUnseen    = "33333333-3333-4333-8333-333333333333" // never registered on the fake
+)
+
 func configure(t *testing.T, endpoint, token, orgID string) (provider.ConfigureResponse, *providerData) {
 	t.Helper()
 	p := New("test")()
@@ -327,24 +342,24 @@ func configure(t *testing.T, endpoint, token, orgID string) (provider.ConfigureR
 
 func TestConfigure_ResolvesTheSingleOrganization(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "Acme", "acme")
+	api.AddOrg(orgAcme, "Acme", "acme")
 	resp, pd := configure(t, api.URL(), api.Token(), "")
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("diagnostics: %v", resp.Diagnostics)
 	}
-	if pd == nil || pd.OrgID != "org-1" {
-		t.Fatalf("OrgID = %+v, want org-1", pd)
+	if pd == nil || pd.OrgID != orgAcme {
+		t.Fatalf("OrgID = %+v, want %s", pd, orgAcme)
 	}
 }
 
 func TestConfigure_ExplicitOrganizationIsValidatedNotListed(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-explicit", "Acme", "acme")
-	resp, pd := configure(t, api.URL(), api.Token(), "org-explicit")
+	api.AddOrg(orgAcme, "Acme", "acme")
+	resp, pd := configure(t, api.URL(), api.Token(), orgAcme)
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("diagnostics: %v", resp.Diagnostics)
 	}
-	if pd.OrgID != "org-explicit" {
+	if pd.OrgID != orgAcme {
 		t.Fatalf("OrgID = %q", pd.OrgID)
 	}
 	var listed, validated bool
@@ -352,7 +367,7 @@ func TestConfigure_ExplicitOrganizationIsValidatedNotListed(t *testing.T) {
 		if r.Path == "/organizations" {
 			listed = true
 		}
-		if r.Path == "/organizations/org-explicit" {
+		if r.Path == "/organizations/"+orgAcme {
 			validated = true
 		}
 	}
@@ -363,17 +378,35 @@ func TestConfigure_ExplicitOrganizationIsValidatedNotListed(t *testing.T) {
 
 func TestConfigure_ExplicitOrganizationTheTokenCannotSeeIsRejected(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "Acme", "acme")
-	resp, _ := configure(t, api.URL(), api.Token(), "org-other") // fake answers 404 for unknown orgs
+	api.AddOrg(orgAcme, "Acme", "acme")
+	resp, _ := configure(t, api.URL(), api.Token(), orgUnseen) // fake answers 404 for unregistered orgs
 	if !resp.Diagnostics.HasError() || !contains(resp.Diagnostics.Errors()[0].Detail(), "organization_id") {
 		t.Fatalf("expected an organization_id error, got %v", resp.Diagnostics)
 	}
 }
 
+// An organization_id that is not a UUID cannot even be turned into a request
+// path, so it must be an attribute error BEFORE any API call - never a
+// downstream encoding failure naming neither the attribute nor the value.
+func TestConfigure_ExplicitOrganizationMustBeAUUID(t *testing.T) {
+	api := fakeapi.New(t)
+	api.AddOrg(orgAcme, "Acme", "acme")
+	resp, _ := configure(t, api.URL(), api.Token(), "not-a-uuid")
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an organization_id error")
+	}
+	if got := resp.Diagnostics.Errors()[0].Detail(); !contains(got, "organization_id") {
+		t.Fatalf("detail = %q, want a hint naming organization_id", got)
+	}
+	for _, r := range api.Requests() {
+		t.Fatalf("expected no API call for an invalid organization_id, got %s %s", r.Method, r.Path)
+	}
+}
+
 func TestConfigure_ErrorsWhenTokenSeesSeveralOrganizations(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "A", "a")
-	api.AddOrg("org-2", "B", "b")
+	api.AddOrg(orgAcme, "A", "a")
+	api.AddOrg(orgSecondary, "B", "b")
 	resp, _ := configure(t, api.URL(), api.Token(), "")
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected an error asking for organization_id")
@@ -393,7 +426,7 @@ func TestConfigure_ErrorsWhenTokenSeesNoOrganization(t *testing.T) {
 
 func TestConfigure_BadTokenIsOneProviderLevelError(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "A", "a")
+	api.AddOrg(orgAcme, "A", "a")
 	resp, _ := configure(t, api.URL(), "aether_wrong", "")
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected an error")
@@ -405,7 +438,7 @@ func TestConfigure_BadTokenIsOneProviderLevelError(t *testing.T) {
 
 func TestConfigure_ReadsEnvironment(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "A", "a")
+	api.AddOrg(orgAcme, "A", "a")
 	t.Setenv("AETHER_API_TOKEN", api.Token())
 	t.Setenv("AETHER_ENDPOINT", api.URL())
 	p := New("test")()
@@ -521,6 +554,20 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		return
 	}
 
+	// The generated client types organization_id as client.OrgID
+	// (= openapi_types.UUID), so parse at the boundary, BEFORE any call: a
+	// syntax error belongs on the attribute, not in a downstream encoding
+	// failure. providerData.OrgID stays canonical UUID TEXT.
+	var orgUUID client.OrgID
+	if orgID != "" {
+		if err := orgUUID.UnmarshalText([]byte(orgID)); err != nil {
+			resp.Diagnostics.AddAttributeError(path.Root("organization_id"), "Invalid organization_id",
+				fmt.Sprintf("organization_id must be a UUID: %q is not (%s). Copy the id from the Aether portal, or omit organization_id and the provider resolves the organization the token belongs to.", orgID, err))
+			return
+		}
+		orgID = orgUUID.String() // canonicalise
+	}
+
 	httpClient := &http.Client{Transport: transport.New(token, http.DefaultTransport)}
 	c, err := client.NewClientWithResponses(endpoint, client.WithHTTPClient(httpClient))
 	if err != nil {
@@ -530,7 +577,7 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 
 	if orgID != "" {
 		// Validate the override: the token belongs to exactly one organization.
-		g, err := c.GetOrganizationWithResponse(ctx, orgID)
+		g, err := c.GetOrganizationWithResponse(ctx, orgUUID)
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot reach the Aether API", fmt.Sprintf("GET %s/api/v1/organizations/%s: %s", endpoint, orgID, err))
 			return
@@ -562,7 +609,7 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 				fmt.Sprintf("The token sees %d organizations; set organization_id explicitly.", len(items)))
 			return
 		}
-		orgID = items[0].Id
+		orgID = items[0].Id.String()
 	}
 
 	data := &providerData{Client: c, OrgID: orgID}
@@ -764,7 +811,9 @@ func TestContract_OperationsTheProviderCallsExist(t *testing.T) {
 - Test: `internal/provider/apierr/apierr_test.go`, `internal/provider/transport/retry_test.go`
 
 **Interfaces:**
-- Produces: `apierr.Parse(status int, body []byte) *apierr.Error` (`Error{Status int; Code, Message, RequestID string; Fields []FieldError{Field, Code, Message}}`, implements `error`); `apierr.IsNotFound(err error) bool`; `apierr.ToDiagnostics(err error, diags *diag.Diagnostics, attrPrefix path.Path)`; `transport.New(token string, next http.RoundTripper) http.RoundTripper` (bearer auth + retries: 429 honouring `Retry-After`, 5xx/transport 3× with 500ms→4s backoff; never retries non-idempotent 5xx? — rule: retry GET/PUT/DELETE on 5xx; retry POST only on 429 and on transport errors before any bytes were written).
+- Produces: `apierr.Parse(status int, header http.Header, body []byte) *apierr.Error` (`Error{Status int; Code, Message, RequestID string; Fields []FieldError{Field, Code, Message}}`, implements `error`); `apierr.IsNotFound(err error) bool`; `apierr.ToDiagnostics(err error, diags *diag.Diagnostics, attrPrefix path.Path)`; `transport.New(token string, next http.RoundTripper) http.RoundTripper`.
+- **The wire format is measured, not assumed** (aether-api `internal/api/handler/response.go` + `internal/api/middleware/requestid.go` @ `8f03fbb`): the envelope is `{"error":{"code","message","details":[{"field","code","message"}]}}`. Field errors live under **`error.details`**; there is **no top-level `errors` list** and **no `request_id` in the body** — the request id is the **`X-Request-ID` response header**, set by middleware on every route. That is why `Parse` takes the header; call sites pass `resp.HTTPResponse.Header`.
+- Retry rules (`transport`): **429 retried for every method**, honouring **integer-seconds** `Retry-After` **clamped to ≤ 60 s** (overflow-guarded). **5xx retried only for idempotent methods** (GET/HEAD/PUT/DELETE/OPTIONS), **1 + 3 attempts**, backoff 500 ms → 1 s → 2 s capped at 4 s; POST/PATCH surface a 5xx at once. A **transport error** is retried for idempotent methods, and for POST/PATCH **only when the failure proves nothing was written** (`*net.DNSError`, or `*net.OpError{Op:"dial"}`) — a connection that broke **mid-body is never replayed**. Nothing is replayed unless the body can be re-opened via `req.GetBody`. Discarded bodies are drained **bounded (64 KiB)** and closed; the **final** response propagates unread.
 
 - [ ] **Step 1 [TEST-WRITER]: Tests**
 
@@ -782,8 +831,11 @@ import (
 )
 
 func TestParse_ValidationErrorsCarryFields(t *testing.T) {
-	body := []byte(`{"error":{"code":"validation_error","message":"invalid request","request_id":"req-1"},"errors":[{"field":"k8s_version","code":"not_offered","message":"1.31 is not offered"},{"field":"name","code":"required","message":"name is required"}]}`)
-	e := Parse(http.StatusUnprocessableEntity, body)
+	// Measured shape: details under error.details, request id in the header.
+	body := []byte(`{"error":{"code":"validation_error","message":"invalid request","details":[{"field":"k8s_version","code":"not_offered","message":"1.31 is not offered"},{"field":"name","code":"required","message":"name is required"}]}}`)
+	hdr := http.Header{}
+	hdr.Set("X-Request-Id", "req-1")
+	e := Parse(http.StatusUnprocessableEntity, hdr, body)
 	if e.Status != 422 || e.Code != "validation_error" || e.RequestID != "req-1" {
 		t.Fatalf("%+v", e)
 	}
@@ -793,30 +845,30 @@ func TestParse_ValidationErrorsCarryFields(t *testing.T) {
 }
 
 func TestParse_PlainErrorEnvelope(t *testing.T) {
-	e := Parse(http.StatusConflict, []byte(`{"error":{"code":"conflict","message":"name already exists"}}`))
+	e := Parse(http.StatusConflict, http.Header{}, []byte(`{"error":{"code":"conflict","message":"name already exists"}}`))
 	if e.Code != "conflict" || e.Message != "name already exists" || len(e.Fields) != 0 {
 		t.Fatalf("%+v", e)
 	}
 }
 
 func TestParse_NonJSONBodyStillProducesAnError(t *testing.T) {
-	e := Parse(http.StatusBadGateway, []byte("<html>502</html>"))
+	e := Parse(http.StatusBadGateway, http.Header{}, []byte("<html>502</html>"))
 	if e.Status != 502 || e.Message == "" {
 		t.Fatalf("%+v", e)
 	}
 }
 
 func TestIsNotFound(t *testing.T) {
-	if !IsNotFound(Parse(404, []byte(`{"error":{"code":"not_found","message":"gone"}}`))) {
+	if !IsNotFound(Parse(404, http.Header{}, []byte(`{"error":{"code":"not_found","message":"gone"}}`))) {
 		t.Fatal("404 must be IsNotFound")
 	}
-	if IsNotFound(Parse(500, nil)) {
+	if IsNotFound(Parse(500, nil, nil)) { // a nil Header must be safe
 		t.Fatal("500 must not be IsNotFound")
 	}
 }
 
 func TestToDiagnostics_ValidationBecomesAttributeErrors(t *testing.T) {
-	e := Parse(422, []byte(`{"error":{"code":"validation_error","message":"invalid"},"errors":[{"field":"k8s_version","code":"not_offered","message":"1.31 is not offered"}]}`))
+	e := Parse(422, http.Header{}, []byte(`{"error":{"code":"validation_error","message":"invalid","details":[{"field":"k8s_version","code":"not_offered","message":"1.31 is not offered"}]}}`))
 	var d diag.Diagnostics
 	ToDiagnostics(e, &d, path.Empty())
 	if len(d) != 1 {
@@ -830,7 +882,7 @@ func TestToDiagnostics_ValidationBecomesAttributeErrors(t *testing.T) {
 
 func TestToDiagnostics_AuthIsOneProviderHint(t *testing.T) {
 	var d diag.Diagnostics
-	ToDiagnostics(Parse(403, []byte(`{"error":{"code":"forbidden","message":"nope"}}`)), &d, path.Empty())
+	ToDiagnostics(Parse(403, http.Header{}, []byte(`{"error":{"code":"forbidden","message":"nope"}}`)), &d, path.Empty())
 	if len(d) != 1 || !containsStr(d[0].Detail(), "api_token") {
 		t.Fatalf("diags = %v", d)
 	}
@@ -838,7 +890,9 @@ func TestToDiagnostics_AuthIsOneProviderHint(t *testing.T) {
 
 func TestToDiagnostics_RequestIDIsSurfaced(t *testing.T) {
 	var d diag.Diagnostics
-	ToDiagnostics(Parse(500, []byte(`{"error":{"code":"internal","message":"boom","request_id":"req-9"}}`)), &d, path.Empty())
+	hdr := http.Header{}
+	hdr.Set("X-Request-Id", "req-9")
+	ToDiagnostics(Parse(500, hdr, []byte(`{"error":{"code":"internal","message":"boom"}}`)), &d, path.Empty())
 	if !containsStr(d[0].Detail(), "req-9") {
 		t.Fatalf("detail = %q", d[0].Detail())
 	}
@@ -962,29 +1016,35 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("aether api: %d: %s", e.Status, e.Message)
 }
 
-// envelope matches ErrorResponse (+ the 422 "errors" list) in api/openapi.yaml.
+// envelope matches ErrorResponse/ErrorBody in aether-api's
+// internal/api/handler/response.go (@ 8f03fbb), which is what the vendored
+// api/openapi.yaml describes. Field errors are error.details; there is no
+// top-level "errors" list and no request_id in the body.
 type envelope struct {
 	Error struct {
-		Code      string `json:"code"`
-		Message   string `json:"message"`
-		RequestID string `json:"request_id"`
-	} `json:"error"`
-	Errors []struct {
-		Field   string `json:"field"`
 		Code    string `json:"code"`
 		Message string `json:"message"`
-	} `json:"errors"`
+		Details []struct {
+			Field   string `json:"field"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"details"`
+	} `json:"error"`
 }
 
-func Parse(status int, body []byte) *Error {
-	e := &Error{Status: status}
+// Parse reads an API error response. header is the RESPONSE header, which is
+// where the request id lives; a nil header is safe (http.Header(nil).Get
+// returns ""). It never returns nil.
+func Parse(status int, header http.Header, body []byte) *Error {
+	// Get canonicalises the key, so the wire's X-Request-ID matches.
+	e := &Error{Status: status, RequestID: header.Get("X-Request-Id")}
 	var env envelope
-	if err := json.Unmarshal(body, &env); err != nil || (env.Error.Message == "" && len(env.Errors) == 0) {
+	if err := json.Unmarshal(body, &env); err != nil || (env.Error.Message == "" && len(env.Error.Details) == 0) {
 		e.Message = strings.TrimSpace(http.StatusText(status) + " " + truncate(string(body), 200))
 		return e
 	}
-	e.Code, e.Message, e.RequestID = env.Error.Code, env.Error.Message, env.Error.RequestID
-	for _, f := range env.Errors {
+	e.Code, e.Message = env.Error.Code, env.Error.Message
+	for _, f := range env.Error.Details {
 		e.Fields = append(e.Fields, FieldError{Field: f.Field, Code: f.Code, Message: f.Message})
 	}
 	return e
@@ -1036,116 +1096,40 @@ func truncate(s string, n int) string {
 }
 ```
 
-`internal/provider/transport/retry.go`:
+`internal/provider/transport/retry.go` — the rules, not a second copy of the code. A
+reference implementation carried here diverged from the measured contract once already; the
+implementation that satisfies every rule below is `internal/provider/transport/retry.go`,
+and the tests above are the contract:
 
-```go
-// Package transport is the provider's HTTP layer: bearer auth plus bounded retries.
-package transport
+- Concrete type `retryTransport{token, next, backoff func(attempt int) time.Duration}`;
+  `New` returns it as an `http.RoundTripper`. `backoff` is a FIELD, not a package function,
+  because the tests type-assert and zero it.
+- `RoundTrip` works on `req.Clone(req.Context())` — a RoundTripper must not mutate the
+  caller's request — sets `Authorization: Bearer <token>`, and sets `User-Agent` only when
+  the caller left it empty.
+- **`maxRetries = 3`**, so an idempotent request makes at most **1 + 3 = 4** attempts.
+  `defaultBackoff` is 500 ms → 1 s → 2 s, capped at 4 s, shift-guarded for large attempts.
+- **429 is retried for every method.** `Retry-After` is read as **integer seconds only**
+  (the HTTP-date form is legal but this API does not send it), negatives clamped to 0 and
+  the value **clamped to ≤ 60 s** so a hostile or buggy header cannot park an apply; absent
+  or unparseable, the backoff applies.
+- **5xx is retried only for idempotent methods** — GET, HEAD, PUT, DELETE, OPTIONS. POST and
+  PATCH surface a 5xx immediately: the server may have acted, and a replay bills the
+  customer twice.
+- A **transport error** is retried for idempotent methods. For POST/PATCH it is replayed
+  **only when the failure proves nothing was written**: `errors.As` a `*net.DNSError`, or a
+  `*net.OpError` with `Op == "dial"`. net/http exposes no "nothing written" signal of its
+  own, so a connection that broke **mid-body is deliberately not replayed**.
+- **Nothing is replayed unless the body can be re-opened**: `req.Body == nil`,
+  `req.Body == http.NoBody`, or `req.GetBody != nil`. Each retry re-opens the body via
+  `req.GetBody()`.
+- Every **discarded** response is drained **bounded — `io.CopyN(io.Discard, resp.Body, 64<<10)`** —
+  and closed, so the connection is reusable without reading an unbounded error page. The
+  **final** response is returned **unread and unclosed**, so it propagates exactly as if
+  there were no retry layer; in particular the 4th 5xx must still have a readable body.
+- `sleep` waits on `req.Context().Done()` as well as the timer and returns the context
+  error, so a cancelled apply does not sit out the remaining backoff.
 
-import (
-	"bytes"
-	"io"
-	"net/http"
-	"strconv"
-	"time"
-)
-
-const maxRetries = 3
-
-type retryTransport struct {
-	token   string
-	next    http.RoundTripper
-	backoff func(attempt int) time.Duration
-}
-
-func New(token string, next http.RoundTripper) http.RoundTripper {
-	return &retryTransport{token: token, next: next, backoff: defaultBackoff}
-}
-
-func defaultBackoff(attempt int) time.Duration {
-	d := 500 * time.Millisecond << attempt // 0.5s, 1s, 2s
-	if d > 4*time.Second {
-		d = 4 * time.Second
-	}
-	return d
-}
-
-func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req = req.Clone(req.Context())
-	req.Header.Set("Authorization", "Bearer "+t.token)
-	req.Header.Set("User-Agent", "terraform-provider-aether")
-
-	var body []byte
-	if req.Body != nil && req.Body != http.NoBody {
-		b, err := io.ReadAll(req.Body)
-		if err != nil {
-			return nil, err
-		}
-		body = b
-	}
-	idempotent := req.Method == http.MethodGet || req.Method == http.MethodPut || req.Method == http.MethodDelete || req.Method == http.MethodHead
-
-	var last *http.Response
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if body != nil {
-			req.Body = io.NopCloser(bytes.NewReader(body))
-		}
-		resp, err := t.next.RoundTrip(req)
-		if err != nil {
-			lastErr, last = err, nil
-			if !idempotent { // a POST may have reached the server; do not replay it
-				return nil, err
-			}
-		} else {
-			last, lastErr = resp, nil
-			if resp.StatusCode == http.StatusTooManyRequests {
-				wait := t.backoff(attempt)
-				if ra := resp.Header.Get("Retry-After"); ra != "" {
-					if secs, perr := strconv.Atoi(ra); perr == nil {
-						wait = time.Duration(secs) * time.Second
-					}
-				}
-				drain(resp)
-				if attempt == maxRetries {
-					return resp, nil
-				}
-				sleep(req, wait)
-				continue
-			}
-			if resp.StatusCode < 500 || !idempotent {
-				return resp, nil
-			}
-			drain(resp)
-		}
-		if attempt == maxRetries {
-			break
-		}
-		sleep(req, t.backoff(attempt))
-	}
-	if last != nil {
-		return last, nil
-	}
-	return nil, lastErr
-}
-
-func drain(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-}
-
-func sleep(req *http.Request, d time.Duration) {
-	if d <= 0 {
-		return
-	}
-	select {
-	case <-time.After(d):
-	case <-req.Context().Done():
-	}
-}
-```
-
-Note: after `drain` on a 5xx that is the LAST attempt, the caller receives a response with a closed body; to keep it readable, on the last attempt do not drain — restructure so `drain` runs only when a retry will follow. The tests above pin the retry counts; the implementer keeps the returned body readable (read into a buffer and re-wrap with `io.NopCloser` if simpler).
 
 - [ ] **Step 4 [TEST-RUNNER]:** `go test ./internal/provider/apierr/ ./internal/provider/transport/ -count=1 -race -v` → PASS.
 - [ ] **Step 5 [CODER]: Commit** — `feat: API error mapping and retrying bearer transport`.
@@ -1166,7 +1150,21 @@ func ForGone(ctx context.Context, probe func(ctx context.Context) (gone bool, er
 var ErrTimeout = errors.New("wait: timeout")
 type FailedError struct { Status, Message string }   // implements error
 ```
-`Now`/`Sleep` default to real time; tests inject fakes. Backoff 1s doubling to 15s cap.
+`Now`/`Sleep` default to real time; tests inject fakes. Four rules are the contract:
+
+- **Match the status on EVERY probe, including the first — check before sleep.** A
+  sleep-then-check loop makes the fastest operation take a whole backoff interval and hides
+  a resource that was already terminal when the wait began.
+- **A `Warning` status is TERMINAL.** It ends the wait with `Result.Warned = true` and the
+  API's message; the caller surfaces that as a **warning diagnostic** (a `degraded` cluster
+  has finished coming up). Polling on would hang to the timeout and then report a failure
+  that did not happen.
+- **Backoff 1 s, 2 s, 4 s, 8 s, then 15 s — capped AFTER the doubling**, so the sequence
+  never jumps 8 s → 16 s. Exactly one sleep per non-terminal probe.
+- **A timeout wraps `ErrTimeout` with `%w` and NAMES the last observed status**; a `Failed`
+  status returns `*FailedError` (a POINTER, so `errors.As` matches); a probe error
+  short-circuits, wrapped so `errors.Is`/`errors.As` still reach the cause. The production
+  `Sleep` honours context cancellation.
 
 - [ ] **Step 1 [TEST-WRITER]:**
 
@@ -1393,7 +1391,9 @@ func ForGone(ctx context.Context, probe func(ctx context.Context) (bool, error),
 
 **Files:** Create `internal/provider/versions/versions.go`; Test `internal/provider/versions/versions_test.go`.
 
-**Interfaces:** Produces `versions.K8sVersionType{}` (a `basetypes.StringTypable`) and `versions.K8sVersionValue` (a `basetypes.StringValuableWithSemanticEquals`); `versions.NewK8sVersionValue(s string) K8sVersionValue`; `versions.SemanticallyEqual(configured, actual string) bool`; `versions.IsForward(from, to string) (bool, error)`; `versions.Minor(v string) (major, minor int, err error)`.
+**Interfaces:** Produces `versions.K8sVersionType{}` (a `basetypes.StringTypable`) and `versions.K8sVersionValue` (a `basetypes.StringValuableWithSemanticEquals`); `versions.NewK8sVersionValue(s string) K8sVersionValue`; `versions.SemanticallyEqual(configured, actual string) bool`; `versions.IsForward(from, to string) (bool, error)`; `versions.Minor(v string) (major, minor int, err error)`. No `latest` keyword at this layer.
+
+**Direction is load-bearing.** The framework calls `proposedNew.StringSemanticEquals(ctx, prior)` and, when it returns true, keeps the **prior** value in state — measured in terraform-plugin-framework v1.19.0, `internal/fwschemadata/value_semantic_equality_string.go:37` (the call) and `:53` (`resp.NewValue = priorValuable`). So the **receiver is the API's value** and the **argument is the configured/prior** one, and the hook must compute `SemanticallyEqual(configured = argument, actual = receiver)`. The two orders are not the same function: `SemanticallyEqual("1.37", "1.37.0")` is true while `SemanticallyEqual("1.37.0", "1.37")` is false, so a hook written backwards is a real bug that a test whose operands happen to be ordered the same way will not catch.
 
 - [ ] **Step 1 [TEST-WRITER]:**
 
@@ -1437,14 +1437,24 @@ func TestIsForward(t *testing.T) {
 }
 
 func TestValue_SemanticEqualsHook(t *testing.T) {
-	v := NewK8sVersionValue("1.37")
-	eq, diags := v.StringSemanticEquals(context.Background(), NewK8sVersionValue("1.37.0"))
+	// The framework calls proposedNew.StringSemanticEquals(ctx, prior)
+	// (terraform-plugin-framework v1.19.0,
+	// internal/fwschemadata/value_semantic_equality_string.go:37), so the
+	// RECEIVER is the API's value and the ARGUMENT is the configured one.
+	apiValue := NewK8sVersionValue("1.37.4")
+	eq, diags := apiValue.StringSemanticEquals(context.Background(), NewK8sVersionValue("1.37"))
 	if diags.HasError() || !eq {
-		t.Fatalf("eq=%v diags=%v", eq, diags)
+		t.Fatalf("eq=%v diags=%v; a configured 1.37 must accept the API's 1.37.4", eq, diags)
 	}
-	eq, _ = v.StringSemanticEquals(context.Background(), basetypes.NewStringValue("1.38.0"))
-	if eq {
-		t.Fatal("1.37 vs 1.38.0 must not be equal")
+	// The SAME two strings in the other role must NOT be equal: a configured
+	// 1.37.4 pins the patch, so an API value of 1.37 does not satisfy it. This
+	// is the assertion that fails when the hook swaps its operands.
+	reversed := NewK8sVersionValue("1.37")
+	if eq, _ := reversed.StringSemanticEquals(context.Background(), NewK8sVersionValue("1.37.4")); eq {
+		t.Fatal("configured 1.37.4 vs API 1.37 must not be equal — the hook has its operands reversed")
+	}
+	if eq, _ := apiValue.StringSemanticEquals(context.Background(), basetypes.NewStringValue("1.38")); eq {
+		t.Fatal("configured 1.38 vs API 1.37.4 must not be equal")
 	}
 }
 ```
@@ -1580,7 +1590,9 @@ func (v K8sVersionValue) StringSemanticEquals(ctx context.Context, newValuable b
 	if v.IsNull() || v.IsUnknown() || nv.IsNull() || nv.IsUnknown() {
 		return v.StringValue.Equal(nv), diags
 	}
-	return SemanticallyEqual(v.ValueString(), nv.ValueString()), diags
+	// v is the RECEIVER = proposedNew = the API's value; nv is the ARGUMENT =
+	// prior = what was configured. Do not swap these (see Interfaces above).
+	return SemanticallyEqual(nv.ValueString(), v.ValueString()), diags
 }
 ```
 
@@ -1631,7 +1643,7 @@ func factories() map[string]func() (tfprotov6.ProviderServer, error) {
 func setupFake(t *testing.T) *fakeapi.Server {
 	t.Helper()
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "Acme", "acme")
+	api.AddOrg("11111111-1111-4111-8111-111111111111", "Acme", "acme")
 	t.Setenv("AETHER_ENDPOINT", api.URL())
 	t.Setenv("AETHER_API_TOKEN", api.Token())
 	return api
