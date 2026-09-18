@@ -2,8 +2,12 @@ package fakeapi
 
 import (
 	"bufio"
+	"encoding/json"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,5 +66,63 @@ func TestServeRespondsWhenTheRequestBodyCannotBeRead(t *testing.T) {
 	}
 	if s.BodyReadError() == nil {
 		t.Fatal("BodyReadError() = nil, want the read failure recorded for the test to inspect")
+	}
+}
+
+// TestServeReturns404ForPathMissingTheAPIPrefix pins a review-confirmed
+// defect: serve computed the routed path with strings.TrimPrefix(r.URL.Path,
+// "/api/v1"), which is a no-op (returns the string unchanged) when the
+// prefix is absent instead of signalling "not stripped". A request to
+// "/organizations" (no "/api/v1" prefix) then falls straight through to the
+// `path == "/organizations"` case and is served as if it *had* the prefix -
+// silently routing a malformed/prefix-less path instead of rejecting it.
+func TestServeReturns404ForPathMissingTheAPIPrefix(t *testing.T) {
+	s := New(t)
+	s.AddOrg("11111111-1111-4111-8111-111111111111", "Acme", "acme")
+
+	req, err := http.NewRequest(http.MethodGet, s.URL()+"/organizations", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+s.Token())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %q, want 404 (a path with no /api/v1 prefix must never be routed as if it had one)", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "invalid API base path") {
+		t.Fatalf("body = %q, want a message naming the invalid API base path", body)
+	}
+}
+
+// TestWriteJSONRespondsWithErrorWhenMarshalFails pins a review-confirmed
+// defect: writeJSON called w.WriteHeader(code) BEFORE marshalling, so a value
+// that fails to marshal (e.g. containing a chan) leaves the caller's status
+// code on the wire with an empty/truncated body instead of surfacing a 500
+// and an error body - the marshal error was silently discarded.
+func TestWriteJSONRespondsWithErrorWhenMarshalFails(t *testing.T) {
+	w := httptest.NewRecorder()
+
+	WriteJSON(w, http.StatusOK, map[string]any{"bad": make(chan int)})
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (a marshal failure must not leave the caller's original status code on the wire)", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body is not valid JSON: %v (body=%q)", err, w.Body.String())
+	}
+	if _, ok := body["error"]; !ok {
+		t.Fatalf("body = %v, want an \"error\" key describing the marshal failure", body)
 	}
 }

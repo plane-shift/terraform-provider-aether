@@ -306,6 +306,10 @@ func TestConfigure_ReadsEnvironment(t *testing.T) {
 	api.AddOrg(orgAcme, "A", "a")
 	t.Setenv("AETHER_API_TOKEN", api.Token())
 	t.Setenv("AETHER_ENDPOINT", api.URL())
+	// A developer's exported AETHER_ORGANIZATION_ID must not flip this test
+	// onto the explicit-org path - pin it empty so the test always exercises
+	// the token-derives-the-org behavior it's named for.
+	t.Setenv("AETHER_ORGANIZATION_ID", "")
 	p := New("test")()
 	schemaResp := provider.SchemaResponse{}
 	p.Schema(context.Background(), provider.SchemaRequest{}, &schemaResp)
@@ -318,6 +322,49 @@ func TestConfigure_ReadsEnvironment(t *testing.T) {
 	p.Configure(context.Background(), provider.ConfigureRequest{Config: tfsdk.Config{Raw: raw, Schema: schemaResp.Schema}}, &resp)
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("diagnostics: %v", resp.Diagnostics)
+	}
+}
+
+// TestConfigure_RejectsPlainHTTPToNonLoopbackEndpoint pins the fix for a
+// review-confirmed defect: a plain-http endpoint carries the bearer token in
+// cleartext over the network. Only loopback/localhost may use http (that's
+// how every other test in this file talks to the fake); anything else must be
+// rejected as an endpoint attribute error BEFORE any request reaches the
+// wire. 203.0.113.5 is TEST-NET-3 (RFC 5737, non-routable) precisely so a
+// missing check would be caught by dial failure/timeout rather than silently
+// reaching a real host - either way it must never reach the fake.
+func TestConfigure_RejectsPlainHTTPToNonLoopbackEndpoint(t *testing.T) {
+	api := fakeapi.New(t)
+	api.AddOrg(orgAcme, "Acme", "acme")
+	resp, _ := configure(t, "http://203.0.113.5:8080", api.Token(), "")
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an endpoint attribute error for plain http to a non-loopback host")
+	}
+	got := resp.Diagnostics.Errors()[0].Detail()
+	if !strings.Contains(got, "endpoint") {
+		t.Fatalf("detail = %q, want a hint naming endpoint", got)
+	}
+	lower := strings.ToLower(got)
+	if !strings.Contains(lower, "cleartext") && !strings.Contains(lower, "https") {
+		t.Fatalf("detail = %q, want it to mention cleartext/https", got)
+	}
+	if got := api.Requests(); len(got) != 0 {
+		t.Fatalf("expected zero API calls for a rejected endpoint, got %v", got)
+	}
+}
+
+// TestConfigure_AllowsPlainHTTPToLoopback is
+// TestConfigure_RejectsPlainHTTPToNonLoopbackEndpoint's positive sibling:
+// every other test in this file already configures against the fake's
+// http://127.0.0.1:<port> endpoint and would fail across the board if
+// loopback http were also rejected - this asserts that explicitly, once,
+// rather than leaving it implicit in every other test's success.
+func TestConfigure_AllowsPlainHTTPToLoopback(t *testing.T) {
+	api := fakeapi.New(t)
+	api.AddOrg(orgAcme, "Acme", "acme")
+	resp, _ := configure(t, api.URL(), api.Token(), "")
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("diagnostics: %v, want plain http to a loopback endpoint accepted", resp.Diagnostics)
 	}
 }
 

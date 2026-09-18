@@ -3,7 +3,9 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -63,7 +65,7 @@ func (p *aetherProvider) Schema(_ context.Context, _ provider.SchemaRequest, res
 			},
 			"endpoint": schema.StringAttribute{
 				Optional:            true,
-				MarkdownDescription: "API base URL. Defaults to `" + defaultEndpoint + "`; falls back to `AETHER_ENDPOINT`.",
+				MarkdownDescription: "API base URL. Defaults to `" + defaultEndpoint + "`; falls back to `AETHER_ENDPOINT`. Must be `https`, or `http` with a loopback host (`localhost` or a loopback IP) — the API token is sent on every request, so plain `http` to any other host is refused rather than leaking the credential in cleartext.",
 			},
 			"organization_id": schema.StringAttribute{
 				Optional:            true,
@@ -112,6 +114,22 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	if token == "" {
 		resp.Diagnostics.AddAttributeError(path.Root("api_token"), "Missing API token",
 			"Set api_token in the provider block or the AETHER_API_TOKEN environment variable. Tokens are created in the Aether portal.")
+		return
+	}
+
+	// Check the endpoint BEFORE anything is sent to it. The bearer token goes
+	// on every request, so a plain-http endpoint puts a long-lived credential
+	// on the wire in cleartext - and it is the kind of thing that gets set
+	// once while debugging and then committed.
+	endpointURL, err := url.Parse(endpoint)
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Invalid endpoint",
+			fmt.Sprintf("endpoint %q is not a valid URL: %s", endpoint, err))
+		return
+	}
+	if !endpointIsSafe(endpointURL) {
+		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Insecure endpoint",
+			fmt.Sprintf("endpoint %q would send the API token in cleartext; plain http is accepted only for loopback endpoints (localhost or a loopback IP). Use https, or a loopback address when testing against a local API.", endpoint))
 		return
 	}
 
@@ -242,6 +260,27 @@ func (p *aetherProvider) Resources(context.Context) []func() resource.Resource {
 
 func (p *aetherProvider) DataSources(context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{} // filled task by task
+}
+
+// endpointIsSafe reports whether the token may be sent to this endpoint.
+// https always; http only when the traffic cannot leave the machine. A missing
+// or unknown scheme is refused too - "api.example.com" parses as a relative
+// URL with no scheme, which is a configuration mistake worth naming rather
+// than silently defaulting.
+func endpointIsSafe(u *url.URL) bool {
+	switch u.Scheme {
+	case "https":
+		return true
+	case "http":
+		host := u.Hostname()
+		if host == "localhost" {
+			return true
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && ip.IsLoopback()
+	default:
+		return false
+	}
 }
 
 // apiTransport is http.DefaultTransport with a bound on how long a host may

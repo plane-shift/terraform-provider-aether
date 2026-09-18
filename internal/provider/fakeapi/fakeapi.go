@@ -85,7 +85,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"code": "unauthorized", "message": "invalid token"}})
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/api/v1")
+	path, ok := strings.CutPrefix(r.URL.Path, "/api/v1")
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "invalid API base path " + r.URL.Path}})
+		return
+	}
 	var body []byte
 	if r.Body != nil {
 		// io.ReadAll, not a single Read call: httptest bodies can arrive
@@ -148,9 +152,24 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// errB is marshalling a plain map of strings, which cannot itself
+		// fail - safe to ignore.
+		errB, _ := json.Marshal(map[string]any{"error": map[string]any{"code": "internal", "message": "fakeapi: marshalling response: " + err.Error()}})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write(errB)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	if _, err := w.Write(b); err != nil {
+		// serve runs on a per-connection goroutine, not the test's own
+		// goroutine (see the read-error path above) - a write failure here
+		// just means the client already went away; nothing more to do.
+		return
+	}
 }
 
 // WriteJSON is exported for test handlers.

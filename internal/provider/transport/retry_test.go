@@ -14,15 +14,19 @@ import (
 )
 
 func TestBearerHeaderIsAdded(t *testing.T) {
-	var got string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { got = r.Header.Get("Authorization") }))
+	var got atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.Store(r.Header.Get("Authorization"))
+	}))
 	defer srv.Close()
 	c := &http.Client{Transport: New("aether_x", http.DefaultTransport)}
-	if _, err := c.Get(srv.URL); err != nil {
+	resp, err := c.Get(srv.URL)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "Bearer aether_x" {
-		t.Fatalf("Authorization = %q", got)
+	defer resp.Body.Close()
+	if v, _ := got.Load().(string); v != "Bearer aether_x" {
+		t.Fatalf("Authorization = %q", v)
 	}
 }
 
@@ -59,6 +63,7 @@ func TestRetriesOn429HonouringRetryAfter(t *testing.T) {
 	if err != nil || resp.StatusCode != 200 || atomic.LoadInt32(&n) != 2 {
 		t.Fatalf("resp=%v err=%v n=%d", resp, err, n)
 	}
+	defer resp.Body.Close()
 	if len(waits) != 1 || waits[0] != 2*time.Second {
 		t.Fatalf("waits = %v, want [2s] (the Retry-After header value, actually honoured)", waits)
 	}
@@ -83,7 +88,10 @@ func TestRetryAfterIsCapped(t *testing.T) {
 		return nil
 	}
 	c := &http.Client{Transport: tr}
-	_, _ = c.Get(srv.URL)
+	resp, err := c.Get(srv.URL)
+	if err == nil {
+		defer resp.Body.Close()
+	}
 	if len(waits) == 0 {
 		t.Fatal("expected at least one recorded wait")
 	}
@@ -122,7 +130,10 @@ func TestRetryAfterOverflowDoesNotGoNegative(t *testing.T) {
 		return nil
 	}
 	c := &http.Client{Transport: tr}
-	_, _ = c.Get(srv.URL)
+	resp, err := c.Get(srv.URL)
+	if err == nil {
+		defer resp.Body.Close()
+	}
 	if len(waits) == 0 {
 		t.Fatal("expected at least one recorded wait")
 	}
@@ -194,6 +205,7 @@ func TestPOSTIsRetriedAfterADialError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err = %v, want the POST retried after a dial error", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -265,6 +277,7 @@ func TestNoRetryOn429WhenBodyHasNoGetBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429 returned untouched (no retry)", resp.StatusCode)
 	}
@@ -313,8 +326,12 @@ func TestRetries5xxOnGetButNotOnPost(t *testing.T) {
 	tr := New("t", http.DefaultTransport).(*retryTransport)
 	tr.backoff = func(int) time.Duration { return 0 }
 	c := &http.Client{Transport: tr}
-	_, _ = c.Get(srv.URL)
-	_, _ = c.Post(srv.URL, "application/json", nil)
+	if resp, err := c.Get(srv.URL); err == nil {
+		resp.Body.Close()
+	}
+	if resp, err := c.Post(srv.URL, "application/json", nil); err == nil {
+		resp.Body.Close()
+	}
 	if atomic.LoadInt32(&gets) != 4 { // 1 + 3 retries
 		t.Fatalf("gets = %d, want 4", gets)
 	}
