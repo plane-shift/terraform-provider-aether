@@ -14,7 +14,7 @@
 
 - Module path `github.com/plane-shift/terraform-provider-aether`; provider type name `aether`; registry address `plane-shift/aether`; plugin protocol **v6**; supports Terraform 1.x and OpenTofu ≥ 1.6 — no engine-specific features (no ephemeral / write-only attributes).
 - Go `1.26.5` in `go.mod`. Library versions exactly as in Tech Stack (bump only via Dependabot PRs).
-- `internal/client/` is **generated only** (`go generate ./...`); CI fails on a generate diff. The vendored spec `api/openapi.yaml` is never hand-edited; `OPENAPI_REF` holds the full aether-api commit SHA it came from (initial: `03459f8f0c9edd982550e9f6ab3292bab5bb96c7`).
+- `internal/client/` is **generated only** (`go generate ./...`); CI fails on a generate diff. The vendored spec `api/openapi.yaml` is never hand-edited; `OPENAPI_REF` holds the full aether-api commit SHA it came from: **`8e9045a686060112ca27c4f73ce68844322b5c1b`** (aether-api #296). **Two earlier SHAs must never be re-pinned, and each fails at a DIFFERENT stage — measured with aether-api's `api/check-codegen.sh` against each spec:** at `03459f8` the **generator itself** exits 1 (`duplicate typename 'Tag' detected, can't auto-rename`), so no client is produced at all; at `8f03fbb` the generator exits 0 and the **client does not compile** (`client.gen.go: EnableRegistryResponse redeclared in this block`). A generator that succeeds is therefore not evidence the pin is usable — only a compile is.
 - Organization is **provider-level**: resources carry NO `organization_id`. API tokens are created in the portal; there is NO `aether_api_token` resource.
 - Out of scope: payment methods, tickets, admin routes, SSE streams, scan triggers, webhook tests, policy runs, invoice PDFs.
 - Field names are the live API's (`vcpus`, `memory_gb`, `disk_gb`, `min_vcpus`…), never the PRD example's (`machine_tier`, `eu-de`).
@@ -72,7 +72,9 @@ docs/                                     # tfplugindocs output (committed)
 .github/workflows/build-test.yml, release.yml, acceptance.yml, dependabot.yml (exists)
 ```
 
-Generated client naming (oapi-codegen, from operationIds): types `client.Cluster`, `client.CreateClusterRequest`, …; request bodies `client.CreateClusterJSONRequestBody` (= alias of the request type); methods on `*client.ClientWithResponses` named `<OperationId>WithResponse`, e.g. `GetClusterWithResponse(ctx, orgID, clusterID)`, `CreateClusterWithResponse(ctx, orgID, body)`, `ListClustersWithResponse(ctx, orgID, &client.ListClustersParams{Cursor: …, Limit: …})`. Responses expose `StatusCode()`, `Body []byte`, and `JSON200 *client.Cluster`-style typed fields. **Implementers verify exact names in `client.gen.go` after Task 2 and use those.**
+Generated client naming (oapi-codegen, from operationIds): types `client.Cluster`, `client.CreateClusterRequest`, …; request bodies `client.CreateClusterJSONRequestBody` (= alias of the request type); methods on `*client.ClientWithResponses` named `<OperationId>WithResponse`, e.g. `GetClusterWithResponse(ctx, orgID, clusterID)`, `CreateClusterWithResponse(ctx, orgID, body)`, `ListClustersWithResponse(ctx, orgID, &client.ListClustersParams{Cursor: …, Limit: …})`. Responses expose `StatusCode()`, `Body []byte`, `HTTPResponse *http.Response` (the source of the `X-Request-ID` header `apierr.Parse` needs) and `JSON200 *client.Cluster`-style typed fields. **Every `JSONnnn` field is nil unless the response's Content-Type contains `json`, and a response type only has the fields the spec documents for that operation** — `CreateClusterResponse`, for instance, has `JSON202` and no `JSON200`/`JSON201`, because `createCluster` documents 202 alone. So a matching status code is NOT sufficient: check the status, then nil-check the typed field, then use it. An unguarded `res.JSONnnn.Field` after a 200 is a nil dereference waiting for the first proxy that answers `text/html`. **Implementers verify exact names in `client.gen.go` after Task 2 and use those.**
+
+**IDs are `openapi_types.UUID`, not strings.** Every `format: uuid` field in the spec is generated as `openapi_types.UUID` (an alias of `google/uuid.UUID`, a `[16]byte`) — path parameters (`client.OrgID`, `client.ClusterID`, `client.PoolID`, …) and struct fields (`Organization.Id`) alike. So: **provider models and `providerData` hold canonical UUID TEXT (`string`), and the parse happens at the client boundary** — `var u client.OrgID; u.UnmarshalText([]byte(s))`, then `u.String()` to canonicalise. A malformed id is an **attribute diagnostic raised before any request is built**, never a downstream encoding failure that names neither the attribute nor the value. Parsing via the generated alias's own `UnmarshalText` keeps `github.com/google/uuid` an INDIRECT dependency. Test fakes serve real UUID text for the same reason — a fake keyed on `"org-1"` exercises a path production never takes.
 
 ---
 
@@ -83,7 +85,9 @@ Generated client naming (oapi-codegen, from operationIds): types `client.Cluster
 - Test: `internal/provider/provider_test.go`
 
 **Interfaces:**
-- Produces: `provider.New(version string) func() provider.Provider`; `type providerData struct { Client *client.ClientWithResponses; OrgID string }` stored in `resp.ResourceData`/`resp.DataSourceData`; `fakeapi.New(t) *fakeapi.Server` with `URL()`, `Token()`, `AddOrg(id, name, slug)`; env vars `AETHER_API_TOKEN`, `AETHER_ENDPOINT`, `AETHER_ORGANIZATION_ID`.
+- Produces: `provider.New(version string) func() provider.Provider`; `type providerData struct { Client *client.ClientWithResponses; OrgID string; orgID client.OrgID }` stored in `resp.ResourceData`/`resp.DataSourceData`; `fakeapi.New(t) *fakeapi.Server` with `URL()`, `Token()`, `AddOrg(id, name, slug)`; env vars `AETHER_API_TOKEN`, `AETHER_ENDPOINT`, `AETHER_ORGANIZATION_ID`.
+- `github.com/oapi-codegen/runtime` **v1.7.0** is a required (direct) dependency — the generated client imports it.
+- **`providerData.OrgID` stays a `string`** holding canonical UUID text, because every resource carries it as configuration data; the generated client wants `client.OrgID` (= `openapi_types.UUID`), so `Configure` parses at the boundary. An explicit `organization_id` that is not a UUID is an **attribute error on `organization_id` raised BEFORE any API call** — not a 404 from a request that could never have been well-formed. `fakeapi` therefore registers real UUID text, and the tests assert on it.
 - Consumes: `internal/client` from Task 2 (Task 1 and 2 are executed together in one branch; Task 1's `Configure` compiles only after Task 2's generation — run Task 2 Steps 1–4 first if the tree does not compile, then return).
 
 - [ ] **Step 1 [CODER]: Scaffold**
@@ -98,6 +102,7 @@ go get github.com/hashicorp/terraform-plugin-framework@v1.19.0 \
        github.com/hashicorp/terraform-plugin-log@v0.11.0 \
        github.com/hashicorp/terraform-plugin-testing@v1.16.0 \
        github.com/oapi-codegen/oapi-codegen/v2@v2.8.0 \
+       github.com/oapi-codegen/runtime@v1.7.0 \
        github.com/hashicorp/terraform-plugin-docs@v0.25.0
 printf '.tmp/\n.worktrees/\ndist/\n*.test\nterraform-provider-aether\n' > .gitignore
 ```
@@ -302,6 +307,16 @@ import (
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/fakeapi"
 )
 
+// Every organization id the generator produces is openapi_types.UUID, and
+// providerData.OrgID holds the canonical text the client round-trips it as.
+// These are real UUIDs rather than opaque labels, so the fixtures exercise the
+// same parse/format path production traffic does.
+const (
+	orgAcme      = "11111111-1111-4111-8111-111111111111"
+	orgSecondary = "22222222-2222-4222-8222-222222222222"
+	orgUnseen    = "33333333-3333-4333-8333-333333333333" // never registered on the fake
+)
+
 func configure(t *testing.T, endpoint, token, orgID string) (provider.ConfigureResponse, *providerData) {
 	t.Helper()
 	p := New("test")()
@@ -327,24 +342,24 @@ func configure(t *testing.T, endpoint, token, orgID string) (provider.ConfigureR
 
 func TestConfigure_ResolvesTheSingleOrganization(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "Acme", "acme")
+	api.AddOrg(orgAcme, "Acme", "acme")
 	resp, pd := configure(t, api.URL(), api.Token(), "")
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("diagnostics: %v", resp.Diagnostics)
 	}
-	if pd == nil || pd.OrgID != "org-1" {
-		t.Fatalf("OrgID = %+v, want org-1", pd)
+	if pd == nil || pd.OrgID != orgAcme {
+		t.Fatalf("OrgID = %+v, want %s", pd, orgAcme)
 	}
 }
 
 func TestConfigure_ExplicitOrganizationIsValidatedNotListed(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-explicit", "Acme", "acme")
-	resp, pd := configure(t, api.URL(), api.Token(), "org-explicit")
+	api.AddOrg(orgAcme, "Acme", "acme")
+	resp, pd := configure(t, api.URL(), api.Token(), orgAcme)
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("diagnostics: %v", resp.Diagnostics)
 	}
-	if pd.OrgID != "org-explicit" {
+	if pd.OrgID != orgAcme {
 		t.Fatalf("OrgID = %q", pd.OrgID)
 	}
 	var listed, validated bool
@@ -352,7 +367,7 @@ func TestConfigure_ExplicitOrganizationIsValidatedNotListed(t *testing.T) {
 		if r.Path == "/organizations" {
 			listed = true
 		}
-		if r.Path == "/organizations/org-explicit" {
+		if r.Path == "/organizations/"+orgAcme {
 			validated = true
 		}
 	}
@@ -363,17 +378,35 @@ func TestConfigure_ExplicitOrganizationIsValidatedNotListed(t *testing.T) {
 
 func TestConfigure_ExplicitOrganizationTheTokenCannotSeeIsRejected(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "Acme", "acme")
-	resp, _ := configure(t, api.URL(), api.Token(), "org-other") // fake answers 404 for unknown orgs
+	api.AddOrg(orgAcme, "Acme", "acme")
+	resp, _ := configure(t, api.URL(), api.Token(), orgUnseen) // fake answers 404 for unregistered orgs
 	if !resp.Diagnostics.HasError() || !contains(resp.Diagnostics.Errors()[0].Detail(), "organization_id") {
 		t.Fatalf("expected an organization_id error, got %v", resp.Diagnostics)
 	}
 }
 
+// An organization_id that is not a UUID cannot even be turned into a request
+// path, so it must be an attribute error BEFORE any API call - never a
+// downstream encoding failure naming neither the attribute nor the value.
+func TestConfigure_ExplicitOrganizationMustBeAUUID(t *testing.T) {
+	api := fakeapi.New(t)
+	api.AddOrg(orgAcme, "Acme", "acme")
+	resp, _ := configure(t, api.URL(), api.Token(), "not-a-uuid")
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an organization_id error")
+	}
+	if got := resp.Diagnostics.Errors()[0].Detail(); !contains(got, "organization_id") {
+		t.Fatalf("detail = %q, want a hint naming organization_id", got)
+	}
+	for _, r := range api.Requests() {
+		t.Fatalf("expected no API call for an invalid organization_id, got %s %s", r.Method, r.Path)
+	}
+}
+
 func TestConfigure_ErrorsWhenTokenSeesSeveralOrganizations(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "A", "a")
-	api.AddOrg("org-2", "B", "b")
+	api.AddOrg(orgAcme, "A", "a")
+	api.AddOrg(orgSecondary, "B", "b")
 	resp, _ := configure(t, api.URL(), api.Token(), "")
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected an error asking for organization_id")
@@ -393,7 +426,7 @@ func TestConfigure_ErrorsWhenTokenSeesNoOrganization(t *testing.T) {
 
 func TestConfigure_BadTokenIsOneProviderLevelError(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "A", "a")
+	api.AddOrg(orgAcme, "A", "a")
 	resp, _ := configure(t, api.URL(), "aether_wrong", "")
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected an error")
@@ -405,7 +438,7 @@ func TestConfigure_BadTokenIsOneProviderLevelError(t *testing.T) {
 
 func TestConfigure_ReadsEnvironment(t *testing.T) {
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "A", "a")
+	api.AddOrg(orgAcme, "A", "a")
 	t.Setenv("AETHER_API_TOKEN", api.Token())
 	t.Setenv("AETHER_ENDPOINT", api.URL())
 	p := New("test")()
@@ -466,7 +499,12 @@ const defaultEndpoint = "https://api.aetherplatform.cloud"
 // providerData is what every resource and data source receives from Configure.
 type providerData struct {
 	Client *client.ClientWithResponses
-	OrgID  string
+	// OrgID is canonical UUID TEXT, which is what resource models carry.
+	OrgID string
+	// orgID is the same id in the form the generated client demands. Parsed
+	// ONCE here, so no resource re-parses a value Configure already validated
+	// and no call site needs error handling for it.
+	orgID client.OrgID
 }
 
 type aetherProvider struct{ version string }
@@ -512,6 +550,28 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	// An unknown value is not an absent one, and ValueString() flattens both to
+	// "". Checked BEFORE the env fallback: falling back would silently use a
+	// different organization than the one being configured.
+	for _, u := range []struct {
+		attr  string
+		value types.String
+		env   string
+	}{
+		{"api_token", cfg.APIToken, "AETHER_API_TOKEN"},
+		{"endpoint", cfg.Endpoint, "AETHER_ENDPOINT"},
+		{"organization_id", cfg.OrganizationID, "AETHER_ORGANIZATION_ID"},
+	} {
+		if u.value.IsUnknown() {
+			resp.Diagnostics.AddAttributeError(path.Root(u.attr), "Unknown configuration value for "+u.attr,
+				fmt.Sprintf("The provider cannot create the Aether API client: %s is not yet known at configure time. "+
+					"Either target apply the source of the value first, set the value statically, or use the %s environment variable.", u.attr, u.env))
+		}
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	token := firstNonEmpty(cfg.APIToken.ValueString(), os.Getenv("AETHER_API_TOKEN"))
 	endpoint := firstNonEmpty(cfg.Endpoint.ValueString(), os.Getenv("AETHER_ENDPOINT"), defaultEndpoint)
 	orgID := firstNonEmpty(cfg.OrganizationID.ValueString(), os.Getenv("AETHER_ORGANIZATION_ID"))
@@ -519,6 +579,20 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		resp.Diagnostics.AddAttributeError(path.Root("api_token"), "Missing API token",
 			"Set api_token in the provider block or the AETHER_API_TOKEN environment variable. Tokens are created in the Aether portal.")
 		return
+	}
+
+	// The generated client types organization_id as client.OrgID
+	// (= openapi_types.UUID), so parse at the boundary, BEFORE any call: a
+	// syntax error belongs on the attribute, not in a downstream encoding
+	// failure. providerData.OrgID stays canonical UUID TEXT.
+	var orgUUID client.OrgID
+	if orgID != "" {
+		if err := orgUUID.UnmarshalText([]byte(orgID)); err != nil {
+			resp.Diagnostics.AddAttributeError(path.Root("organization_id"), "Invalid organization_id",
+				fmt.Sprintf("organization_id must be a UUID: %q is not (%s). Copy the id from the Aether portal, or omit organization_id and the provider resolves the organization the token belongs to.", orgID, err))
+			return
+		}
+		orgID = orgUUID.String() // canonicalise
 	}
 
 	httpClient := &http.Client{Transport: transport.New(token, http.DefaultTransport)}
@@ -530,7 +604,7 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 
 	if orgID != "" {
 		// Validate the override: the token belongs to exactly one organization.
-		g, err := c.GetOrganizationWithResponse(ctx, orgID)
+		g, err := c.GetOrganizationWithResponse(ctx, orgUUID)
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot reach the Aether API", fmt.Sprintf("GET %s/api/v1/organizations/%s: %s", endpoint, orgID, err))
 			return
@@ -556,16 +630,25 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 			resp.Diagnostics.AddError("Cannot list organizations", list.Status()+": "+string(list.Body))
 			return
 		}
+		// The generated parser fills JSON200 only on a JSON content type. A 200
+		// of HTML is a proxy or login page; dereferencing it panics.
+		if list.JSON200 == nil {
+			resp.Diagnostics.AddError("Aether API answered 200 without a JSON body",
+				fmt.Sprintf("GET %s/api/v1/organizations returned %s with content type %q. Check that endpoint points at the Aether API and not at a proxy or login page.",
+					endpoint, list.Status(), list.HTTPResponse.Header.Get("Content-Type")))
+			return
+		}
 		items := list.JSON200.Items
 		if len(items) != 1 {
 			resp.Diagnostics.AddAttributeError(path.Root("organization_id"), "Cannot resolve the organization",
 				fmt.Sprintf("The token sees %d organizations; set organization_id explicitly.", len(items)))
 			return
 		}
-		orgID = items[0].Id
+		orgUUID = items[0].Id
+		orgID = orgUUID.String()
 	}
 
-	data := &providerData{Client: c, OrgID: orgID}
+	data := &providerData{Client: c, OrgID: orgID, orgID: orgUUID}
 	resp.ResourceData = data
 	resp.DataSourceData = data
 }
@@ -643,7 +726,7 @@ echo "vendored api/openapi.yaml at $REF"
 
 ```bash
 chmod +x scripts/fetch-openapi.sh
-./scripts/fetch-openapi.sh 03459f8f0c9edd982550e9f6ab3292bab5bb96c7
+./scripts/fetch-openapi.sh 8e9045a686060112ca27c4f73ce68844322b5c1b
 ```
 
 - [ ] **Step 2 [CODER]: Generator config**
@@ -753,7 +836,7 @@ func TestContract_OperationsTheProviderCallsExist(t *testing.T) {
 
 - [ ] **Step 4 [TEST-RUNNER]:** `go test ./internal/client/ -count=1 -v` → PASS (field/method names come from the generator; if one is spelled differently than the test expects, the TEST-WRITER adjusts the expectation to the generated spelling and records it — the generator, not the test, is authoritative on spelling).
 
-- [ ] **Step 5 [CODER]: Commit** — `git add OPENAPI_REF api scripts internal/client && git commit -m "feat(client): vendor aether-api OpenAPI at 03459f8 and generate the client"`.
+- [ ] **Step 5 [CODER]: Commit** — `git add OPENAPI_REF api scripts internal/client && git commit -m "feat(client): vendor aether-api OpenAPI at 8e9045a and generate the client"`.
 
 ---
 
@@ -764,7 +847,9 @@ func TestContract_OperationsTheProviderCallsExist(t *testing.T) {
 - Test: `internal/provider/apierr/apierr_test.go`, `internal/provider/transport/retry_test.go`
 
 **Interfaces:**
-- Produces: `apierr.Parse(status int, body []byte) *apierr.Error` (`Error{Status int; Code, Message, RequestID string; Fields []FieldError{Field, Code, Message}}`, implements `error`); `apierr.IsNotFound(err error) bool`; `apierr.ToDiagnostics(err error, diags *diag.Diagnostics, attrPrefix path.Path)`; `transport.New(token string, next http.RoundTripper) http.RoundTripper` (bearer auth + retries: 429 honouring `Retry-After`, 5xx/transport 3× with 500ms→4s backoff; never retries non-idempotent 5xx? — rule: retry GET/PUT/DELETE on 5xx; retry POST only on 429 and on transport errors before any bytes were written).
+- Produces: `apierr.Parse(status int, header http.Header, body []byte) *apierr.Error` (`Error{Status int; Code, Message, RequestID string; Fields []FieldError{Field, Code, Message}}`, implements `error`); `apierr.IsNotFound(err error) bool`; `apierr.ToDiagnostics(err error, diags *diag.Diagnostics, attrPrefix path.Path)`; `transport.New(token string, next http.RoundTripper) http.RoundTripper`.
+- **The wire format is measured, not assumed** (aether-api `internal/api/handler/response.go` + `internal/api/middleware/requestid.go`, measured at `8f03fbb` and re-checked unchanged at the current pin `8e9045a`: `git diff 8f03fbb..8e9045a` touches only `api/openapi.yaml` — one component-key rename — plus three CI files, and no Go source in aether-api at all): the envelope is `{"error":{"code","message","details":[{"field","code","message"}]}}`. Field errors live under **`error.details`**; there is **no top-level `errors` list** and **no `request_id` in the body** — the request id is the **`X-Request-ID` response header**, set by middleware on every route. That is why `Parse` takes the header; call sites pass `resp.HTTPResponse.Header`.
+- Retry rules (`transport`): **429 retried for every method**, honouring **integer-seconds** `Retry-After` **clamped to ≤ 60 s** (overflow-guarded; a negative value falls through to the backoff rather than becoming a 0 wait). **5xx retried only for idempotent methods** (GET/HEAD/PUT/DELETE/OPTIONS), **1 + 3 attempts**, backoff 500 ms → 1 s → 2 s capped at 4 s; POST/PATCH surface a 5xx at once. A **transport error** is retried for idempotent methods, and for POST/PATCH **only when the failure proves nothing was written** (`*net.DNSError`, or `*net.OpError{Op:"dial"}`) — a connection that broke **mid-body is never replayed**. Nothing is replayed unless the body can be re-opened via `req.GetBody`. Discarded bodies are drained **bounded (64 KiB)** and closed; the **final** response propagates unread.
 
 - [ ] **Step 1 [TEST-WRITER]: Tests**
 
@@ -782,8 +867,11 @@ import (
 )
 
 func TestParse_ValidationErrorsCarryFields(t *testing.T) {
-	body := []byte(`{"error":{"code":"validation_error","message":"invalid request","request_id":"req-1"},"errors":[{"field":"k8s_version","code":"not_offered","message":"1.31 is not offered"},{"field":"name","code":"required","message":"name is required"}]}`)
-	e := Parse(http.StatusUnprocessableEntity, body)
+	// Measured shape: details under error.details, request id in the header.
+	body := []byte(`{"error":{"code":"validation_error","message":"invalid request","details":[{"field":"k8s_version","code":"not_offered","message":"1.31 is not offered"},{"field":"name","code":"required","message":"name is required"}]}}`)
+	hdr := http.Header{}
+	hdr.Set("X-Request-Id", "req-1")
+	e := Parse(http.StatusUnprocessableEntity, hdr, body)
 	if e.Status != 422 || e.Code != "validation_error" || e.RequestID != "req-1" {
 		t.Fatalf("%+v", e)
 	}
@@ -793,30 +881,30 @@ func TestParse_ValidationErrorsCarryFields(t *testing.T) {
 }
 
 func TestParse_PlainErrorEnvelope(t *testing.T) {
-	e := Parse(http.StatusConflict, []byte(`{"error":{"code":"conflict","message":"name already exists"}}`))
+	e := Parse(http.StatusConflict, http.Header{}, []byte(`{"error":{"code":"conflict","message":"name already exists"}}`))
 	if e.Code != "conflict" || e.Message != "name already exists" || len(e.Fields) != 0 {
 		t.Fatalf("%+v", e)
 	}
 }
 
 func TestParse_NonJSONBodyStillProducesAnError(t *testing.T) {
-	e := Parse(http.StatusBadGateway, []byte("<html>502</html>"))
+	e := Parse(http.StatusBadGateway, http.Header{}, []byte("<html>502</html>"))
 	if e.Status != 502 || e.Message == "" {
 		t.Fatalf("%+v", e)
 	}
 }
 
 func TestIsNotFound(t *testing.T) {
-	if !IsNotFound(Parse(404, []byte(`{"error":{"code":"not_found","message":"gone"}}`))) {
+	if !IsNotFound(Parse(404, http.Header{}, []byte(`{"error":{"code":"not_found","message":"gone"}}`))) {
 		t.Fatal("404 must be IsNotFound")
 	}
-	if IsNotFound(Parse(500, nil)) {
+	if IsNotFound(Parse(500, nil, nil)) { // a nil Header must be safe
 		t.Fatal("500 must not be IsNotFound")
 	}
 }
 
 func TestToDiagnostics_ValidationBecomesAttributeErrors(t *testing.T) {
-	e := Parse(422, []byte(`{"error":{"code":"validation_error","message":"invalid"},"errors":[{"field":"k8s_version","code":"not_offered","message":"1.31 is not offered"}]}`))
+	e := Parse(422, http.Header{}, []byte(`{"error":{"code":"validation_error","message":"invalid","details":[{"field":"k8s_version","code":"not_offered","message":"1.31 is not offered"}]}}`))
 	var d diag.Diagnostics
 	ToDiagnostics(e, &d, path.Empty())
 	if len(d) != 1 {
@@ -830,7 +918,7 @@ func TestToDiagnostics_ValidationBecomesAttributeErrors(t *testing.T) {
 
 func TestToDiagnostics_AuthIsOneProviderHint(t *testing.T) {
 	var d diag.Diagnostics
-	ToDiagnostics(Parse(403, []byte(`{"error":{"code":"forbidden","message":"nope"}}`)), &d, path.Empty())
+	ToDiagnostics(Parse(403, http.Header{}, []byte(`{"error":{"code":"forbidden","message":"nope"}}`)), &d, path.Empty())
 	if len(d) != 1 || !containsStr(d[0].Detail(), "api_token") {
 		t.Fatalf("diags = %v", d)
 	}
@@ -838,7 +926,9 @@ func TestToDiagnostics_AuthIsOneProviderHint(t *testing.T) {
 
 func TestToDiagnostics_RequestIDIsSurfaced(t *testing.T) {
 	var d diag.Diagnostics
-	ToDiagnostics(Parse(500, []byte(`{"error":{"code":"internal","message":"boom","request_id":"req-9"}}`)), &d, path.Empty())
+	hdr := http.Header{}
+	hdr.Set("X-Request-Id", "req-9")
+	ToDiagnostics(Parse(500, hdr, []byte(`{"error":{"code":"internal","message":"boom"}}`)), &d, path.Empty())
 	if !containsStr(d[0].Detail(), "req-9") {
 		t.Fatalf("detail = %q", d[0].Detail())
 	}
@@ -853,6 +943,15 @@ func containsStr(s, sub string) bool {
 	return false
 }
 ```
+
+The tree's `apierr_test.go` carries **six** fixtures beyond the seven in the block above; keep them when regenerating it, because each locks a distinct property of the measured contract:
+
+- `TestParse_OldWrongEnvelopeShapeYieldsNoFieldErrors` — a body in the shape the ORIGINAL brief assumed (top-level `errors`, body `request_id`) must yield **zero** field errors and an empty `RequestID`. This is the regression lock: without it, re-adopting the wrong envelope passes silently.
+- `TestParse_NoRequestIDHeaderLeavesRequestIDEmpty` — no `X-Request-Id` header ⇒ `RequestID == ""`, so a missing id is absent rather than invented.
+- `TestParse_NilHeaderIsSafe` — a nil `http.Header` must not panic (`http.Header(nil).Get` is defined), because a transport-level failure can leave one.
+- `TestToDiagnostics_NoRequestIDHeaderOmitsSuffix` — with no id, the diagnostic carries no "request id" suffix at all.
+- `TestToDiagnostics_NilHeaderParseOmitsRequestIDSuffix` — same for an error parsed from a nil header.
+- `TestToDiagnostics_NestedFieldPathAddressesNestedAttribute` — a dotted API field (`node_pools.name`) becomes `path.Root("node_pools").AtName("name")`, not one flat attribute name.
 
 `internal/provider/transport/retry_test.go`:
 
@@ -935,6 +1034,7 @@ package apierr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -962,44 +1062,55 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("aether api: %d: %s", e.Status, e.Message)
 }
 
-// envelope matches ErrorResponse (+ the 422 "errors" list) in api/openapi.yaml.
+// envelope matches ErrorResponse/ErrorBody in aether-api's
+// internal/api/handler/response.go (measured at 8f03fbb, byte-identical at
+// the current pin 8e9045a), which is what the vendored
+// api/openapi.yaml describes. Field errors are error.details; there is no
+// top-level "errors" list and no request_id in the body.
 type envelope struct {
 	Error struct {
-		Code      string `json:"code"`
-		Message   string `json:"message"`
-		RequestID string `json:"request_id"`
-	} `json:"error"`
-	Errors []struct {
-		Field   string `json:"field"`
 		Code    string `json:"code"`
 		Message string `json:"message"`
-	} `json:"errors"`
+		Details []struct {
+			Field   string `json:"field"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"details"`
+	} `json:"error"`
 }
 
-func Parse(status int, body []byte) *Error {
-	e := &Error{Status: status}
+// Parse reads an API error response. header is the RESPONSE header, which is
+// where the request id lives; a nil header is safe (http.Header(nil).Get
+// returns ""). It never returns nil.
+func Parse(status int, header http.Header, body []byte) *Error {
+	// Get canonicalises the key, so the wire's X-Request-ID matches.
+	e := &Error{Status: status, RequestID: header.Get("X-Request-Id")}
 	var env envelope
-	if err := json.Unmarshal(body, &env); err != nil || (env.Error.Message == "" && len(env.Errors) == 0) {
-		e.Message = strings.TrimSpace(http.StatusText(status) + " " + truncate(string(body), 200))
+	if err := json.Unmarshal(body, &env); err != nil || (env.Error.Message == "" && len(env.Error.Details) == 0) {
+		e.Message = strings.TrimSpace(http.StatusText(status) + " " + Truncate(string(body), 200))
 		return e
 	}
-	e.Code, e.Message, e.RequestID = env.Error.Code, env.Error.Message, env.Error.RequestID
-	for _, f := range env.Errors {
+	e.Code, e.Message = env.Error.Code, env.Error.Message
+	for _, f := range env.Error.Details {
 		e.Fields = append(e.Fields, FieldError{Field: f.Field, Code: f.Code, Message: f.Message})
 	}
 	return e
 }
 
 func IsNotFound(err error) bool {
-	e, ok := err.(*Error)
-	return ok && e.Status == http.StatusNotFound
+	// errors.As, not a bare type assertion: this package's own errors travel
+	// wrapped (the wait helper wraps probe errors with %w), and `err.(*Error)`
+	// silently answers false for a wrapped one - so a 404 mid-wait would stop
+	// looking like a 404.
+	var e *Error
+	return errors.As(err, &e) && e.Status == http.StatusNotFound
 }
 
 // ToDiagnostics appends diagnostics for err. attrPrefix is prepended to field paths
 // (path.Empty() for top-level attributes).
 func ToDiagnostics(err error, diags *diag.Diagnostics, attrPrefix path.Path) {
-	e, ok := err.(*Error)
-	if !ok {
+	var e *Error
+	if !errors.As(err, &e) {
 		diags.AddError("Aether API request failed", err.Error())
 		return
 	}
@@ -1027,125 +1138,56 @@ func ToDiagnostics(err error, diags *diag.Diagnostics, attrPrefix path.Path) {
 		diags.AddError("Aether API error", fmt.Sprintf("%d %s: %s%s", e.Status, e.Code, e.Message, rid))
 	}
 }
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
-}
 ```
 
-`internal/provider/transport/retry.go`:
+`Truncate` is stated as rules rather than carried as code, because the copy that lived here
+sliced raw bytes and the tree's version does more than that:
 
-```go
-// Package transport is the provider's HTTP layer: bearer auth plus bounded retries.
-package transport
+- **Exported**, because every caller that puts a response body into a diagnostic needs it;
+  an unbounded body in a diagnostic is a defect, not a verbosity choice.
+- Cuts on a **rune boundary** (walk back while `!utf8.ValidString(cut)`), so a truncation
+  never manufactures a replacement character of its own.
+- Runs `strings.ToValidUTF8` on **EVERY** path, including the no-cut path. A response body
+  is bytes from elsewhere: it can be invalid UTF-8 at any offset, including inside the
+  first `n` bytes, and a diagnostic carrying invalid UTF-8 fails to serialise over the
+  plugin protocol.
 
-import (
-	"bytes"
-	"io"
-	"net/http"
-	"strconv"
-	"time"
-)
+`internal/provider/transport/retry.go` — the rules, not a second copy of the code. A
+reference implementation carried here diverged from the measured contract once already; the
+implementation that satisfies every rule below is `internal/provider/transport/retry.go`,
+and the tests above are the contract:
 
-const maxRetries = 3
+- Concrete type `retryTransport{token, next, backoff func(attempt int) time.Duration}`;
+  `New` returns it as an `http.RoundTripper`. `backoff` is a FIELD, not a package function,
+  because the tests type-assert and zero it.
+- `RoundTrip` works on `req.Clone(req.Context())` — a RoundTripper must not mutate the
+  caller's request — sets `Authorization: Bearer <token>`, and sets `User-Agent` only when
+  the caller left it empty.
+- **`maxRetries = 3`**, so an idempotent request makes at most **1 + 3 = 4** attempts.
+  `defaultBackoff` is 500 ms → 1 s → 2 s, capped at 4 s, shift-guarded for large attempts.
+- **429 is retried for every method.** `Retry-After` is read as **integer seconds only**
+  (the HTTP-date form is legal but this API does not send it) and **clamped to ≤ 60 s** so
+  a hostile or buggy header cannot park an apply. A **negative** value FALLS THROUGH to
+  `backoff(attempt)`, exactly like an absent or unparseable one — it is deliberately not
+  clamped to 0, because a 0 wait would fire every remaining retry back-to-back, which is
+  the opposite of what a 429 asks for.
+- **5xx is retried only for idempotent methods** — GET, HEAD, PUT, DELETE, OPTIONS. POST and
+  PATCH surface a 5xx immediately: the server may have acted, and a replay bills the
+  customer twice.
+- A **transport error** is retried for idempotent methods. For POST/PATCH it is replayed
+  **only when the failure proves nothing was written**: `errors.As` a `*net.DNSError`, or a
+  `*net.OpError` with `Op == "dial"`. net/http exposes no "nothing written" signal of its
+  own, so a connection that broke **mid-body is deliberately not replayed**.
+- **Nothing is replayed unless the body can be re-opened**: `req.Body == nil`,
+  `req.Body == http.NoBody`, or `req.GetBody != nil`. Each retry re-opens the body via
+  `req.GetBody()`.
+- Every **discarded** response is drained **bounded — `io.CopyN(io.Discard, resp.Body, 64<<10)`** —
+  and closed, so the connection is reusable without reading an unbounded error page. The
+  **final** response is returned **unread and unclosed**, so it propagates exactly as if
+  there were no retry layer; in particular the 4th 5xx must still have a readable body.
+- `sleep` waits on `req.Context().Done()` as well as the timer and returns the context
+  error, so a cancelled apply does not sit out the remaining backoff.
 
-type retryTransport struct {
-	token   string
-	next    http.RoundTripper
-	backoff func(attempt int) time.Duration
-}
-
-func New(token string, next http.RoundTripper) http.RoundTripper {
-	return &retryTransport{token: token, next: next, backoff: defaultBackoff}
-}
-
-func defaultBackoff(attempt int) time.Duration {
-	d := 500 * time.Millisecond << attempt // 0.5s, 1s, 2s
-	if d > 4*time.Second {
-		d = 4 * time.Second
-	}
-	return d
-}
-
-func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req = req.Clone(req.Context())
-	req.Header.Set("Authorization", "Bearer "+t.token)
-	req.Header.Set("User-Agent", "terraform-provider-aether")
-
-	var body []byte
-	if req.Body != nil && req.Body != http.NoBody {
-		b, err := io.ReadAll(req.Body)
-		if err != nil {
-			return nil, err
-		}
-		body = b
-	}
-	idempotent := req.Method == http.MethodGet || req.Method == http.MethodPut || req.Method == http.MethodDelete || req.Method == http.MethodHead
-
-	var last *http.Response
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if body != nil {
-			req.Body = io.NopCloser(bytes.NewReader(body))
-		}
-		resp, err := t.next.RoundTrip(req)
-		if err != nil {
-			lastErr, last = err, nil
-			if !idempotent { // a POST may have reached the server; do not replay it
-				return nil, err
-			}
-		} else {
-			last, lastErr = resp, nil
-			if resp.StatusCode == http.StatusTooManyRequests {
-				wait := t.backoff(attempt)
-				if ra := resp.Header.Get("Retry-After"); ra != "" {
-					if secs, perr := strconv.Atoi(ra); perr == nil {
-						wait = time.Duration(secs) * time.Second
-					}
-				}
-				drain(resp)
-				if attempt == maxRetries {
-					return resp, nil
-				}
-				sleep(req, wait)
-				continue
-			}
-			if resp.StatusCode < 500 || !idempotent {
-				return resp, nil
-			}
-			drain(resp)
-		}
-		if attempt == maxRetries {
-			break
-		}
-		sleep(req, t.backoff(attempt))
-	}
-	if last != nil {
-		return last, nil
-	}
-	return nil, lastErr
-}
-
-func drain(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-}
-
-func sleep(req *http.Request, d time.Duration) {
-	if d <= 0 {
-		return
-	}
-	select {
-	case <-time.After(d):
-	case <-req.Context().Done():
-	}
-}
-```
-
-Note: after `drain` on a 5xx that is the LAST attempt, the caller receives a response with a closed body; to keep it readable, on the last attempt do not drain — restructure so `drain` runs only when a retry will follow. The tests above pin the retry counts; the implementer keeps the returned body readable (read into a buffer and re-wrap with `io.NopCloser` if simpler).
 
 - [ ] **Step 4 [TEST-RUNNER]:** `go test ./internal/provider/apierr/ ./internal/provider/transport/ -count=1 -race -v` → PASS.
 - [ ] **Step 5 [CODER]: Commit** — `feat: API error mapping and retrying bearer transport`.
@@ -1166,7 +1208,21 @@ func ForGone(ctx context.Context, probe func(ctx context.Context) (gone bool, er
 var ErrTimeout = errors.New("wait: timeout")
 type FailedError struct { Status, Message string }   // implements error
 ```
-`Now`/`Sleep` default to real time; tests inject fakes. Backoff 1s doubling to 15s cap.
+`Now`/`Sleep` default to real time; tests inject fakes. Four rules are the contract:
+
+- **Match the status on EVERY probe, including the first — check before sleep.** A
+  sleep-then-check loop makes the fastest operation take a whole backoff interval and hides
+  a resource that was already terminal when the wait began.
+- **A `Warning` status is TERMINAL.** It ends the wait with `Result.Warned = true` and the
+  API's message; the caller surfaces that as a **warning diagnostic** (a `degraded` cluster
+  has finished coming up). Polling on would hang to the timeout and then report a failure
+  that did not happen.
+- **Backoff 1 s, 2 s, 4 s, 8 s, then 15 s — capped AFTER the doubling**, so the sequence
+  never jumps 8 s → 16 s. Exactly one sleep per non-terminal probe.
+- **A timeout wraps `ErrTimeout` with `%w` and NAMES the last observed status**; a `Failed`
+  status returns `*FailedError` (a POINTER, so `errors.As` matches); a probe error
+  short-circuits, wrapped so `errors.Is`/`errors.As` still reach the cause. The production
+  `Sleep` honours context cancellation.
 
 - [ ] **Step 1 [TEST-WRITER]:**
 
@@ -1329,13 +1385,23 @@ func in(set []string, s string) bool {
 	return false
 }
 
-func backoff(attempt int) time.Duration {
-	d := time.Second << attempt
-	if d > 15*time.Second {
-		d = 15 * time.Second
-	}
-	return d
-}
+// backoff / nextSleep are stated as RULES rather than carried as code: the copy
+// that lived here had `d := time.Second << attempt` with no shift guard, which
+// overflows to a NEGATIVE duration around attempt 34 and turns the wait into a
+// busy loop, and it predates the deadline clamp. The implementation is
+// internal/provider/wait/wait.go:
+//
+//   - backoff(attempt) is 1s, 2s, 4s, 8s, then 15s forever, the cap applied
+//     AFTER the doubling so the sequence never jumps 8s -> 16s. The shift is
+//     guarded (`if attempt >= 4 { return 15 * time.Second }`), so no attempt
+//     count can overflow it.
+//   - nextSleep(attempt, now, deadline) is backoff CLAMPED to the time
+//     remaining: sleeping past the deadline both overruns the caller's timeout
+//     and reports a staler "last status" than the clock allowed for. The
+//     unclamped sequence survives whenever there is room, which is every
+//     ordinary case.
+//   - Exactly one sleep per non-terminal probe, and the production Sleep
+//     honours context cancellation.
 
 func ForStatus(ctx context.Context, probe Probe, opts Options) (Result, error) {
 	opts.defaults()
@@ -1358,7 +1424,7 @@ func ForStatus(ctx context.Context, probe Probe, opts Options) (Result, error) {
 		if !opts.Now().Before(deadline) {
 			return Result{}, fmt.Errorf("%w after %s; last status %q", ErrTimeout, opts.Timeout, last)
 		}
-		if err := opts.Sleep(ctx, backoff(attempt)); err != nil {
+		if err := opts.Sleep(ctx, nextSleep(attempt, opts.Now(), deadline)); err != nil {
 			return Result{}, err
 		}
 	}
@@ -1378,7 +1444,7 @@ func ForGone(ctx context.Context, probe func(ctx context.Context) (bool, error),
 		if !opts.Now().Before(deadline) {
 			return fmt.Errorf("%w after %s; resource still present", ErrTimeout, opts.Timeout)
 		}
-		if err := opts.Sleep(ctx, backoff(attempt)); err != nil {
+		if err := opts.Sleep(ctx, nextSleep(attempt, opts.Now(), deadline)); err != nil {
 			return err
 		}
 	}
@@ -1393,7 +1459,9 @@ func ForGone(ctx context.Context, probe func(ctx context.Context) (bool, error),
 
 **Files:** Create `internal/provider/versions/versions.go`; Test `internal/provider/versions/versions_test.go`.
 
-**Interfaces:** Produces `versions.K8sVersionType{}` (a `basetypes.StringTypable`) and `versions.K8sVersionValue` (a `basetypes.StringValuableWithSemanticEquals`); `versions.NewK8sVersionValue(s string) K8sVersionValue`; `versions.SemanticallyEqual(configured, actual string) bool`; `versions.IsForward(from, to string) (bool, error)`; `versions.Minor(v string) (major, minor int, err error)`.
+**Interfaces:** Produces `versions.K8sVersionType{}` (a `basetypes.StringTypable`) and `versions.K8sVersionValue` (a `basetypes.StringValuableWithSemanticEquals`); `versions.NewK8sVersionValue(s string) K8sVersionValue`; `versions.SemanticallyEqual(configured, actual string) bool`; `versions.IsForward(from, to string) (bool, error)`; `versions.Minor(v string) (major, minor int, err error)`. No `latest` keyword at this layer.
+
+**Direction is load-bearing.** The framework calls `proposedNew.StringSemanticEquals(ctx, prior)` and, when it returns true, keeps the **prior** value in state — measured in terraform-plugin-framework v1.19.0, `internal/fwschemadata/value_semantic_equality_string.go:37` (the call) and `:53` (`resp.NewValue = priorValuable`). So the **receiver is the API's value** and the **argument is the configured/prior** one, and the hook must compute `SemanticallyEqual(configured = argument, actual = receiver)`. The two orders are not the same function: `SemanticallyEqual("1.37", "1.37.0")` is true while `SemanticallyEqual("1.37.0", "1.37")` is false, so a hook written backwards is a real bug that a test whose operands happen to be ordered the same way will not catch.
 
 - [ ] **Step 1 [TEST-WRITER]:**
 
@@ -1437,14 +1505,24 @@ func TestIsForward(t *testing.T) {
 }
 
 func TestValue_SemanticEqualsHook(t *testing.T) {
-	v := NewK8sVersionValue("1.37")
-	eq, diags := v.StringSemanticEquals(context.Background(), NewK8sVersionValue("1.37.0"))
+	// The framework calls proposedNew.StringSemanticEquals(ctx, prior)
+	// (terraform-plugin-framework v1.19.0,
+	// internal/fwschemadata/value_semantic_equality_string.go:37), so the
+	// RECEIVER is the API's value and the ARGUMENT is the configured one.
+	apiValue := NewK8sVersionValue("1.37.4")
+	eq, diags := apiValue.StringSemanticEquals(context.Background(), NewK8sVersionValue("1.37"))
 	if diags.HasError() || !eq {
-		t.Fatalf("eq=%v diags=%v", eq, diags)
+		t.Fatalf("eq=%v diags=%v; a configured 1.37 must accept the API's 1.37.4", eq, diags)
 	}
-	eq, _ = v.StringSemanticEquals(context.Background(), basetypes.NewStringValue("1.38.0"))
-	if eq {
-		t.Fatal("1.37 vs 1.38.0 must not be equal")
+	// The SAME two strings in the other role must NOT be equal: a configured
+	// 1.37.4 pins the patch, so an API value of 1.37 does not satisfy it. This
+	// is the assertion that fails when the hook swaps its operands.
+	reversed := NewK8sVersionValue("1.37")
+	if eq, _ := reversed.StringSemanticEquals(context.Background(), NewK8sVersionValue("1.37.4")); eq {
+		t.Fatal("configured 1.37.4 vs API 1.37 must not be equal — the hook has its operands reversed")
+	}
+	if eq, _ := apiValue.StringSemanticEquals(context.Background(), basetypes.NewStringValue("1.38")); eq {
+		t.Fatal("configured 1.38 vs API 1.37.4 must not be equal")
 	}
 }
 ```
@@ -1580,7 +1658,9 @@ func (v K8sVersionValue) StringSemanticEquals(ctx context.Context, newValuable b
 	if v.IsNull() || v.IsUnknown() || nv.IsNull() || nv.IsUnknown() {
 		return v.StringValue.Equal(nv), diags
 	}
-	return SemanticallyEqual(v.ValueString(), nv.ValueString()), diags
+	// v is the RECEIVER = proposedNew = the API's value; nv is the ARGUMENT =
+	// prior = what was configured. Do not swap these (see Interfaces above).
+	return SemanticallyEqual(nv.ValueString(), v.ValueString()), diags
 }
 ```
 
@@ -1597,7 +1677,7 @@ func (v K8sVersionValue) StringSemanticEquals(ctx context.Context, newValuable b
 - Produces: `NewClusterResource() resource.Resource`; model `clusterModel` with `tfsdk` tags = attribute names below; helpers `defaultTimeouts(ctx, m timeouts.Value) (create, update, delete time.Duration)`.
 
 Schema (attribute → framework type; C=Configured, P=Computed, R=RequiresReplace):
-`id` P (UseStateForUnknown) · `name` C · `region` C+R · `k8s_version` C, `CustomType: versions.K8sVersionType{}` · `public_endpoint` C, Optional+Computed, `Default: booldefault.StaticBool(false)` · `plan` C Optional · `status`, `status_message`, `endpoint`, `observed_kubernetes_version`, `capi_cluster_name`, `keycloak_realm`, `harbor_project`, `ceph_pool`, `lb_subnet`, `worker_subnet`, `created_at`, `updated_at` P · `timeouts` (framework-timeouts `timeouts.Attributes(ctx, timeouts.Opts{Create: true, Update: true, Delete: true})`).
+`id` P (UseStateForUnknown) · `name` C · `region` C+R · `k8s_version` C, `CustomType: versions.K8sVersionType{}` · `public_endpoint` C+**R**, Optional+Computed, `Default: booldefault.StaticBool(false)` · `plan` C+**R** Optional · `status`, `status_message`, `endpoint`, `observed_kubernetes_version`, `capi_cluster_name`, `keycloak_realm`, `harbor_project`, `ceph_pool`, `lb_subnet`, `worker_subnet`, `created_at`, `updated_at` P · `timeouts` (framework-timeouts `timeouts.Attributes(ctx, timeouts.Opts{Create: true, Update: true, Delete: true})`).
 
 - [ ] **Step 1 [TEST-WRITER]: fakeapi cluster routes + resource tests**
 
@@ -1631,7 +1711,7 @@ func factories() map[string]func() (tfprotov6.ProviderServer, error) {
 func setupFake(t *testing.T) *fakeapi.Server {
 	t.Helper()
 	api := fakeapi.New(t)
-	api.AddOrg("org-1", "Acme", "acme")
+	api.AddOrg("11111111-1111-4111-8111-111111111111", "Acme", "acme")
 	t.Setenv("AETHER_ENDPOINT", api.URL())
 	t.Setenv("AETHER_API_TOKEN", api.Token())
 	return api
@@ -1756,6 +1836,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -1817,9 +1898,28 @@ func (r *clusterResource) Schema(ctx context.Context, _ resource.SchemaRequest, 
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()}},
 			"k8s_version": schema.StringAttribute{Required: true, CustomType: versions.K8sVersionType{},
 				MarkdownDescription: "`MAJOR.MINOR` (resolves to the latest offered patch) or an explicit `MAJOR.MINOR.PATCH` of an offered minor. `1.37` and `1.37.0` are treated as equal. Only forward changes are allowed and go through an upgrade."},
+			// Both of these are IMMUTABLE after create, measured in the
+			// vendored spec: UpdateClusterRequest carries public_endpoint
+			// "accepted only when it equals the cluster's current value ...
+			// any other value is rejected with 422
+			// public_endpoint/immutable", and has NO field for plan at all
+			// (Cluster.plan_slug: "Immutable - no endpoint changes it"). So a
+			// change to either can only be honoured by replacement; without
+			// RequiresReplace the provider plans an in-place update the API
+			// will reject.
 			"public_endpoint": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				MarkdownDescription: "Expose the API server on a public IP + DNS name (billed per public IP)."},
-			"plan":                        schema.StringAttribute{Optional: true, MarkdownDescription: "Plan slug; omit for the default."},
+				PlanModifiers:       []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
+				MarkdownDescription: "Expose the API server on a public IP + DNS name (billed per public IP). Immutable: changing it replaces the cluster."},
+			// Optional+Computed with a static default has a subtlety here:
+			// REMOVING public_endpoint from the configuration plans the
+			// default (false), not "no change". If state holds true, that is a
+			// change, and with RequiresReplace it is a REPLACEMENT - correct
+			// per the API, but it means dropping the attribute is not a no-op.
+			// The attribute's description has to say so, and the acceptance
+			// test for it asserts the plan, not just the apply.
+			"plan": schema.StringAttribute{Optional: true,
+				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
+				MarkdownDescription: "Package slug (`dev`, `starter`, `growth`, `scale`); omit to be billed per resource. Immutable: changing it replaces the cluster."},
 			"status":                      computedString(),
 			"status_message":              computedString(),
 			"endpoint":                    computedString(),
@@ -1867,6 +1967,27 @@ func (r *clusterResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	}
 }
 
+// parseID turns an id the provider holds as canonical UUID TEXT into the
+// openapi_types.UUID the generated client requires. client.OrgID, ClusterID,
+// PoolID and friends are all ALIASES of that one type, so a single helper
+// serves every call. Lives in internal/provider/ids.go and is shared by Tasks
+// 6/7/8+.
+//
+// The organization id is parsed ONCE, in Configure, and carried on
+// providerData as `orgID client.OrgID` beside the canonical-text `OrgID
+// string` the models use — so resource code never re-parses it and the call
+// sites below need no error handling for it. Ids that arrive from STATE
+// (cluster, pool) are parsed per call, because state is data from outside this
+// process: a hand-edited or truncated id must become an attribute diagnostic,
+// not a request that cannot be built.
+func parseID(s string) (client.OrgID, error) {
+	var u client.OrgID
+	if err := u.UnmarshalText([]byte(s)); err != nil {
+		return u, fmt.Errorf("%q is not a UUID: %w", s, err)
+	}
+	return u, nil
+}
+
 func (r *clusterResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan clusterModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -1887,17 +2008,35 @@ func (r *clusterResource) Create(ctx context.Context, req resource.CreateRequest
 		v := plan.Plan.ValueString()
 		body.Plan = &v
 	}
-	res, err := r.pd.Client.CreateClusterWithResponse(ctx, r.pd.OrgID, body)
+	res, err := r.pd.Client.CreateClusterWithResponse(ctx, r.pd.orgID, body)
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot create cluster", err.Error())
 		return
 	}
-	if res.StatusCode() != http.StatusCreated && res.StatusCode() != http.StatusAccepted && res.StatusCode() != http.StatusOK {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+	// createCluster documents **202 only** ("Cluster accepted for
+	// provisioning", api/openapi.yaml), and CreateClusterResponse carries a
+	// single typed success field, JSON202 — there is no JSON200 or JSON201 to
+	// fall back on. Accepting 200/201 here would take a body the parser never
+	// populated.
+	if res.StatusCode() != http.StatusAccepted {
+		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
 		return
 	}
-	created := clusterFromResponse(res.Body)
-	plan.ID = types.StringValue(created.Id)
+	// Use the TYPED body and guard it. An id must never come from an
+	// unchecked decode: a 202 whose body is not the expected JSON leaves a
+	// ZERO UUID, and the next line persists it to state — recording
+	// 00000000-0000-0000-0000-000000000000 while the cluster that was really
+	// created is orphaned, unreferenced by any state and un-importable
+	// without hunting for it in the portal. Failing here instead leaves no
+	// state entry at all, which is the recoverable outcome.
+	created := res.JSON202
+	if created == nil {
+		resp.Diagnostics.AddError("Aether API accepted the cluster but returned no usable body",
+			fmt.Sprintf("POST %s returned %s with content type %q. The cluster may exist; check the portal before retrying, since a retry creates a second one.",
+				res.HTTPResponse.Request.URL, res.Status(), res.HTTPResponse.Header.Get("Content-Type")))
+		return
+	}
+	plan.ID = types.StringValue(created.Id.String()) // UUID -> canonical text for state
 	// Persist the id immediately so a wait failure leaves an importable resource in state.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 
@@ -1919,7 +2058,12 @@ func (r *clusterResource) Read(ctx context.Context, req resource.ReadRequest, re
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	res, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.OrgID, state.ID.ValueString())
+	clusterID, err := parseID(state.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid cluster id in state", err.Error())
+		return
+	}
+	res, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.orgID, clusterID)
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot read cluster", err.Error())
 		return
@@ -1929,7 +2073,13 @@ func (r *clusterResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 	if res.StatusCode() != http.StatusOK {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
+		return
+	}
+	if res.JSON200 == nil {
+		resp.Diagnostics.AddError("Aether API answered 200 without a JSON body",
+			fmt.Sprintf("GET %s returned %s with content type %q.",
+				res.HTTPResponse.Request.URL, res.Status(), res.HTTPResponse.Header.Get("Content-Type")))
 		return
 	}
 	r.flatten(res.JSON200, &state)
@@ -1945,42 +2095,47 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 	}
 	updateTimeout, d := plan.Timeouts.Update(ctx, 30*time.Minute)
 	resp.Diagnostics.Append(d...)
-	id := state.ID.ValueString()
+	clusterID, err := parseID(state.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid cluster id in state", err.Error())
+		return
+	}
 
-	// 1. mutable scalar fields via PUT
-	if plan.Name != state.Name || plan.PublicEndpoint != state.PublicEndpoint {
-		body := client.UpdateClusterJSONRequestBody{}
-		if plan.Name != state.Name {
-			v := plan.Name.ValueString()
-			body.Name = &v
-		}
-		if plan.PublicEndpoint != state.PublicEndpoint {
-			v := plan.PublicEndpoint.ValueBool()
-			body.PublicEndpoint = &v
-		}
-		res, err := r.pd.Client.UpdateClusterWithResponse(ctx, r.pd.OrgID, id, body)
+	// 1. mutable scalar fields via PUT.
+	//
+	// `name` is the ONLY field Update sends. public_endpoint and plan are
+	// immutable (see the schema above) and now carry RequiresReplace, so a
+	// change to either never reaches Update at all - Terraform destroys and
+	// recreates instead. Sending public_endpoint here would be either a no-op
+	// (the API accepts it only at its current value) or a guaranteed 422
+	// public_endpoint/immutable; omitting it is the only shape that is right
+	// in both cases. k8s_version has its own endpoint, below.
+	if plan.Name != state.Name {
+		name := plan.Name.ValueString()
+		body := client.UpdateClusterJSONRequestBody{Name: &name}
+		res, err := r.pd.Client.UpdateClusterWithResponse(ctx, r.pd.orgID, clusterID, body)
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot update cluster", err.Error())
 			return
 		}
 		if res.StatusCode() != http.StatusOK {
-			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
 			return
 		}
 	}
 	// 2. k8s_version via the upgrade endpoint (ModifyPlan already refused backwards moves)
 	if !versions.SemanticallyEqual(plan.K8sVersion.ValueString(), state.K8sVersion.ValueString()) {
-		res, err := r.pd.Client.UpgradeClusterWithResponse(ctx, r.pd.OrgID, id, client.UpgradeClusterJSONRequestBody{TargetVersion: plan.K8sVersion.ValueString()})
+		res, err := r.pd.Client.UpgradeClusterWithResponse(ctx, r.pd.orgID, clusterID, client.UpgradeClusterJSONRequestBody{TargetVersion: plan.K8sVersion.ValueString()})
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot upgrade cluster", err.Error())
 			return
 		}
 		if res.StatusCode() >= 300 {
-			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Root("k8s_version"))
+			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Root("k8s_version"))
 			return
 		}
 	}
-	final, err := r.waitForCluster(ctx, id, updateTimeout)
+	final, err := r.waitForCluster(ctx, clusterID, updateTimeout)
 	if err != nil {
 		resp.Diagnostics.AddError("Cluster did not return to running", err.Error())
 		return
@@ -2001,22 +2156,39 @@ func (r *clusterResource) Delete(ctx context.Context, req resource.DeleteRequest
 	}
 	deleteTimeout, d := state.Timeouts.Delete(ctx, 20*time.Minute)
 	resp.Diagnostics.Append(d...)
-	id := state.ID.ValueString()
-	res, err := r.pd.Client.DeleteClusterWithResponse(ctx, r.pd.OrgID, id)
+	clusterID, err := parseID(state.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid cluster id in state", err.Error())
+		return
+	}
+	res, err := r.pd.Client.DeleteClusterWithResponse(ctx, r.pd.orgID, clusterID)
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot delete cluster", err.Error())
 		return
 	}
 	if res.StatusCode() != http.StatusNotFound && res.StatusCode() >= 300 {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
 		return
 	}
 	err = wait.ForGone(ctx, func(ctx context.Context) (bool, error) {
-		g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.OrgID, id)
+		g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.orgID, clusterID)
 		if err != nil {
 			return false, err
 		}
-		return g.StatusCode() == http.StatusNotFound, nil
+		// Only 404 means gone and only a 2xx means still present. Folding
+		// everything else into "still present" — as `g.StatusCode() == 404`
+		// alone does — turns a 403 (token rotated mid-delete) or a 500 into a
+		// silent wait to the full delete timeout, and the diagnostic then
+		// blames the timeout instead of naming the error that was in hand on
+		// the first probe.
+		switch code := g.StatusCode(); {
+		case code == http.StatusNotFound:
+			return true, nil
+		case code >= 200 && code < 300:
+			return false, nil
+		default:
+			return false, apierr.Parse(code, g.HTTPResponse.Header, g.Body)
+		}
 	}, wait.Options{Timeout: deleteTimeout})
 	if err != nil {
 		resp.Diagnostics.AddError("Cluster deletion did not complete", err.Error())
@@ -2033,15 +2205,22 @@ type clusterWait struct {
 	Warned  bool
 }
 
-func (r *clusterResource) waitForCluster(ctx context.Context, id string, timeout time.Duration) (clusterWait, error) {
+func (r *clusterResource) waitForCluster(ctx context.Context, id client.ClusterID, timeout time.Duration) (clusterWait, error) {
 	var last *client.Cluster
 	res, err := wait.ForStatus(ctx, func(ctx context.Context) (string, string, error) {
-		g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.OrgID, id)
+		g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.orgID, id)
 		if err != nil {
 			return "", "", err
 		}
 		if g.StatusCode() != http.StatusOK {
-			return "", "", apierr.Parse(g.StatusCode(), g.Body)
+			return "", "", apierr.Parse(g.StatusCode(), g.HTTPResponse.Header, g.Body)
+		}
+		if g.JSON200 == nil {
+			// A 200 that is not JSON is not a status reading. Returning it as
+			// an empty status would be treated as "not terminal yet" and poll
+			// until the timeout.
+			return "", "", fmt.Errorf("GET %s returned %s with content type %q, not JSON",
+				g.HTTPResponse.Request.URL, g.Status(), g.HTTPResponse.Header.Get("Content-Type"))
 		}
 		last = g.JSON200
 		return string(last.Status), deref(last.StatusMessage), nil
@@ -2053,14 +2232,24 @@ func (r *clusterResource) waitForCluster(ctx context.Context, id string, timeout
 }
 
 func (r *clusterResource) flatten(c *client.Cluster, m *clusterModel) {
-	m.ID = types.StringValue(c.Id)
+	m.ID = types.StringValue(c.Id.String())
 	m.Name = types.StringValue(c.Name)
 	m.Region = types.StringValue(c.Region)
 	// keep the configured spelling when it is semantically equal to what the API holds
 	if !versions.SemanticallyEqual(m.K8sVersion.ValueString(), c.K8sVersion) || m.K8sVersion.IsNull() || m.K8sVersion.IsUnknown() {
 		m.K8sVersion = versions.NewK8sVersionValue(c.K8sVersion)
 	}
-	m.PublicEndpoint = types.BoolValue(c.PublicEndpoint)
+	// Cluster.public_endpoint is *bool and is NOT in the schema's `required`
+	// list (measured in api/openapi.yaml), so it can legitimately be absent.
+	// Absent is mapped to FALSE rather than null, on purpose: the Terraform
+	// attribute is Optional+Computed with Default: booldefault.StaticBool(false),
+	// so a null here would put an unknown-shaped value into an attribute
+	// Terraform requires to be known and produce "provider produced
+	// inconsistent result after apply". The API's own reading agrees - a
+	// cluster with no public endpoint reads false (an implementation gap it
+	// calls I-14), not a separate third state. Do NOT use
+	// types.BoolPointerValue here, for that reason.
+	m.PublicEndpoint = types.BoolValue(c.PublicEndpoint != nil && *c.PublicEndpoint)
 	m.Plan = optString(c.PlanSlug)
 	m.Status = types.StringValue(string(c.Status))
 	m.StatusMessage = optString(c.StatusMessage)
@@ -2089,7 +2278,6 @@ func optString(p *string) types.String {
 	}
 	return types.StringValue(*p)
 }
-func clusterFromResponse(body []byte) *client.Cluster { var c client.Cluster; _ = json.Unmarshal(body, &c); return &c }
 ```
 
 Adjust to the generated types: if `CreatedAt` is `time.Time` use `.Format`, if `string` assign directly; `Status` may be `client.ClusterStatus` (string alias). `plan` when null in config but returned by the API: keep it `Optional+Computed` with `UseStateForUnknown` if the API always echoes a slug (verify against the fake; the test-writer's fake returns `plan_slug: null` unless set). Register in `provider.go`: `Resources()` returns `[]func() resource.Resource{NewClusterResource}`.
@@ -2115,7 +2303,7 @@ Adjust to the generated types: if `CreatedAt` is `time.Time` use `.Format`, if `
   6. `effect = "Sometimes"` fails validation at plan.
 
 - [ ] **Step 2 [TEST-RUNNER]:** RED.
-- [ ] **Step 3 [CODER]:** implement mirroring Task 6's structure: schema with `int64planmodifier.UseStateForUnknown()` on the Optional+Computed ints, `mapplanmodifier.RequiresReplace()` / `listplanmodifier.RequiresReplace()` on labels/taints, `stringvalidator.OneOf("NoSchedule","PreferNoSchedule","NoExecute")` on `effect` (`github.com/hashicorp/terraform-plugin-framework-validators` — add `go get …-validators@latest` and pin), Create → `CreateNodePoolWithResponse(ctx, org, clusterID, body)` building `*int64` only for non-null attributes, wait `Success: ready`, `Failed: failed`; Update → PUT with only changed scalar fields then wait; Delete → DELETE then `ForGone`; `flatten` maps every field (`node_labels` → `types.MapValueFrom`, taints → nested list via `types.ListValueFrom` with an object type `{key,value,effect}`); ImportState passthrough on `id` — Read needs `cluster_id` too, so import id format is `<cluster_id>/<pool_id>` (document it; `ImportState` splits on `/` and sets both).
+- [ ] **Step 3 [CODER]:** implement mirroring Task 6's structure: schema with `int64planmodifier.UseStateForUnknown()` on the Optional+Computed ints, `mapplanmodifier.RequiresReplace()` / `listplanmodifier.RequiresReplace()` on labels/taints, `stringvalidator.OneOf("NoSchedule","PreferNoSchedule","NoExecute")` on `effect` (`github.com/hashicorp/terraform-plugin-framework-validators` — add `go get …-validators@latest` and pin), Create → `CreateNodePoolWithResponse(ctx, r.pd.orgID, clusterID, body)` — `clusterID` (and, in Read/Update/Delete, the pool id) go through `parseID` because they arrive from state or from the import id, while the org id is the already-parsed `r.pd.orgID`; every `<x>.Id` written back to state is `.Id.String()` — building `*int64` only for non-null attributes, wait `Success: ready`, `Failed: failed`; Update → PUT with only changed scalar fields then wait; Delete → DELETE then `ForGone`; `flatten` maps every field (`node_labels` → `types.MapValueFrom`, taints → nested list via `types.ListValueFrom` with an object type `{key,value,effect}`); ImportState passthrough on `id` — Read needs `cluster_id` too, so import id format is `<cluster_id>/<pool_id>` (document it; `ImportState` splits on `/` and sets both).
 - [ ] **Step 4 [TEST-RUNNER]:** PASS. **Step 5:** commit `feat: aether_node_pool resource`.
 
 ---
@@ -2216,6 +2404,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -2270,7 +2459,13 @@ func (d *regionsDataSource) Read(ctx context.Context, _ datasource.ReadRequest, 
 		return
 	}
 	if res.StatusCode() != http.StatusOK {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.Body), &resp.Diagnostics, path.Empty())
+		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
+		return
+	}
+	if res.JSON200 == nil {
+		resp.Diagnostics.AddError("Aether API answered 200 without a JSON body",
+			fmt.Sprintf("GET %s returned %s with content type %q.",
+				res.HTTPResponse.Request.URL, res.Status(), res.HTTPResponse.Header.Get("Content-Type")))
 		return
 	}
 	var out regionsModel

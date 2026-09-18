@@ -49,9 +49,11 @@ internal/provider/
   provider.go                   # provider schema + Configure (token, endpoint, org resolution)
   resource_<name>.go            # one file per resource: schema, Create/Read/Update/Delete, ImportState
   datasource_<name>.go          # one file per data source
+  apierr/                       # API error envelope → diagnostics
+  transport/                    # RoundTripper: bearer auth + bounded retries
+  versions/                     # k8s_version custom type and semantic equality
   wait/                         # poll-to-terminal-state helper; framework `timeouts` integration
-  versions.go                   # k8s_version semantic equality
-  errors.go                     # ErrorResponse/ValidationError → diagnostics; retry policy
+  fakeapi/                      # in-process API fake for unit tests; NOT a _test.go file, so every package can use it
 internal/acctest/               # acceptance harness (provider factories, env, cleanup)
 docs/                           # tfplugindocs output (registry format); docs/PRD.md stays
 examples/, templates/           # tfplugindocs inputs
@@ -61,7 +63,7 @@ terraform-registry-manifest.json
 ```
 
 Rules: client code changes only by regeneration; each resource file has one
-responsibility and depends only on the client, `wait`, `versions.go` and `errors.go`.
+responsibility and depends only on the client, `wait`, `versions` and `apierr`.
 
 ## 3. Components
 
@@ -92,11 +94,26 @@ aether-api commit. A `make openapi` target re-vendors and regenerates; CI fails 
 
 ### 3.3 Wait helper
 
-`wait.ForStatus(ctx, get func() (status, message string, err error), terminal []string,
-failed []string, timeout)` polls with capped exponential backoff (1 s → 15 s). A status in
-`failed` returns an error carrying `status_message`. `wait.ForGone(ctx, get, timeout)`
-polls until the read returns 404. Timeouts come from the framework `timeouts` block
-(defaults §5.1). A fake clock makes it unit-testable.
+`wait.ForStatus(ctx, probe, Options{Timeout, Success, Warning, Failed, Now, Sleep})` polls
+until the status is terminal. Three rules are load-bearing:
+
+- **The status is matched on every probe, including the first** — check before sleep. A
+  sleep-then-check loop makes the fastest operation take a whole backoff interval, and hides
+  a resource that was already terminal when the wait began.
+- **A `Warning` status is TERMINAL**, not a state to poll through. It ends the wait with
+  `Result.Warned = true` and the API's message, which the caller surfaces as a **warning
+  diagnostic** — a `degraded` cluster has finished coming up (§4.1). Polling on would hang
+  until the timeout and then report a failure that did not happen.
+- Backoff is **1 s, 2 s, 4 s, 8 s, then 15 s**, capped **after** the doubling so the
+  sequence never jumps 8 s → 16 s. One sleep per non-terminal probe.
+
+A status in `Failed` returns a `*wait.FailedError` carrying `status_message`. A timeout
+returns an error **wrapping `wait.ErrTimeout`** (so `errors.Is` works) whose message
+**names the last observed status**. A probe error short-circuits, wrapped so `errors.Is`
+and `errors.As` still reach the cause. `wait.ForGone(ctx, probe, Options)` polls until the
+read returns 404. Timeouts come from the framework `timeouts` block (defaults §5.1);
+`Now`/`Sleep` are injectable so a fake clock makes it unit-testable, and the production
+`Sleep` honours context cancellation.
 
 ### 3.4 Version helper
 
@@ -104,12 +121,32 @@ polls until the read returns 404. Timeouts come from the framework `timeouts` bl
 `MAJOR.MINOR[.PATCH]`, the **major and minor** both match, and either the configured value
 has no patch or the patches are equal. Used as the `k8s_version` semantic-equality function so `1.37`
 in HCL versus `1.37.0` from the API is not drift. `versions.IsForward(from, to)` guards
-upgrades (§4.1).
+upgrades (§4.1). There is deliberately **no `latest` keyword at this layer**: a version
+string here is a version, and resolving a moving target belongs to whatever chooses the
+value.
+
+**Direction is not interchangeable.** The framework calls
+`proposedNew.StringSemanticEquals(ctx, prior)` and, when that returns true, keeps the
+**prior** value in state (measured: terraform-plugin-framework v1.19.0
+`internal/fwschemadata/value_semantic_equality_string.go:37`, and `:53`
+`resp.NewValue = priorValuable`). So the **receiver is the API's value** and the
+**argument is the configured/prior** one, and the hook computes
+`SemanticallyEqual(configured = argument, actual = receiver)` — never the reverse:
+`SemanticallyEqual("1.37", "1.37.0")` is true while `SemanticallyEqual("1.37.0", "1.37")`
+is false. A hook written the wrong way round still passes a test whose two operands happen
+to be ordered the same way, so the test must fix the receiver as the API value.
 
 ### 3.5 Error mapper
 
-The API answers 4xx with `ErrorResponse{error{code, message, details?}}` and 422 with
-`ValidationError{…, errors[]{field, code, message}}`. `errors.ToDiagnostics` turns each
+The API answers errors with `ErrorResponse{error{code, message, details?}}`, and a 422
+carries its per-field errors in **`error.details[]{field, code, message}`**. There is **no
+top-level `errors` list** and **no `request_id` in the body**: the request id is the
+**`X-Request-ID` response header**, which the middleware sets on every route. Measured in
+aether-api `internal/api/handler/response.go` (`ErrorBody{Code, Message, Details
+[]model.ValidationError}`) and `internal/api/middleware/requestid.go` @ 8f03fbb. The
+parser therefore takes the header —
+`apierr.Parse(status int, header http.Header, body []byte) *apierr.Error` — and call sites
+pass `resp.HTTPResponse.Header`. `apierr.ToDiagnostics` turns each
 validation error into an attribute-scoped diagnostic (path from `field`), a 409 into a
 conflict diagnostic on the resource, 401/403 into one provider-level message ("check
 api_token / organization_id"), 404 on a **resource** Read into "remove from state", 404 on
@@ -119,16 +156,38 @@ mounted before any handler (`internal/api/router.go`: `r.Use(middleware.RateLimi
 429 never reaches a handler and cannot have side effects. That invariant belongs to aether-api
 and is guarded THERE (router-level test, aether-api follow-up issue), not by this provider —
 the provider documents its reliance on it in the retry code and in the changelog for any
-`OPENAPI_REF` bump; 5xx and transport errors are retried 3× with
-backoff **only for idempotent methods** (GET/PUT/DELETE/HEAD). POST (`/clusters`, `/upgrade`,
-`/rotate-secret`, `/registry`, robot accounts, policies) is never replayed: a POST that fails
-after the server may have acted surfaces the error, and the next `terraform apply` reconciles
-through Read (a 409 on a name-based create is surfaced with the API's message — adopting an
-existing resource is `terraform import`, never an automatic merge).
+`OPENAPI_REF` bump. A `Retry-After` is honoured in **integer seconds only** (the HTTP-date
+form is legal but this API does not send it, and guessing wrong means sleeping for hours),
+**clamped to ≤ 60 s** and overflow-guarded, so a hostile or buggy value cannot park an
+apply.
+
+**5xx** is retried **only for idempotent methods** (GET/HEAD/PUT/DELETE/OPTIONS), **1 + 3
+attempts**, backoff 500 ms → 1 s → 2 s capped at 4 s. POST and PATCH (`/clusters`,
+`/upgrade`, `/rotate-secret`, `/registry`, robot accounts, policies) are **not** retried on
+5xx: a POST that fails after the server may have acted surfaces the error, and the next
+`terraform apply` reconciles through Read (a 409 on a name-based create is surfaced with
+the API's message — adopting an existing resource is `terraform import`, never an automatic
+merge).
+
+A **transport error** is retried for idempotent methods. For POST/PATCH it is replayed
+**only when the failure proves nothing was written** — a `*net.DNSError`, or a
+`*net.OpError` with `Op == "dial"`, both of which happen before the first byte of the
+request leaves. net/http exposes no "nothing written" signal of its own, so a connection
+that broke **mid-body is deliberately not replayed**. Nothing is replayed at all unless the
+body can be re-opened via `req.GetBody` — a replay that sends a half-consumed payload is
+worse than the failure it is papering over. Every **discarded** response body is drained
+**bounded (64 KiB)** and closed, so the connection is reusable without reading an unbounded
+error page; the **final** response propagates unread and unclosed, exactly as if there were
+no retry layer.
 
 ## 4. Resources
 
-Ids are the API UUIDs. Import is `terraform import <address> <uuid>`; singletons import by
+Ids are the API UUIDs. Every `format: uuid` field is generated as `openapi_types.UUID`
+(a `[16]byte`, not a string), so provider models hold **canonical UUID text** and parse at
+the **client boundary**; a malformed id is an attribute diagnostic there, before any
+request is built, and never a downstream encoding failure naming neither attribute nor
+value. Test fakes serve real UUID text for the same reason. Import is
+`terraform import <address> <uuid>`; singletons import by
 the parent id (`aether_cluster_network` by cluster id; `aether_registry`,
 `aether_billing_budget`, `aether_organization` by organization id). Field names are the
 live API's.
@@ -251,13 +310,15 @@ Framework `timeouts` block on cluster and node pool: create 30 m, update 30 m, d
 
 | Situation | Behaviour |
 |---|---|
-| 422 validation | attribute-scoped diagnostics from `errors[].field` |
+| 422 validation | attribute-scoped diagnostics from `error.details[].field` |
 | 409 conflict | resource-level diagnostic with the API message |
 | 401 / 403 | one provider-level diagnostic: check `api_token` / `organization_id` |
 | 404 on a resource Read | remove from state (also the delete-completion signal) |
 | 404 on a data source Read | error "not found" (never silently empty) |
-| 429 | retry honouring `Retry-After` |
-| 5xx / transport | 3 retries with backoff, then surface with request id |
+| 429 | retry (every method) honouring integer-seconds `Retry-After`, clamped to ≤ 60 s |
+| 5xx | 3 retries with backoff for idempotent methods only; POST/PATCH surface at once |
+| transport | 3 retries for idempotent methods; POST/PATCH only when nothing was written |
+| any of the above | surfaced with the request id from the `X-Request-ID` response header |
 | terminal `failed` | error with `status_message`; resource stays in state |
 | wait timeout | error naming the last observed status; resource stays in state |
 
