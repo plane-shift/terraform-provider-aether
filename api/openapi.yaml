@@ -1,0 +1,5066 @@
+openapi: 3.1.0
+info:
+  title: Aether API
+  version: 1.0.0
+  description: |
+    The Aether HTTP API for managing organizations, Kubernetes clusters, node
+    pools, container registries, and billing on the Aether platform.
+
+    ## Base URL
+
+    All endpoints are served under `https://api.aetherplatform.cloud`. Versioned
+    routes live under the `/api/v1` prefix.
+
+    ## Authentication
+
+    Requests authenticate with an API token of the form `aether_<hex>`, sent in the
+    `Authorization` header as a Bearer credential:
+
+    ```
+    Authorization: Bearer aether_0123456789abcdef...
+    ```
+
+    Tokens are created per organization (see the API Tokens endpoints) and the raw
+    secret is shown only once, at creation time. Unauthenticated requests receive
+    `401`.
+
+    ## Rate limiting
+
+    Requests are rate-limited to **100 requests per minute per key** (token-bucket
+    with a small burst allowance). Exceeding the limit returns `429`.
+
+    ## Pagination
+
+    List endpoints use opaque cursor pagination via query parameters:
+
+    ```
+    ?cursor=<UUID>&limit=<N>
+    ```
+
+    `limit` defaults to `50` and is capped at `100`. The response envelope carries
+    the items plus a `next_cursor` field; when `next_cursor` is absent there are no
+    further pages. Pass the returned `next_cursor` value back as `cursor` to fetch
+    the next page.
+
+    ## Errors
+
+    Errors are returned as a JSON object with an `error` member containing a stable
+    `code`, a human-readable `message`, and (for validation failures) a `details`
+    array.
+
+    ## Packages
+
+    A cluster is billed either from a package or per resource ("custom"). The
+    choice is made when the cluster is created — the `plan` field on the create
+    request — and is fixed for the cluster's lifetime. The catalogue currently
+    offers four packages (`dev`, `starter`, `growth`, `scale`), and a retired
+    package can still appear on an existing cluster; each is a flat monthly fee
+    per cluster covering an allowance of vCPUs, memory and node disk, and
+    anything above the allowance is charged per resource, each dimension on its
+    own. Omitting `plan` bills the cluster entirely per resource. Either way
+    load balancers, persistent volumes, registry storage and the public API
+    endpoint — which every cluster is required to have, and which no package
+    fee includes — are charged separately. The current package prices and
+    allowances are shown in the portal when you create a cluster (and, once
+    published, on the pricing page).
+
+servers:
+  - url: https://api.aetherplatform.cloud
+
+security:
+  - bearerApiToken: []
+
+tags:
+  - name: Organizations
+    description: >-
+      Organization CRUD plus org-scoped members, API tokens, and the audit log.
+  - name: Webhooks
+    description: |
+      Outbound webhook endpoints and their delivery log. Aether POSTs a JSON
+      event envelope to every subscribed endpoint:
+
+      ```
+      {"id": "<event UUID>", "type": "<event type>",
+       "created_at": "<RFC 3339>", "org_id": "<org UUID>", "data": {...}}
+      ```
+
+      Each delivery carries the headers `X-Aether-Event` (event type),
+      `X-Aether-Event-Id` (event UUID, shared across endpoints receiving the
+      same event), `X-Aether-Delivery` (delivery UUID), `X-Aether-Timestamp`
+      (unix seconds), and `X-Aether-Signature` with the value
+      `v1=<hex(HMAC-SHA256(secret, "<timestamp>.<raw body>"))>` — verify by
+      recomputing the HMAC with the stored secret over the timestamp, a `.`,
+      and the raw request body, and reject stale timestamps (replay
+      resistance).
+
+      A `2xx` response marks the delivery `succeeded`. Anything else (non-2xx,
+      timeout, connection error) is retried on a fixed backoff schedule — waits
+      of 2m, 10m, 30m, 2h, 6h, 12h, and 24h between 8 total attempts (≈ 2
+      days) — after which the delivery is marked `dead`. Redirects are not
+      followed. Delivery is **at-least-once**: consumers must deduplicate on
+      `X-Aether-Event-Id`.
+
+      Endpoint URLs must be `https`, without embedded credentials, and must not
+      point at private, loopback, or otherwise internal address ranges.
+  - name: Clusters
+    description: >-
+      Kubernetes cluster lifecycle, networking, kubeconfig retrieval, upgrades,
+      node pools, and load balancers.
+  - name: Registry
+    description: >-
+      Org-level container registry (Harbor project), repositories, tags, robot
+      accounts, and cleanup policies.
+  - name: Billing
+    description: Usage, daily spend, invoices, and payment methods.
+  - name: Support
+    description: >-
+      Support tickets and their message threads. Tickets are org-scoped;
+      messages are attributed to their author (`tenant` or `provider`). A
+      tenant reply reopens a `waiting`/`resolved` ticket, a provider reply on an
+      `open` ticket moves it to `in_progress`, and message creation recomputes
+      the ticket's status and lifecycle timestamps in a single transaction.
+  - name: Admin
+    description: >-
+      Platform-scoped (non-org) administration. Every `/api/v1/admin` endpoint
+      requires the Keycloak `platform-admin` realm role and is reachable only
+      with an interactive OIDC JWT — API tokens carry no roles and are rejected
+      with 403.
+
+paths:
+  /api/v1/regions:
+    get:
+      tags: [Clusters]
+      operationId: listRegions
+      summary: List regions
+      description: |
+        The regions the platform knows about. `region` on cluster creation
+        must name a region with an enabled Proxmox endpoint configured on this
+        instance (otherwise `422` `validation_error`); the cluster is recorded
+        under the region this API instance serves. `available` is
+        informational. **Public — no authentication required**, so the
+        pre-login signup wizard can populate its picker. Subject to the global
+        rate limit.
+
+        `available` is true only for the region this API instance itself
+        serves (its `AETHER_REGION` setting); every other entry is
+        informational and is **not** what cluster creation checks.
+
+        Cluster creation accepts only a region this instance can place into:
+        `POST /api/v1/organizations/{orgId}/clusters` resolves the requested
+        `region` to an enabled Proxmox endpoint and rejects a region with none
+        with `422` (`validation_error`, a message naming the region:
+        `No Proxmox endpoint is configured for region eu-fi`). The created
+        cluster is recorded under the region this instance serves.
+
+        The list is static in the binary today — it is not read from the
+        database and does not reflect capacity.
+      security: []
+      responses:
+        '200':
+          description: The known regions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    description: >-
+                      Never `null`; the list is static in the binary and is
+                      not paginated.
+                    items:
+                      type: object
+                      required: [id, name, location, available]
+                      properties:
+                        id:
+                          type: string
+                          example: eu-fi
+                          description: Region identifier used as `region` on cluster creation.
+                        name:
+                          type: string
+                          example: Europe (Finland)
+                        location:
+                          type: string
+                          example: Helsinki
+                        available:
+                          type: boolean
+                          description: True only for the region this API serves.
+              example:
+                items:
+                  - id: eu-fi
+                    name: Europe (Finland)
+                    location: Helsinki
+                    available: true
+
+  /api/v1/k8s-versions:
+    get:
+      tags: [Clusters]
+      operationId: listK8sVersions
+      summary: List offered Kubernetes versions
+      description: |
+        The Kubernetes versions a cluster can currently be created on or
+        upgraded to. **Public — no authentication required**, so the pre-login
+        portal wizard can populate its picker. Subject to the global rate limit.
+
+        This endpoint is the authoritative source for that picker: a version
+        absent from this list is rejected by cluster creation and by upgrade
+        with `422`.
+
+        Each `version` is a **minor** (`"1.37"`), not a full patch version.
+        Create and upgrade accept either form — a bare minor resolves to the
+        latest patch Aether has verified for it, and a full
+        `MAJOR.MINOR.PATCH` is accepted when its minor is offered and the patch
+        is one this platform has resolved (at or below the minor's current
+        `patch`); otherwise `422`.
+
+        Every entry also carries `patch`: the full version that minor currently
+        resolves to (`"1.37.0"`), so a picker can show the concrete version
+        alongside the label without a second call.
+
+        The list is every Kubernetes minor upstream still supports that the
+        deployed Talos worker image can run, ordered newest-first. Two bounds,
+        not three:
+
+        - **Upstream's support window** — the minors whose `endOfLifeDate` in
+          the Kubernetes release schedule has not passed. Normally three;
+          **four** during the ~2-month overlap after a new minor ships. Do not
+          assume a maximum of three entries.
+        - **The deployed Talos worker image** (`AETHER_TALOS_VERSION`) caps the
+          top. A minor the worker OS cannot run is never offered: the tenant
+          control plane would roll to a version no kubelet can match. Every
+          patch of an offered minor is runnable by that image, so the cap never
+          refuses a patch of a minor this endpoint lists.
+
+        aether-operator accepts the uncapped upstream window, so everything
+        offered here is provisionable by construction — both components read
+        the same resolver (`github.com/plane-shift/k8s-versions-go`) rather
+        than each deriving a window of its own.
+
+        A minor upstream supports but for which no patch release has been
+        published yet is not offered (there is nothing to deploy), though the
+        operator would accept it.
+
+        When the list is non-empty, exactly one entry is labelled `Latest` —
+        the topmost minor that survives the Talos cap, which is **not**
+        necessarily upstream's latest. Every other entry is labelled `Stable`.
+
+        A Talos update never changes a tenant's Kubernetes version (owner ruling
+        2026-09-15); it only changes which versions this endpoint can offer.
+        The list can therefore shrink underneath a running cluster, and that
+        cluster keeps the version it is on.
+      security: []
+      responses:
+        '200':
+          description: |
+            The offered versions, newest first.
+
+            An empty `items` array is a valid `200`, not an error condition, and
+            this endpoint has no failure response of its own. It means the
+            version service has resolved nothing yet (cold start, or upstream
+            unreachable) or every candidate was excluded by the bounds above.
+            While that lasts, cluster creation fails `422` on `k8s_version` and
+            upgrades fail `503 versions_unavailable` — so a client should read
+            an empty list as "the picker is unavailable", never as "no
+            Kubernetes versions exist".
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/K8sVersionList'
+
+  /api/v1/organizations:
+    get:
+      tags: [Organizations]
+      operationId: listOrganizations
+      summary: List organizations
+      description: Lists organizations the authenticated principal can access.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of organizations.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Organizations]
+      operationId: createOrganization
+      summary: Create an organization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrganizationRequest'
+      responses:
+        '201':
+          description: Organization created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Organizations]
+      operationId: getOrganization
+      summary: Get an organization
+      responses:
+        '200':
+          description: The organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Organizations]
+      operationId: updateOrganization
+      summary: Update an organization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrganizationRequest'
+      responses:
+        '200':
+          description: The updated organization.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+    delete:
+      tags: [Organizations]
+      operationId: deleteOrganization
+      summary: Delete an organization
+      responses:
+        '200':
+          description: Deletion result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/members:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Organizations]
+      operationId: listMembers
+      summary: List organization members
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of members.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Organizations]
+      operationId: createMember
+      summary: Invite an organization member
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMemberRequest'
+      responses:
+        '201':
+          description: Member invited.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/members/{memberID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/MemberID'
+    get:
+      tags: [Organizations]
+      operationId: getMember
+      summary: Get an organization member
+      responses:
+        '200':
+          description: The member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Organizations]
+      operationId: updateMember
+      summary: Update an organization member's role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMemberRequest'
+      responses:
+        '200':
+          description: The updated member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+    delete:
+      tags: [Organizations]
+      operationId: deleteMember
+      summary: Remove an organization member
+      responses:
+        '204':
+          description: Member removed.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/api-tokens:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Organizations]
+      operationId: listApiTokens
+      summary: List API tokens
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of API tokens (secrets are never returned here).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APITokenList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Organizations]
+      operationId: createApiToken
+      summary: Create an API token
+      description: >-
+        Creates a new API token. The raw `token` secret is returned only in this
+        response and is never retrievable again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAPITokenRequest'
+      responses:
+        '201':
+          description: Token created. Contains the one-time raw secret.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APITokenWithSecret'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/api-tokens/{tokenID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/TokenID'
+    get:
+      tags: [Organizations]
+      operationId: getApiToken
+      summary: Get an API token's metadata
+      responses:
+        '200':
+          description: The token metadata (no secret).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIToken'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Organizations]
+      operationId: deleteApiToken
+      summary: Revoke an API token
+      responses:
+        '204':
+          description: Token revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/webhooks:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Webhooks]
+      operationId: listWebhooks
+      summary: List webhooks
+      description: Lists the organization's webhooks. Responses never include the signing secret.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of webhooks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Webhooks]
+      operationId: createWebhook
+      summary: Create a webhook
+      description: >-
+        Registers a webhook endpoint. The server generates the signing secret
+        and returns it in this response only — store it now; no later read
+        includes it (rotate to obtain a new one). `events` is validated against
+        the event-type catalog (see the `Webhook` schema). At most 10 webhooks
+        per organization.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+      responses:
+        '201':
+          description: Webhook created. Includes the signing secret (shown once).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Webhook limit reached for this organization (`webhook_limit`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/webhooks/{webhookID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/WebhookID'
+    get:
+      tags: [Webhooks]
+      operationId: getWebhook
+      summary: Get a webhook
+      responses:
+        '200':
+          description: The webhook (without its signing secret).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Webhooks]
+      operationId: updateWebhook
+      summary: Update a webhook
+      description: >-
+        Updates the webhook. All fields are optional; omitted fields are left
+        unchanged. Set `enabled` to `false` to pause deliveries.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWebhookRequest'
+      responses:
+        '200':
+          description: The updated webhook (without its signing secret).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+    delete:
+      tags: [Webhooks]
+      operationId: deleteWebhook
+      summary: Delete a webhook
+      responses:
+        '204':
+          description: Webhook deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/webhooks/{webhookID}/rotate-secret:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/WebhookID'
+    post:
+      tags: [Webhooks]
+      operationId: rotateWebhookSecret
+      summary: Rotate a webhook's signing secret
+      description: >-
+        Replaces the signing secret with a newly generated one, effective for
+        all subsequent deliveries. The new secret is returned in this response
+        only.
+      responses:
+        '200':
+          description: The webhook with its new signing secret (shown once).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/webhooks/{webhookID}/test:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/WebhookID'
+    post:
+      tags: [Webhooks]
+      operationId: testWebhook
+      summary: Send a test delivery
+      description: >-
+        Enqueues a signed `ping` event to this webhook. It is delivered
+        asynchronously by the same worker as real events — proving the full
+        delivery path, not just reachability. Check the deliveries listing for
+        the outcome.
+      responses:
+        '202':
+          description: Test delivery enqueued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The webhook is disabled (`webhook_disabled`) — enable it first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/organizations/{orgID}/webhooks/{webhookID}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/WebhookID'
+    get:
+      tags: [Webhooks]
+      operationId: listWebhookDeliveries
+      summary: List webhook deliveries
+      description: Lists the webhook's delivery log, newest first.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of deliveries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDeliveryList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/tickets:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Support]
+      operationId: listTickets
+      summary: List support tickets
+      description: Lists the organization's support tickets, newest first.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of tickets.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Support]
+      operationId: createTicket
+      summary: Open a support ticket
+      description: >-
+        Opens a ticket. The ticket's initial `body` is stored as the first
+        message, authored by the caller as a `tenant` message. `severity`
+        defaults to `low` and `category` to `general` when omitted. The
+        `created_by` field is set from the caller's JWT subject (null for API
+        tokens).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTicketRequest'
+      responses:
+        '201':
+          description: Ticket created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/tickets/{ticketID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/TicketID'
+    get:
+      tags: [Support]
+      operationId: getTicket
+      summary: Get a support ticket
+      responses:
+        '200':
+          description: The ticket.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Support]
+      operationId: updateTicket
+      summary: Update a support ticket
+      description: >-
+        Updates a ticket's `severity`, `status`, `category`, or `assigned_to`.
+        All fields are optional; omitted fields are left unchanged. A `status`
+        change must be a legal transition (`closed` is terminal in this phase);
+        an illegal transition is rejected with 422 (`invalid_transition`).
+        Entering `resolved` stamps `resolved_at`; it is preserved on `closed`
+        and cleared only when a resolved ticket is reopened (to `open` or
+        `in_progress`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTicketRequest'
+      responses:
+        '200':
+          description: The updated ticket.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/tickets/{ticketID}/messages:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/TicketID'
+    get:
+      tags: [Support]
+      operationId: listTicketMessages
+      summary: List ticket messages
+      description: Lists the ticket's message thread, oldest first.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketMessageList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Support]
+      operationId: createTicketMessage
+      summary: Post a message to a ticket
+      description: >-
+        Appends a message to the thread. The author is derived from the
+        caller's auth context: `author_id` from the JWT subject, `author_type`
+        = `provider` when the caller holds the `platform-admin` role, otherwise
+        `tenant`. Posting recomputes the ticket's status (a tenant reply
+        reopens a `waiting`/`resolved` ticket; a provider reply on an `open`
+        ticket moves it to `in_progress`) and stamps `first_response_at` on the
+        first provider message — all in one transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTicketMessageRequest'
+      responses:
+        '201':
+          description: Message created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/tickets/{ticketID}/attachments:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/TicketID'
+    get:
+      tags: [Support]
+      operationId: listTicketAttachments
+      summary: List a ticket's attachments
+      description: >-
+        Lists the ticket's confirmed (`attached`) attachments, oldest first.
+        Pending (reserved-but-unreferenced) uploads are not returned.
+      responses:
+        '200':
+          description: The ticket's attachments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketAttachmentList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Support]
+      operationId: presignTicketAttachmentUpload
+      summary: Reserve an attachment and get a presigned upload URL
+      description: >-
+        Reserves a `pending` attachment slot on the ticket and returns a
+        short-lived presigned PUT URL. The client uploads the file **bytes
+        directly to object storage** (MinIO/S3) at `upload_url` with a matching
+        `Content-Type`; the API never proxies the bytes. The upload is then
+        confirmed by referencing the returned `attachment_id` in
+        `attachment_ids` on a subsequent message (see the message endpoint) —
+        that flips the row to `attached` inside the message transaction.
+        Server-side limits: `content_type` must be on the allowlist (images,
+        pdf, text, json, yaml, gzip, tar) and `size_bytes` in `(0, 26214400]`
+        (25 MiB). Returns **503** when attachment storage is not configured
+        (`MINIO_ENDPOINT` unset).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PresignUploadRequest'
+      responses:
+        '201':
+          description: Attachment reserved; upload URL issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignUploadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+        '503':
+          description: Attachment storage is not configured.
+
+  /api/v1/organizations/{orgID}/tickets/{ticketID}/attachments/{attachmentID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/TicketID'
+      - $ref: '#/components/parameters/AttachmentID'
+    get:
+      tags: [Support]
+      operationId: downloadTicketAttachment
+      summary: Download a ticket attachment
+      description: >-
+        Redirects (302) to a short-lived presigned GET URL for the attachment
+        bytes in object storage. Returns **503** when attachment storage is not
+        configured.
+      responses:
+        '302':
+          description: Redirect to the presigned download URL.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          description: Attachment storage is not configured.
+
+  /api/v1/organizations/{orgID}/audit-log:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Organizations]
+      operationId: listAuditLog
+      summary: List audit log events
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of audit events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/organizations/{orgID}/clusters:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Clusters]
+      operationId: listClusters
+      summary: List clusters
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          description: Filter clusters by status.
+          required: false
+          schema:
+            $ref: '#/components/schemas/ClusterStatus'
+      responses:
+        '200':
+          description: A page of clusters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Clusters]
+      operationId: createCluster
+      summary: Create a cluster
+      description: >-
+        Creates a cluster and begins asynchronous provisioning. Returns `202` with
+        the cluster record in `provisioning` status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClusterRequest'
+      responses:
+        '202':
+          description: Cluster accepted for provisioning.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cluster'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+    get:
+      tags: [Clusters]
+      operationId: getCluster
+      summary: Get a cluster
+      responses:
+        '200':
+          description: The cluster.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cluster'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Clusters]
+      operationId: updateCluster
+      summary: Update a cluster
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClusterRequest'
+      responses:
+        '200':
+          description: The updated cluster.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cluster'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+    delete:
+      tags: [Clusters]
+      operationId: deleteCluster
+      summary: Delete a cluster
+      description: >-
+        Begins teardown. Returns `202` with `{"status":"deleting"}` when
+        infrastructure exists, or `200` with `{"status":"deleted"}` when there was
+        nothing to tear down.
+      responses:
+        '200':
+          description: Cluster deleted (no infrastructure was provisioned).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '202':
+          description: Cluster teardown started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/network:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+    get:
+      tags: [Clusters]
+      operationId: getClusterNetwork
+      summary: Get cluster network policy
+      description: >-
+        Returns the authorized source-IP allowlist and optional API server
+        connection rate limit for the cluster's public control-plane endpoint.
+      responses:
+        '200':
+          description: The cluster network policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterNetwork'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Clusters]
+      operationId: upsertClusterNetwork
+      summary: Set cluster network policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertClusterNetworkRequest'
+      responses:
+        '200':
+          description: The updated cluster network policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterNetwork'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/kubeconfig:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+    get:
+      tags: [Clusters]
+      operationId: getKubeconfig
+      summary: Download the admin kubeconfig
+      description: >-
+        Returns the operator-managed admin kubeconfig as a YAML file attachment.
+        Only available once the cluster is `running`.
+      responses:
+        '200':
+          description: The admin kubeconfig.
+          content:
+            application/yaml:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: >-
+            The cluster is not yet ready (control plane still provisioning).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/upgrade:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+    post:
+      tags: [Clusters]
+      operationId: upgradeCluster
+      summary: Upgrade a cluster's Kubernetes version
+      description: >-
+        Initiates a Kubernetes version upgrade across the control plane and worker
+        node pools. Upgrades must be incremental: a patch bump on the same minor or
+        a step to exactly the next minor. The cluster must be `running`.
+
+        `target_version` accepts the same two forms as cluster creation. A bare
+        minor resolves to the latest patch Aether has verified for it; a full
+        `MAJOR.MINOR.PATCH` is accepted only when its minor is offered by
+        `GET /api/v1/k8s-versions` and its patch is one this platform has
+        resolved (at or below that minor's current `patch`) — otherwise 422
+        `validation_error`. When no version is offered at all (upstream release
+        data has never been reachable) the endpoint answers `503`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpgradeRequest'
+      responses:
+        '202':
+          description: Upgrade accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpgradeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The cluster is not in a state that permits upgrade.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/events:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+    get:
+      tags: [Clusters]
+      operationId: streamClusterEvents
+      summary: Stream cluster events (SSE)
+      description: >-
+        Server-Sent Events stream of cluster lifecycle and node-pool state events.
+        Long-lived; the connection stays open and emits `text/event-stream` data.
+      responses:
+        '200':
+          description: An open Server-Sent Events stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/system-events:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+    get:
+      tags: [Clusters]
+      operationId: streamClusterSystemEvents
+      summary: Stream cluster system events (SSE)
+      description: >-
+        Server-Sent Events stream of harvested system events (CAPI Machine and
+        Proxmox task activity) for the cluster. Returns `503` when the event
+        harvester is disabled.
+      responses:
+        '200':
+          description: An open Server-Sent Events stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/loadbalancers:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+    get:
+      tags: [Clusters]
+      operationId: listLoadBalancers
+      summary: List a cluster's load balancers
+      description: Read-only listing of load balancers provisioned for the cluster.
+      responses:
+        '200':
+          description: A list of load balancers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoadBalancerList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/volumes:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+    get:
+      tags: [Clusters]
+      operationId: listClusterVolumes
+      summary: List a cluster's persistent volumes
+      description: >-
+        Read-only inventory of the cluster's PersistentVolumes, read from the
+        organization's `StorageInventory` on the management cluster (nothing
+        here calls the tenant cluster's own apiserver, and there is no delete
+        path — volume lifecycle stays a `kubectl delete pvc` inside the
+        tenant).
+
+
+        Both byte figures are reported for every volume, and `billed_on` says
+        which of the two is charged: `aether-block` volumes bill on
+        `provisioned_bytes` (RBD space is reserved, so an empty claim costs
+        what a full one does), `aether-shared` volumes bill on `used_bytes`
+        (CephFS is thin-provisioned). `used_percent` is computed server-side and
+        is **not** clamped — CephFS enforces its per-subvolume quota lazily, so
+        a value above 100 is legitimate — and is `0` when there is no quota to
+        divide by.
+
+
+        When the management read fails, the snapshot is stale or not Ready, or
+        the cluster is not provisioned far enough to be identified,
+        `inventory_available` is `false` and `volumes` is an empty array: "you
+        have no volumes" and "we could not look" are different answers.
+      responses:
+        '200':
+          description: >-
+            The cluster's volumes, plus the organization-wide shared-pool
+            figures and the freshness of the underlying snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [volumes, org_shared_quota_bytes, org_shared_used_bytes, inventory_available, last_synced_at]
+                properties:
+                  volumes:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name, type, storage_class, provisioned_bytes, used_bytes, used_percent, billed_on, state, watchers, created_at]
+                      properties:
+                        id:
+                          type: string
+                          description: The CSI volume handle (block) or subvolume name (shared).
+                        name:
+                          type: string
+                          description: The volume's display name.
+                        type:
+                          type: string
+                          enum: [block, shared]
+                        storage_class:
+                          type: string
+                          enum: [aether-block, aether-shared]
+                        provisioned_bytes:
+                          type: integer
+                          format: int64
+                          description: >-
+                            The RBD image size for block volumes, or the
+                            subvolume's quota for shared ones — where `0` means
+                            an INFINITE quota, not an empty volume.
+                        used_bytes:
+                          type: integer
+                          format: int64
+                        used_percent:
+                          type: number
+                          format: double
+                          description: >-
+                            Used over provisioned, in percent. Unclamped (may
+                            exceed 100), and `0` when provisioned is `0`.
+                        billed_on:
+                          type: string
+                          enum: [provisioned, used]
+                          description: Which of the two byte figures this volume is charged on.
+                        state:
+                          type: string
+                          description: The volume's state as reported by the management cluster.
+                        watchers:
+                          type: integer
+                          description: Open RBD watchers (0 means nothing has the image mapped).
+                        created_at:
+                          type: string
+                          format: date-time
+                  org_shared_quota_bytes:
+                    type: integer
+                    format: int64
+                    description: >-
+                      The hard, OSD-enforced quota on the ORGANIZATION's CephFS
+                      data pool, which every cluster in the org shares. `0`
+                      means unlimited/unset. Display only — nothing in billing
+                      reads it.
+                  org_shared_used_bytes:
+                    type: integer
+                    format: int64
+                    description: >-
+                      How much of that org-wide pool is occupied — not the sum
+                      of this cluster's volumes.
+                  inventory_available:
+                    type: boolean
+                    description: >-
+                      `false` when the management read failed or the snapshot is
+                      not provably current, in which case `volumes` is empty.
+                  last_synced_at:
+                    type: string
+                    format: date-time
+                    description: >-
+                      When the organization's inventory last completed a full
+                      sync. The zero time when `inventory_available` is `false`.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/nodepools:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+    get:
+      tags: [Clusters]
+      operationId: listNodePools
+      summary: List node pools
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of node pools.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodePoolList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Clusters]
+      operationId: createNodePool
+      summary: Create a node pool
+      description: >-
+        Creates a node pool. Autoscaling is permitted; when `min_nodes`,
+        `desired_nodes`, and `max_nodes` are equal the pool is fixed-size.
+        Omitted bounds default to `desired_nodes` (which defaults to 1). Returns
+        `202` while the pool provisions.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateNodePoolRequest'
+      responses:
+        '202':
+          description: Node pool accepted for provisioning.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodePool'
+        '400':
+          description: >-
+            Invalid request. Includes `no_schedulable_pool` when the new pool's
+            taints would leave the cluster with no pool that can schedule
+            workloads (a cluster must retain at least one pool with no
+            `NoSchedule`/`NoExecute` taint).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/nodepools/{poolID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+      - $ref: '#/components/parameters/PoolID'
+    get:
+      tags: [Clusters]
+      operationId: getNodePool
+      summary: Get a node pool
+      responses:
+        '200':
+          description: The node pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodePool'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Clusters]
+      operationId: updateNodePool
+      summary: Update a node pool
+      description: >-
+        Partial update. Any omitted field keeps its stored value. The merged
+        result must satisfy `min_nodes <= desired_nodes <= max_nodes`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateNodePoolRequest'
+      responses:
+        '200':
+          description: The updated node pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodePool'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+    delete:
+      tags: [Clusters]
+      operationId: deleteNodePool
+      summary: Delete a node pool
+      responses:
+        '202':
+          description: Node pool teardown started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/clusters/{clusterID}/nodepools/{poolID}/machines:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/ClusterID'
+      - $ref: '#/components/parameters/PoolID'
+    get:
+      tags: [Clusters]
+      operationId: listNodePoolMachines
+      summary: List a node pool's machines
+      description: Lists the CAPI machines (nodes) belonging to the node pool.
+      responses:
+        '200':
+          description: The machines in the node pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MachineList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/registry:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Registry]
+      operationId: getRegistry
+      summary: Get the organization's registry
+      description: >-
+        Returns the registry record, or `{"enabled": false}` when no registry has
+        been provisioned for the organization.
+      responses:
+        '200':
+          description: The registry, or a disabled indicator.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Registry'
+                  - $ref: '#/components/schemas/RegistryDisabled'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Registry]
+      operationId: enableRegistry
+      summary: Enable the organization's registry
+      description: >-
+        Provisions the org's Harbor project and a default robot credential. No
+        request body is required. The robot `credentials` are returned only in this
+        response.
+      responses:
+        '201':
+          description: The enabled registry plus one-time robot credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnableRegistryResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      tags: [Registry]
+      operationId: disableRegistry
+      summary: Disable the organization's registry
+      parameters:
+        - name: purge
+          in: query
+          required: false
+          description: When "true", also deletes all repositories in the registry.
+          schema:
+            type: string
+            enum: ['true']
+      responses:
+        '204':
+          description: Registry disabled.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/registry/repositories:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Registry]
+      operationId: listRepositories
+      summary: List registry repositories
+      responses:
+        '200':
+          description: A list of repositories.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepositoryList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/organizations/{orgID}/registry/repositories/{repoName}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/RepoName'
+    delete:
+      tags: [Registry]
+      operationId: deleteRepository
+      summary: Delete a repository
+      responses:
+        '204':
+          description: Repository deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/registry/repositories/{repoName}/tags:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/RepoName'
+    get:
+      tags: [Registry]
+      operationId: listRepositoryTags
+      summary: List a repository's tags
+      responses:
+        '200':
+          description: A list of tags.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/organizations/{orgID}/registry/repositories/{repoName}/tags/{tag}/scan:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/RepoName'
+      - $ref: '#/components/parameters/TagName'
+    get:
+      tags: [Registry]
+      operationId: getTagScan
+      summary: Get a tag's vulnerability scan result
+      responses:
+        '200':
+          description: The Harbor scan result for the tag.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Registry]
+      operationId: triggerTagScan
+      summary: Trigger a vulnerability scan for a tag
+      responses:
+        '202':
+          description: Scan triggered.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/registry/robot-accounts:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Registry]
+      operationId: listRobotAccounts
+      summary: List registry robot accounts
+      responses:
+        '200':
+          description: A list of robot accounts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RobotAccountList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Registry]
+      operationId: createRobotAccount
+      summary: Create a registry robot account
+      description: >-
+        Creates a robot account. The one-time `token` secret is returned only in
+        this response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRobotAccountRequest'
+      responses:
+        '201':
+          description: Robot account created. Contains the one-time token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RobotAccountWithSecret'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/registry/robot-accounts/{accountID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/AccountID'
+    delete:
+      tags: [Registry]
+      operationId: deleteRobotAccount
+      summary: Delete a registry robot account
+      responses:
+        '204':
+          description: Robot account deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/registry/robot/rotate:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    post:
+      tags: [Registry]
+      operationId: rotateRobot
+      summary: Rotate the registry's default robot credential
+      responses:
+        '200':
+          description: Fresh one-time robot credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RobotCredentialsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/registry/cleanup-policies:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Registry]
+      operationId: listCleanupPolicies
+      summary: List registry cleanup policies
+      responses:
+        '200':
+          description: A list of cleanup policies.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CleanupPolicyList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Registry]
+      operationId: createCleanupPolicy
+      summary: Create a registry cleanup policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCleanupPolicyRequest'
+      responses:
+        '201':
+          description: Cleanup policy created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CleanupPolicy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/registry/cleanup-policies/{policyID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/PolicyID'
+    put:
+      tags: [Registry]
+      operationId: updateCleanupPolicy
+      summary: Update a registry cleanup policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCleanupPolicyRequest'
+      responses:
+        '200':
+          description: The updated cleanup policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CleanupPolicy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+    delete:
+      tags: [Registry]
+      operationId: deleteCleanupPolicy
+      summary: Delete a registry cleanup policy
+      responses:
+        '204':
+          description: Cleanup policy deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/registry/cleanup-policies/{policyID}/dry-run:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/PolicyID'
+    post:
+      tags: [Registry]
+      operationId: dryRunCleanupPolicy
+      summary: Dry-run a registry cleanup policy
+      description: Evaluates the policy without deleting anything.
+      responses:
+        '200':
+          description: The dry-run result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DryRunResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/registry/cleanup-policies/{policyID}/run:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/PolicyID'
+    post:
+      tags: [Registry]
+      operationId: runCleanupPolicy
+      summary: Run a registry cleanup policy now
+      responses:
+        '200':
+          description: The applied cleanup result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunPolicyResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/billing/usage:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Billing]
+      operationId: getUsage
+      summary: Get month-to-date usage and subscriptions
+      description: >-
+        Returns the current UTC month's billing summary: flat monthly
+        subscriptions (fixed pools, control plane, packages and package
+        overage, public API endpoints and load balancers) and autoscaling
+        hourly usage records, with a combined total in euros.
+      responses:
+        '200':
+          description: The usage summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/organizations/{orgID}/billing/breakdown:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Billing]
+      operationId: getCostBreakdown
+      summary: Get the authoritative month-to-date cost breakdown
+      description: >-
+        Returns the current UTC month's authoritative cost breakdown: flat
+        monthly subscriptions (fixed pools, control plane, packages and package
+        overage, public API endpoints and load balancers) plus server-priced
+        autoscaling usage aggregated per node pool and resource type, with a
+        reconciled subtotal in euros. The subtotal reconciles to
+        UsageSummary.total_eur (to display precision; exact-cents parity lands
+        with invoice generation in Phase 4) — this endpoint is the single source
+        of truth for the month's bill (unlike /billing/daily-spend, which is
+        autoscaling-only). Each autoscaling line carries the server-computed
+        unit_price_eur and amount_eur.
+      responses:
+        '200':
+          description: The authoritative cost breakdown.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostBreakdown'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/organizations/{orgID}/billing/daily-spend:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Billing]
+      operationId: getDailySpend
+      summary: Get daily spend (autoscaling)
+      description: >-
+        Returns a zero-filled, contiguous per-day autoscaling spend series from the
+        first of the current UTC month through today, plus the period total.
+      responses:
+        '200':
+          description: The daily-spend series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailySpendResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/organizations/{orgID}/billing/budget:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Billing]
+      operationId: getBudget
+      summary: Get the org's monthly budget
+      description: >-
+        Returns the org's soft monthly budget (limit plus ascending percentage
+        thresholds). Budgets are advisory: crossing a threshold fires a
+        one-time `usage.alert` webhook, but nothing is blocked.
+      responses:
+        '200':
+          description: The budget.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Budget'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Billing]
+      operationId: setBudget
+      summary: Create or replace the org's monthly budget
+      description: >-
+        Upserts the org's soft monthly budget. `thresholds_pct` must be
+        non-empty, strictly ascending, and each value in `0 < pct <= 100`;
+        `monthly_limit_eur` must be > 0. Validation failures return 422.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetBudgetRequest'
+      responses:
+        '200':
+          description: The saved budget.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Budget'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+    delete:
+      tags: [Billing]
+      operationId: deleteBudget
+      summary: Delete the org's monthly budget
+      responses:
+        '204':
+          description: The budget was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/billing/invoices:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Billing]
+      operationId: listInvoices
+      summary: List invoices
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of invoices.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/organizations/{orgID}/billing/invoices/{invoiceID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/InvoiceID'
+    get:
+      tags: [Billing]
+      operationId: getInvoice
+      summary: Get an invoice
+      responses:
+        '200':
+          description: The invoice, including its itemized line items.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/billing/invoices/{invoiceID}/pdf:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/InvoiceID'
+    get:
+      tags: [Billing]
+      operationId: downloadInvoicePDF
+      summary: Download an invoice PDF
+      responses:
+        '200':
+          description: The invoice PDF.
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/billing/payment-methods:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Billing]
+      operationId: listPaymentMethods
+      summary: List payment methods
+      responses:
+        '200':
+          description: A list of payment methods.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethodList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Billing]
+      operationId: createPaymentMethod
+      summary: Attach a payment method
+      description: >-
+        Attaches a Stripe payment method (referenced by its Stripe payment-method
+        ID) to the organization.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentMethodRequest'
+      responses:
+        '201':
+          description: Payment method attached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethod'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/organizations/{orgID}/billing/payment-methods/{pmID}:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/PaymentMethodID'
+    get:
+      tags: [Billing]
+      operationId: getPaymentMethod
+      summary: Get a payment method
+      responses:
+        '200':
+          description: The payment method.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethod'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Billing]
+      operationId: deletePaymentMethod
+      summary: Detach a payment method
+      responses:
+        '204':
+          description: Payment method detached.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{orgID}/billing/payment-methods/{pmID}/default:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+      - $ref: '#/components/parameters/PaymentMethodID'
+    post:
+      tags: [Billing]
+      operationId: setDefaultPaymentMethod
+      summary: Set the default payment method
+      responses:
+        '200':
+          description: The default payment method was updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/admin/whoami:
+    get:
+      tags: [Admin]
+      operationId: adminWhoami
+      summary: Echo the authenticated admin's identity and roles
+      description: >-
+        Returns the calling admin's email and Keycloak realm roles. Doubles as a
+        liveness check that the `platform-admin` gate is wired correctly. Like
+        the whole `/api/v1/admin` tree, this requires the `platform-admin` realm
+        role and rejects API tokens (which carry no roles) with 403.
+      responses:
+        '200':
+          description: The authenticated admin's identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [email, roles]
+                properties:
+                  email:
+                    type: string
+                    description: The admin's email, from the JWT `email` claim.
+                  roles:
+                    type: array
+                    description: Keycloak realm roles from `realm_access.roles`.
+                    items:
+                      type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/admin/rate-card:
+    get:
+      tags: [Admin]
+      operationId: adminGetRateCard
+      summary: Get the current effective customer rate card
+      description: >-
+        Returns the live €/month price per resource type — the newest
+        effective-dated `rate_cards` row per type with `effective_from <= now()`.
+        Requires the `platform-admin` realm role.
+      responses:
+        '200':
+          description: The current effective rates, keyed by resource type.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rates]
+                properties:
+                  rates:
+                    type: object
+                    description: >-
+                      Map of resource_type -> €/month unit price. Keys are the
+                      ten resource types of the rate card (see the enum on
+                      updateRateCard).
+                    additionalProperties:
+                      type: number
+                      format: double
+                    example:
+                      control_plane: 0
+                      vcpu: 8
+                      memory: 3.5
+                      disk: 0.12
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    put:
+      tags: [Admin]
+      operationId: adminUpdateRateCard
+      summary: Update the customer rate card
+      description: >-
+        Appends a new effective-now `rate_cards` row per submitted resource type
+        and refreshes the in-process rate card so the change is live immediately.
+        Each line is validated against the resource-type enum and the
+        non-negative price constraint; a duplicated resource_type in one request
+        is rejected. Requires the `platform-admin` realm role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rates]
+              properties:
+                rates:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [resource_type, unit_price_eur]
+                    properties:
+                      resource_type:
+                        type: string
+                        enum: [control_plane, vcpu, memory, disk, storage_block,
+                               storage_rwx, loadbalancer, registry, snapshot, public_ip]
+                      unit_price_eur:
+                        type: number
+                        format: double
+                        minimum: 0
+                        description: €/month unit price (non-negative).
+            example:
+              rates:
+                - resource_type: control_plane
+                  unit_price_eur: 0
+                - resource_type: vcpu
+                  unit_price_eur: 6.5
+      responses:
+        '200':
+          description: The updated current effective rates.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rates]
+                properties:
+                  rates:
+                    type: object
+                    additionalProperties:
+                      type: number
+                      format: double
+        '400':
+          description: >-
+            Invalid body — unknown resource_type, negative price, duplicate
+            resource_type, or empty rates.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/admin/rate-card/history:
+    get:
+      tags: [Admin]
+      operationId: adminGetRateCardHistory
+      summary: List recent rate-card changes
+      description: >-
+        Returns recent `rate_cards` rows newest-first (the effective-dated price
+        history). Requires the `platform-admin` realm role.
+      responses:
+        '200':
+          description: Recent rate-card rows, newest-first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [history]
+                properties:
+                  history:
+                    type: array
+                    items:
+                      type: object
+                      required: [resource_type, unit_price_eur, effective_from, created_by, created_at]
+                      properties:
+                        resource_type:
+                          type: string
+                          enum: [control_plane, vcpu, memory, disk, storage_block,
+                                 storage_rwx, loadbalancer, registry, snapshot, public_ip]
+                        unit_price_eur:
+                          type: number
+                          format: double
+                        effective_from:
+                          type: string
+                          format: date-time
+                        created_by:
+                          type: string
+                        created_at:
+                          type: string
+                          format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/admin/organizations/{orgID}/storage-quota:
+    parameters:
+      - $ref: '#/components/parameters/OrgID'
+    get:
+      tags: [Admin]
+      operationId: adminGetSharedStorageQuota
+      summary: Get an organization's shared-storage quota
+      description: >-
+        Returns the org's configured shared-storage (CephFS) cap alongside the
+        platform default and, when the management cluster can be reached, the
+        quota ceph is actually enforcing and the bytes already written. The
+        observation is best-effort: an unreachable management cluster leaves
+        both observed members `null` rather than failing the request. Requires
+        the `platform-admin` realm role.
+      responses:
+        '200':
+          description: The org's configured, effective and observed quota figures.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SharedStorageQuota'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Admin]
+      operationId: adminSetSharedStorageQuota
+      summary: Set or revert an organization's shared-storage quota
+      description: >-
+        Sets the org's shared-storage cap and publishes it to the org's
+        `StorageInventory` so a raise takes effect immediately; the provisioner
+        syncer is the durable path, so a failed publish is logged rather than
+        returned. A `null` `quota_gb` REVERTS the org to the platform default
+        and publishes a REMOVAL of `spec.sharedQuotaBytes` from the org's
+        `StorageInventory` (never `0` — ceph reads `0` as unlimited, the exact
+        inversion of a revert).
+
+
+        Lowering is pre-flighted against the bytes already stored and rejected
+        with `409` when it would fall below them: ceph accepts such a quota and
+        then refuses every write to the pool until usage drops, an org-wide
+        outage whose only undo is raising the quota back. The check is advisory
+        — when no observed figure is available it is skipped, because a
+        `StorageInventory` with no status yet is the ordinary state of a young
+        org.
+
+
+        The change is recorded in the admin audit log with its before and after
+        values. Requires the `platform-admin` realm role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quota_gb]
+              properties:
+                quota_gb:
+                  type: [integer, 'null']
+                  minimum: 1
+                  maximum: 10240
+                  description: >-
+                    The cap in GiB, between 1 and 10240, or `null` to revert to
+                    the platform default. `1` is the floor because `0` means
+                    UNLIMITED to ceph.
+            example:
+              quota_gb: 200
+      responses:
+        '200':
+          description: The stored quota, with the observed figures when available.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SharedStorageQuota'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: >-
+            `quota_below_usage` — the requested cap is below the bytes already
+            stored in the org's pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/admin/tickets:
+    get:
+      tags: [Admin]
+      operationId: adminListTickets
+      summary: List tickets across all orgs
+      description: >-
+        Lists support tickets across every organization, newest first, for
+        platform staff. Narrow the result with the optional `status`,
+        `severity`, `category`, `org_id`, and `assigned` query parameters.
+        Requires the `platform-admin` realm role.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [open, in_progress, waiting, resolved, closed]
+        - name: severity
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [low, medium, high, critical]
+        - name: category
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [cluster, networking, storage, identity, billing, feature_request, general]
+        - name: org_id
+          in: query
+          required: false
+          description: Restrict to a single organization.
+          schema:
+            type: string
+            format: uuid
+        - name: assigned
+          in: query
+          required: false
+          description: >-
+            `unassigned` for tickets with no assignee, or a user UUID for
+            tickets assigned to that staff member. Omit for any.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of tickets across all orgs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketList'
+        '400':
+          description: >-
+            Invalid query — malformed `org_id`, or `assigned` that is neither
+            `unassigned` nor a user UUID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/admin/tickets/{ticketID}:
+    parameters:
+      - $ref: '#/components/parameters/TicketID'
+    get:
+      tags: [Admin]
+      operationId: adminGetTicket
+      summary: Get any ticket
+      description: >-
+        Fetches a ticket from any organization (no org scope). Requires the
+        `platform-admin` realm role.
+      responses:
+        '200':
+          description: The ticket.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Admin]
+      operationId: adminUpdateTicket
+      summary: Update any ticket (assign / status / severity / category)
+      description: >-
+        Updates a ticket's `severity`, `status`, `category`, or `assigned_to`
+        without an org scope. All fields are optional; omitted fields are left
+        unchanged. Uses the admin transition matrix, which additionally permits
+        reopening a `closed` ticket (to `open` or `in_progress`); an illegal
+        transition is rejected with 422 (`invalid_transition`). Requires the
+        `platform-admin` realm role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTicketRequest'
+      responses:
+        '200':
+          description: The updated ticket.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/admin/tickets/{ticketID}/messages:
+    parameters:
+      - $ref: '#/components/parameters/TicketID'
+    get:
+      tags: [Admin]
+      operationId: adminListTicketMessages
+      summary: List any ticket's messages
+      description: >-
+        Lists a ticket's message thread (no org scope), oldest first. Requires
+        the `platform-admin` realm role.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketMessageList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Admin]
+      operationId: adminCreateTicketMessage
+      summary: Reply to a ticket as provider
+      description: >-
+        Appends a provider-authored message (`author_type` = `provider`,
+        `author_id` from the caller's JWT subject) to any ticket's thread. In
+        one transaction it recomputes the ticket's status (a provider reply on
+        an `open` ticket moves it to `in_progress`), stamps `first_response_at`
+        on the first provider message, and enqueues the `ticket.updated`
+        webhook. A notification email to the tenant is sent best-effort after
+        commit. Requires the `platform-admin` realm role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTicketMessageRequest'
+      responses:
+        '201':
+          description: Message created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+
+  /api/v1/admin/tickets/{ticketID}/attachments:
+    parameters:
+      - $ref: '#/components/parameters/TicketID'
+    get:
+      tags: [Support]
+      operationId: adminListTicketAttachments
+      summary: List any ticket's attachments (admin)
+      description: >-
+        Lists a ticket's confirmed attachments across any org, oldest first.
+        Requires the `platform-admin` realm role.
+      responses:
+        '200':
+          description: The ticket's attachments.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketAttachmentList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Support]
+      operationId: adminPresignTicketAttachmentUpload
+      summary: Reserve an attachment on any ticket (admin)
+      description: >-
+        Provider-side equivalent of the tenant presign-upload: reserves a
+        `pending` attachment on any ticket (the ticket's org is resolved for the
+        metadata row) and returns a presigned PUT URL. Same allowlist/size
+        limits and 503-when-unconfigured behavior. Confirm by referencing the
+        `attachment_id` in `attachment_ids` on a provider reply. Requires the
+        `platform-admin` realm role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PresignUploadRequest'
+      responses:
+        '201':
+          description: Attachment reserved; upload URL issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignUploadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationErrorResponse'
+        '503':
+          description: Attachment storage is not configured.
+
+  /api/v1/admin/tickets/{ticketID}/attachments/{attachmentID}:
+    parameters:
+      - $ref: '#/components/parameters/TicketID'
+      - $ref: '#/components/parameters/AttachmentID'
+    get:
+      tags: [Support]
+      operationId: adminDownloadTicketAttachment
+      summary: Download any ticket's attachment (admin)
+      description: >-
+        Redirects (302) to a short-lived presigned GET URL for the attachment
+        bytes. No org scope. Returns 503 when storage is unconfigured. Requires
+        the `platform-admin` realm role.
+      responses:
+        '302':
+          description: Redirect to the presigned download URL.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          description: Attachment storage is not configured.
+
+components:
+  securitySchemes:
+    bearerApiToken:
+      type: http
+      scheme: bearer
+      description: >-
+        An Aether API token of the form `aether_<hex>`, sent as
+        `Authorization: Bearer <token>`.
+
+  parameters:
+    OrgID:
+      name: orgID
+      in: path
+      required: true
+      description: Organization UUID.
+      schema:
+        type: string
+        format: uuid
+    MemberID:
+      name: memberID
+      in: path
+      required: true
+      description: Member UUID.
+      schema:
+        type: string
+        format: uuid
+    TokenID:
+      name: tokenID
+      in: path
+      required: true
+      description: API token UUID.
+      schema:
+        type: string
+        format: uuid
+    WebhookID:
+      name: webhookID
+      in: path
+      required: true
+      description: Webhook UUID.
+      schema:
+        type: string
+        format: uuid
+    TicketID:
+      name: ticketID
+      in: path
+      required: true
+      description: Support ticket UUID.
+      schema:
+        type: string
+        format: uuid
+    AttachmentID:
+      name: attachmentID
+      in: path
+      required: true
+      description: Ticket attachment UUID.
+      schema:
+        type: string
+        format: uuid
+    ClusterID:
+      name: clusterID
+      in: path
+      required: true
+      description: Cluster UUID.
+      schema:
+        type: string
+        format: uuid
+    PoolID:
+      name: poolID
+      in: path
+      required: true
+      description: Node pool UUID.
+      schema:
+        type: string
+        format: uuid
+    InvoiceID:
+      name: invoiceID
+      in: path
+      required: true
+      description: Invoice UUID.
+      schema:
+        type: string
+        format: uuid
+    PaymentMethodID:
+      name: pmID
+      in: path
+      required: true
+      description: Payment method UUID.
+      schema:
+        type: string
+        format: uuid
+    RepoName:
+      name: repoName
+      in: path
+      required: true
+      description: Repository name (org-scoped repo path segment).
+      schema:
+        type: string
+    TagName:
+      name: tag
+      in: path
+      required: true
+      description: Tag name.
+      schema:
+        type: string
+    AccountID:
+      name: accountID
+      in: path
+      required: true
+      description: Robot account identifier.
+      schema:
+        type: string
+    PolicyID:
+      name: policyID
+      in: path
+      required: true
+      description: Cleanup policy identifier.
+      schema:
+        type: string
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor (a UUID) for pagination; pass back the prior page's next_cursor.
+      schema:
+        type: string
+        format: uuid
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of items per page (1-100, default 50).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+
+  responses:
+    BadRequest:
+      description: >-
+        Malformed request — e.g. an invalid path UUID or an unparseable JSON
+        body.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Missing or invalid credentials.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: >-
+        The credential was accepted but lacks the required role or access
+        (e.g. a non-`platform-admin` calling an `/api/v1/admin` endpoint).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: The requested resource was not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: The resource already exists or conflicts with current state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ValidationErrorResponse:
+      description: Request validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: A required backend dependency is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: A stable, machine-readable error code.
+            message:
+              type: string
+            details:
+              type: array
+              items:
+                $ref: '#/components/schemas/ValidationError'
+
+    ValidationError:
+      type: object
+      required: [field, code, message]
+      properties:
+        field:
+          type: string
+        code:
+          type: string
+        message:
+          type: string
+
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          description: A short status word, e.g. "deleting", "deleted", or "ok".
+
+    Organization:
+      type: object
+      required: [id, name, slug, plan, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+        billing_email:
+          type: [string, 'null']
+        vat_id:
+          type: [string, 'null']
+        plan:
+          type: string
+          readOnly: true
+          description: >-
+            Legacy organization field, always `starter`; not settable through
+            the API and unrelated to a cluster's package (`plan` on
+            createCluster).
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateOrganizationRequest:
+      type: object
+      required: [name, slug]
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+        billing_email:
+          type: [string, 'null']
+        vat_id:
+          type: [string, 'null']
+
+    UpdateOrganizationRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+        billing_email:
+          type: [string, 'null']
+        vat_id:
+          type: [string, 'null']
+
+    OrganizationList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Organization'
+        next_cursor:
+          type: [string, 'null']
+
+    Member:
+      type: object
+      required: [id, org_id, email, role, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        role:
+          type: string
+          enum: [owner, admin, member, viewer]
+        invited_by:
+          type: [string, 'null']
+          format: uuid
+        accepted_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    CreateMemberRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email:
+          type: string
+        role:
+          type: string
+          enum: [owner, admin, member, viewer]
+
+    UpdateMemberRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [owner, admin, member, viewer]
+
+    MemberList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Member'
+        next_cursor:
+          type: [string, 'null']
+
+    APIToken:
+      type: object
+      required: [id, org_id, name, prefix, scopes, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        prefix:
+          type: string
+          description: The non-secret token prefix, for display/identification.
+        scopes:
+          type: array
+          items:
+            type: string
+        last_used_at:
+          type: [string, 'null']
+          format: date-time
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    APITokenWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/APIToken'
+        - type: object
+          required: [token]
+          properties:
+            token:
+              type: string
+              description: >-
+                The raw API token (`aether_<hex>`). Shown only once, at creation.
+
+    CreateAPITokenRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        expires_at:
+          type: [string, 'null']
+          description: Optional expiry timestamp (RFC 3339).
+
+    APITokenList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/APIToken'
+        next_cursor:
+          type: [string, 'null']
+
+    Webhook:
+      type: object
+      required: [id, org_id, url, description, events, enabled, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        url:
+          type: string
+          description: >-
+            Delivery endpoint. Must be `https`, without embedded credentials,
+            and must not point at private or internal address ranges.
+        description:
+          type: string
+        events:
+          type: array
+          items:
+            type: string
+          description: >-
+            Subscribed event types, validated against the catalog:
+            `cluster.created`, `cluster.ready`, `cluster.upgraded`,
+            `cluster.degraded`, `cluster.deleted`, `node.replaced`,
+            `usage.alert`, `invoice.generated`, `ticket.updated` — or exactly
+            `["*"]` to subscribe to every catalog type. `usage.alert` fires once
+            per budget threshold crossed in a month; its payload is
+            `{budget_eur, spend_eur, threshold_pct, billing_month}`.
+            `invoice.generated` fires at month close when an org's invoice is
+            generated; its payload is
+            `{invoice_id, amount_cents, currency, period_start, period_end}`.
+            `ticket.updated` fires whenever a support ticket is created, receives
+            a new message, or changes status; its payload is
+            `{ticket_id, status, severity, category, last_message_author_type,
+            updated_at}` where `last_message_author_type` is `tenant` or
+            `provider` for a message event and empty (`""`) for a status-only
+            change.
+        enabled:
+          type: boolean
+          description: Disabled webhooks receive no deliveries.
+        secret:
+          type: string
+          description: >-
+            Server-generated signing secret (`whsec_<hex>`). Returned once —
+            present only in create and rotate-secret responses; list and get
+            never include it.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateWebhookRequest:
+      type: object
+      required: [url, events]
+      properties:
+        url:
+          type: string
+          description: >-
+            Delivery endpoint. Must be `https`, without embedded credentials,
+            and must not point at private or internal address ranges.
+        description:
+          type: string
+        events:
+          type: array
+          items:
+            type: string
+          description: >-
+            Event types to subscribe to (see the `Webhook.events` catalog), or
+            exactly `["*"]` for all of them.
+
+    UpdateWebhookRequest:
+      type: object
+      description: All fields are optional; omitted fields are left unchanged.
+      properties:
+        url:
+          type: string
+        description:
+          type: string
+        events:
+          type: array
+          items:
+            type: string
+        enabled:
+          type: boolean
+
+    WebhookList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Webhook'
+        next_cursor:
+          type: [string, 'null']
+
+    WebhookDelivery:
+      type: object
+      required: [id, webhook_id, event_id, event_type, status, attempts, next_attempt_at, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        webhook_id:
+          type: string
+          format: uuid
+        event_id:
+          type: string
+          format: uuid
+          description: >-
+            Event identity, shared by every endpoint's delivery of the same
+            event and sent as `X-Aether-Event-Id`. Delivery is at-least-once —
+            deduplicate on it.
+        event_type:
+          type: string
+        status:
+          type: string
+          enum: [pending, succeeded, dead]
+        attempts:
+          type: integer
+        next_attempt_at:
+          type: string
+          format: date-time
+        last_status_code:
+          type: integer
+          description: HTTP status returned by the endpoint on the last attempt, if any.
+        last_error:
+          type: string
+          description: Failure summary of the last attempt; absent after success.
+        delivered_at:
+          type: string
+          format: date-time
+          description: Set when the delivery succeeded.
+        created_at:
+          type: string
+          format: date-time
+
+    WebhookDeliveryList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebhookDelivery'
+        next_cursor:
+          type: [string, 'null']
+
+    Ticket:
+      type: object
+      required: [id, org_id, subject, category, severity, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        cluster_id:
+          type: [string, 'null']
+          format: uuid
+          description: Optional cluster this ticket concerns.
+        subject:
+          type: string
+        category:
+          type: string
+          enum: [cluster, networking, storage, identity, billing, feature_request, general]
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+        status:
+          type: string
+          enum: [open, in_progress, waiting, resolved, closed]
+        created_by:
+          type: [string, 'null']
+          format: uuid
+          description: JWT subject of the opener; null for API-token requests.
+        assigned_to:
+          type: [string, 'null']
+          format: uuid
+        first_response_at:
+          type: [string, 'null']
+          format: date-time
+          description: Set when the first `provider` message is posted.
+        resolved_at:
+          type: [string, 'null']
+          format: date-time
+          description: >-
+            Set when the ticket enters `resolved`; cleared only when a resolved
+            ticket is reopened (to `open`/`in_progress`); preserved on close.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateTicketRequest:
+      type: object
+      required: [subject, body]
+      properties:
+        cluster_id:
+          type: string
+          format: uuid
+          description: Optional cluster this ticket concerns.
+        subject:
+          type: string
+        category:
+          type: string
+          enum: [cluster, networking, storage, identity, billing, feature_request, general]
+          description: Defaults to `general` when omitted.
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+          description: Defaults to `low` when omitted.
+        body:
+          type: string
+          description: The initial message body (stored as the first tenant message).
+
+    UpdateTicketRequest:
+      type: object
+      description: All fields are optional; omitted fields are left unchanged.
+      properties:
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+        status:
+          type: string
+          enum: [open, in_progress, waiting, resolved, closed]
+          description: >-
+            Must be a legal transition from the current status (`closed` is
+            terminal in this phase). An illegal move returns 422 with code
+            `invalid_transition`.
+        category:
+          type: string
+          enum: [cluster, networking, storage, identity, billing, feature_request, general]
+        assigned_to:
+          type: string
+          format: uuid
+
+    TicketList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ticket'
+        next_cursor:
+          type: [string, 'null']
+
+    TicketMessage:
+      type: object
+      required: [id, ticket_id, author_type, body, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        ticket_id:
+          type: string
+          format: uuid
+        author_id:
+          type: [string, 'null']
+          format: uuid
+          description: JWT subject of the author; null for API-token requests.
+        author_type:
+          type: string
+          enum: [tenant, provider]
+        body:
+          type: string
+        attachments:
+          type: array
+          description: Opaque legacy attachments blob (structured attachments arrive in a later phase).
+          items: {}
+        created_at:
+          type: string
+          format: date-time
+
+    CreateTicketMessageRequest:
+      type: object
+      required: [body]
+      properties:
+        body:
+          type: string
+        attachments:
+          type: array
+          items: {}
+        attachment_ids:
+          type: array
+          description: >-
+            IDs of `pending` attachments (previously reserved via the
+            presign-upload endpoint) to confirm onto this message. Each id must
+            be a pending upload owned by this ticket; any foreign/unknown id
+            rejects the whole message (422) and rolls back the transaction.
+          items:
+            type: string
+            format: uuid
+
+    TicketMessageList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TicketMessage'
+        next_cursor:
+          type: [string, 'null']
+
+    TicketAttachment:
+      type: object
+      required: [id, ticket_id, filename, content_type, size_bytes, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        ticket_id:
+          type: string
+          format: uuid
+        message_id:
+          type: [string, 'null']
+          format: uuid
+          description: The message this attachment was confirmed onto; null while pending.
+        filename:
+          type: string
+        content_type:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [pending, attached]
+        created_at:
+          type: string
+          format: date-time
+
+    TicketAttachmentList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TicketAttachment'
+
+    PresignUploadRequest:
+      type: object
+      required: [filename, content_type, size_bytes]
+      properties:
+        filename:
+          type: string
+        content_type:
+          type: string
+          description: >-
+            Must be on the server allowlist (images, application/pdf, text/plain,
+            application/json, yaml, gzip, tar). Other types are rejected (422).
+        size_bytes:
+          type: integer
+          format: int64
+          description: File size in bytes; must be in (0, 26214400] (25 MiB).
+
+    PresignUploadResponse:
+      type: object
+      required: [attachment_id, upload_url]
+      properties:
+        attachment_id:
+          type: string
+          format: uuid
+          description: Reference this id in a message's `attachment_ids` to confirm the upload.
+        upload_url:
+          type: string
+          format: uri
+          description: Short-lived presigned PUT URL; upload bytes directly here with the matching Content-Type.
+
+    AuditEvent:
+      type: object
+      required: [id, org_id, actor_type, action, resource_type, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        actor_id:
+          type: [string, 'null']
+          format: uuid
+        actor_type:
+          type: string
+        actor_email:
+          type: [string, 'null']
+        action:
+          type: string
+        resource_type:
+          type: string
+        resource_id:
+          type: [string, 'null']
+          format: uuid
+        metadata:
+          description: Arbitrary event metadata (any JSON value, may be null).
+        ip_address:
+          type: [string, 'null']
+        created_at:
+          type: string
+          format: date-time
+
+    AuditEventList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        next_cursor:
+          type: [string, 'null']
+
+    ClusterStatus:
+      type: string
+      enum: [provisioning, running, upgrading, degraded, deleting, failed]
+
+    Cluster:
+      type: object
+      required: [id, org_id, name, region, k8s_version, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        region:
+          type: string
+        k8s_version:
+          type: string
+        status:
+          $ref: '#/components/schemas/ClusterStatus'
+        status_message:
+          type: [string, 'null']
+        endpoint:
+          type: [string, 'null']
+          description: >-
+            The apiserver URL aether-operator reports for the cluster: the
+            private control-plane proxy address, or the public hostname when
+            `public_endpoint` is true (which it is on every supported cluster —
+            a cluster without the mandatory public endpoint is an
+            implementation gap, tracked internally as I-14, see
+            `public_endpoint`). Observed, not derived — `null` (and omitted
+            from the response) until the cluster has been provisioned far
+            enough for the operator to report one.
+        observed_kubernetes_version:
+          type: [string, 'null']
+          description: The version aether-operator reports once a rollout settles.
+        capi_cluster_name:
+          type: [string, 'null']
+        keycloak_realm:
+          type: [string, 'null']
+        harbor_project:
+          type: [string, 'null']
+        ceph_pool:
+          type: [string, 'null']
+        lb_subnet:
+          type: [string, 'null']
+        worker_subnet:
+          type: [string, 'null']
+          description: The per-cluster worker /24 (read-only; allocated at create time).
+        public_endpoint:
+          type: boolean
+          description: >-
+            Whether this cluster's apiserver is exposed on a public IPv4 and
+            DNS name in addition to the private control-plane proxy path.
+            Every cluster is required to have one: the public API endpoint is
+            mandatory, billed at the published monthly rate for `public_ip`
+            (€4 at the time of writing; the current rate is shown in the
+            portal and, once published, on the pricing page) as a flat month
+            with no proration, locked the first time the billing sampler
+            observes the address — one line per cluster per month, see
+            `SubscriptionLine.kind` `public_ip`. Set at create time and
+            immutable afterwards; sending a different value to updateCluster
+            is rejected with 422 public_endpoint/immutable.
+            A cluster reading false is an implementation gap (tracked
+            internally as I-14), not a supported configuration: the API still
+            accepts `public_endpoint: false` at create time, and the resulting
+            cluster has no public address, no endpoint charge and no supported
+            access path. Its apiserver answers only on the cluster's private
+            network — its own workers and the platform — and in production
+            there is no supported way to reach it from a laptop or a CI
+            pipeline; the kubectl proxy through the platform API
+            (`proxy-kubeconfig`, not exposed in this reference) is a preview
+            that is switched off in production and, where enabled, reaches
+            private and public clusters alike. Private-network connectivity,
+            which would make the public endpoint optional, is a future
+            capability.
+        plan_slug:
+          type: [string, 'null']
+          description: >-
+            The package this cluster is billed from, as chosen at create time:
+            one of the package slugs in the catalogue (currently `dev`,
+            `starter`, `growth`, `scale`; a retired slug can still appear on an
+            existing cluster). `null` (and omitted from the response) means the
+            cluster is billed per resource ("custom"). Immutable — no endpoint
+            changes it.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateClusterRequest:
+      type: object
+      required: [name, region, k8s_version]
+      properties:
+        name:
+          type: string
+        region:
+          type: string
+        k8s_version:
+          type: string
+          description: >-
+            A supported Kubernetes version as MAJOR.MINOR (e.g. "1.33") or full
+            MAJOR.MINOR.PATCH. Bare minors resolve to the latest available
+            patch; a full version is accepted only when its minor is offered by
+            `GET /api/v1/k8s-versions` and its patch is one this platform has
+            resolved (at or below that minor's current `patch`) — otherwise 422
+            `validation_error`.
+        plan:
+          type: string
+          examples: [starter]
+          description: >-
+            The package to bill this cluster from. The catalogue currently
+            offers `dev`, `starter`, `growth` and `scale`, but the server
+            validates the slug against its own catalogue rather than a fixed
+            list, so treat those four as the values available today and not as
+            the permitted set. Optional: omitted — or sent as an empty string,
+            which is accepted and means the same thing — bills the cluster per
+            resource ("custom"), with no package fee and no allowance. A slug
+            that is unknown or retired is rejected at create time with 422
+            `validation_error` carrying `plan`/`unavailable` in `details`.
+            Chosen at create time and immutable afterwards: no update field
+            changes it, so moving between packages, or between a package and
+            custom, means recreating the cluster.
+        public_endpoint:
+          type: boolean
+          default: false
+          description: >-
+            The public apiserver endpoint: the cluster's control-plane proxy
+            also binds one IPv4 from the region's public pool and the
+            apiserver is published at
+            <cluster>.<org>.<region>.aetherplatform.cloud. Send true — the
+            public API endpoint is mandatory on every cluster, billed at the
+            published monthly rate for `public_ip` (€4 at the time of writing;
+            the current rate is shown in the portal and, once published, on
+            the pricing page) as a flat month with no proration, locked the
+            first time the billing sampler observes the address — one charge
+            per cluster per month, on top of the cluster's other resources,
+            and no package fee includes it.
+            The schema default stays false, but omitting the field or sending
+            false is an implementation gap (tracked internally as I-14), not a
+            supported alternative: the API still accepts it and creates a
+            cluster with no public address, no endpoint charge and no
+            supported access path. Such a cluster's apiserver answers only on
+            its private network — its own workers and the platform — and in
+            production there is no supported way to reach it from a laptop or
+            a CI pipeline; the kubectl proxy through the platform API
+            (`proxy-kubeconfig`, not exposed in this reference) is a preview
+            that is switched off in production and, where enabled, reaches
+            private and public clusters alike. Private-network connectivity,
+            which would make the public endpoint optional, is a future
+            capability.
+            Immutable after create; a 409 public_ip_pool_exhausted means the
+            region has no free address.
+
+    UpdateClusterRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        k8s_version:
+          type: string
+        public_endpoint:
+          type: boolean
+          description: >-
+            Immutable. Accepted only when it equals the cluster's current
+            value (so a GET can be round-tripped into an update); any other
+            value is rejected with 422 public_endpoint/immutable. Recreate the
+            cluster to change it — there is no path that turns the public API
+            endpoint on or off on an existing cluster. Every cluster is
+            required to have one (billed at the published monthly rate for
+            `public_ip`, €4 at the time of writing, as a flat month locked the
+            first time the billing sampler observes the address), so a cluster
+            sitting at false is an implementation gap (tracked internally as
+            I-14), not a supported configuration: it has no public address and
+            no supported access path, and the only remedy is to recreate it
+            with `public_endpoint: true`.
+            `plan` is immutable in the same way and has no field here at all.
+
+    ClusterList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Cluster'
+        next_cursor:
+          type: [string, 'null']
+
+    K8sVersionList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: >-
+            The offered versions, newest first. Never `null`; an unwarmed or
+            fully-excluded version service yields an empty array. This endpoint
+            is not paginated and emits no `next_cursor`.
+          items:
+            $ref: '#/components/schemas/K8sVersionInfo'
+
+    K8sVersionInfo:
+      type: object
+      required: [version, label, patch]
+      properties:
+        version:
+          type: string
+          description: >-
+            The Kubernetes MINOR version — `1.37`, not `1.37.4`. Pass it back as
+            `k8s_version` on cluster creation or `target_version` on upgrade,
+            where it resolves to the latest patch Aether has verified for that
+            minor.
+          examples: ['1.37']
+        label:
+          type: string
+          enum: [Latest, Stable]
+          description: >-
+            `Latest` marks the newest offered minor and appears on exactly one
+            entry. It is the topmost minor that survives the Talos cap, which is
+            not necessarily upstream's latest release. Every other entry is
+            `Stable`.
+          examples: [Latest]
+        patch:
+          type: string
+          description: >-
+            The full version this minor currently resolves to — `1.37.0` for
+            `version` `1.37` — with no leading `v`. Always present on an offered
+            entry: a minor whose patch cannot be resolved is dropped from the
+            list rather than advertised. Display-oriented (`Latest — 1.37.0`);
+            it is not a stable identifier, since the same minor resolves to a
+            newer patch as upstream publishes one. Send `version` back on
+            create/upgrade, or send an explicit published patch of an offered
+            minor.
+          examples: ['1.37.0']
+
+    APIServerRateLimit:
+      type: object
+      required: [max_connections_per_second, burst]
+      properties:
+        max_connections_per_second:
+          type: integer
+          minimum: 1
+        burst:
+          type: integer
+          minimum: 1
+
+    ClusterNetwork:
+      type: object
+      required: [cluster_id, authorized_cidrs, updated_at]
+      properties:
+        cluster_id:
+          type: string
+          format: uuid
+        authorized_cidrs:
+          type: array
+          items:
+            type: string
+          description: >-
+            Source-IP allowlist (CIDRs) for reaching the cluster's control
+            plane. An empty list means connections are accepted from any source
+            address; authentication still applies. Send at least one CIDR to
+            restrict it. The list restricts the public control-plane endpoint —
+            where the cluster's own workers and the platform are always allowed
+            in addition to it — and, where the platform kubectl proxy is
+            enabled, connections made through it, which are matched against
+            these entries alone — a private cluster reached through the proxy is
+            matched like any other. It has no effect on the private
+            control-plane path itself, which has no public listener.
+        api_server_rate_limit:
+          oneOf:
+            - $ref: '#/components/schemas/APIServerRateLimit'
+            - type: 'null'
+        updated_at:
+          type: string
+          format: date-time
+
+    UpsertClusterNetworkRequest:
+      type: object
+      required: [authorized_cidrs]
+      properties:
+        authorized_cidrs:
+          type: array
+          items:
+            type: string
+          description: >-
+            Source-IP allowlist (CIDRs) for reaching the cluster's control
+            plane. An empty list means connections are accepted from any source
+            address; authentication still applies. Send at least one CIDR to
+            restrict it. The list restricts the public control-plane endpoint —
+            where the cluster's own workers and the platform are always allowed
+            in addition to it — and, where the platform kubectl proxy is
+            enabled, connections made through it, which are matched against
+            these entries alone — a private cluster reached through the proxy is
+            matched like any other. It has no effect on the private
+            control-plane path itself, which has no public listener. Replaces
+            the stored list outright; every entry must be CIDR notation, and a
+            bare address is rejected with 422 authorized_cidrs/invalid_cidr.
+        api_server_rate_limit:
+          oneOf:
+            - $ref: '#/components/schemas/APIServerRateLimit'
+            - type: 'null'
+
+    UpgradeRequest:
+      type: object
+      required: [target_version]
+      properties:
+        target_version:
+          type: string
+          description: >-
+            The target Kubernetes version as MAJOR.MINOR (e.g. "1.37") or full
+            MAJOR.MINOR.PATCH. Bare minors resolve to the latest available
+            patch; a full version is accepted only when its minor is offered by
+            `GET /api/v1/k8s-versions` and its patch is one this platform has
+            resolved (at or below that minor's current `patch`) — otherwise 422
+            `validation_error`. Must also be an incremental step from the
+            cluster's current version: a patch bump on the same minor, or a
+            step to exactly the next minor.
+
+    UpgradeResponse:
+      type: object
+      description: >-
+        The updated cluster plus worker-rollout counters. When worker patching
+        partially fails, additional fields (workers_pending, workers_error) are
+        present.
+      properties:
+        cluster:
+          $ref: '#/components/schemas/Cluster'
+        workers_patched:
+          type: integer
+        workers_skipped:
+          type: integer
+        workers_pending:
+          type: boolean
+        workers_error:
+          type: string
+
+    NodePoolStatus:
+      type: string
+      enum: [provisioning, ready, scaling, deleting, failed]
+
+    NodeTaint:
+      type: object
+      required:
+        - key
+        - effect
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        effect:
+          type: string
+          enum: [NoSchedule, PreferNoSchedule, NoExecute]
+
+    NodePool:
+      type: object
+      required:
+        - id
+        - cluster_id
+        - name
+        - vcpus
+        - memory_gb
+        - disk_gb
+        - min_nodes
+        - max_nodes
+        - desired_nodes
+        - current_nodes
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        cluster_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        vcpus:
+          type: integer
+        memory_gb:
+          type: integer
+        disk_gb:
+          type: integer
+        min_nodes:
+          type: integer
+        max_nodes:
+          type: integer
+        desired_nodes:
+          type: integer
+        min_vcpus:
+          type: integer
+          description: >-
+            Optional per-pool CPU autoscaling budget (total pool vCPUs); max > min ⇒ autoscaling.
+            A non-zero minimum must cover at least one node; set BOTH min_vcpus and
+            min_memory_gb to 0 (with the maxima set) to let the pool scale to zero
+            nodes.
+        max_vcpus:
+          type: integer
+          description: Optional per-pool CPU autoscaling budget (total pool vCPUs); max > min ⇒ autoscaling.
+        min_memory_gb:
+          type: integer
+          description: >-
+            Optional per-pool memory autoscaling budget (total pool GB); max > min ⇒ autoscaling.
+            A non-zero minimum must cover at least one node; set BOTH min_vcpus and
+            min_memory_gb to 0 (with the maxima set) to let the pool scale to zero
+            nodes.
+        max_memory_gb:
+          type: integer
+          description: Optional per-pool memory autoscaling budget (total pool GB); max > min ⇒ autoscaling.
+        node_labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: Labels applied to the pool's nodes at bootstrap.
+        node_taints:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeTaint'
+          description: Taints applied to the pool's nodes at bootstrap (set at create; immutable).
+        drain_timeout_seconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          description: >-
+            How long the platform drains a node in this pool before deleting it
+            anyway. Omitted when the pool has none configured, which means the
+            platform default of 600s applies (and keeps applying if that default
+            changes).
+        scale_down_delay_seconds:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          description: >-
+            How long a node in this pool must stay underutilised before the
+            autoscaler removes it. Omitted when the pool has none configured,
+            which means the platform default of 600s applies (and keeps applying
+            if that default changes). Acts on the scale-down DECISION;
+            drain_timeout_seconds bounds the removal once it is decided. Only
+            autoscaling pools have an autoscaler node group, so on a fixed pool
+            the value is stored and reported but has no effect.
+        scale_down_utilization_percent:
+          type: integer
+          minimum: 10
+          maximum: 90
+          description: >-
+            A node counts as underutilised when its CPU and memory requests are
+            both below this share of allocatable capacity. Omitted when the pool
+            has none configured, which means the platform default of 50 applies.
+        current_nodes:
+          type: integer
+        first_ready_at:
+          type: [string, 'null']
+          format: date-time
+        status:
+          $ref: '#/components/schemas/NodePoolStatus'
+        status_message:
+          type: [string, 'null']
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateNodePoolRequest:
+      type: object
+      required: [name, vcpus, memory_gb, disk_gb]
+      properties:
+        name:
+          type: string
+        vcpus:
+          type: integer
+          minimum: 1
+          maximum: 128
+        memory_gb:
+          type: integer
+          minimum: 1
+          maximum: 512
+        disk_gb:
+          type: integer
+          minimum: 1
+          maximum: 2048
+        min_nodes:
+          type: [integer, 'null']
+          minimum: 0
+        max_nodes:
+          type: [integer, 'null']
+          minimum: 0
+        desired_nodes:
+          type: [integer, 'null']
+          minimum: 0
+        min_vcpus:
+          type: [integer, 'null']
+          minimum: 0
+          description: >-
+            Optional per-pool CPU autoscaling budget (total pool vCPUs); max > min ⇒ autoscaling.
+            A non-zero minimum must cover at least one node; set BOTH min_vcpus and
+            min_memory_gb to 0 (with the maxima set) to let the pool scale to zero
+            nodes.
+        max_vcpus:
+          type: [integer, 'null']
+          minimum: 1
+          description: Optional per-pool CPU autoscaling budget (total pool vCPUs); max > min ⇒ autoscaling.
+        min_memory_gb:
+          type: [integer, 'null']
+          minimum: 0
+          description: >-
+            Optional per-pool memory autoscaling budget (total pool GB); max > min ⇒ autoscaling.
+            A non-zero minimum must cover at least one node; set BOTH min_vcpus and
+            min_memory_gb to 0 (with the maxima set) to let the pool scale to zero
+            nodes.
+        max_memory_gb:
+          type: [integer, 'null']
+          minimum: 1
+          description: Optional per-pool memory autoscaling budget (total pool GB); max > min ⇒ autoscaling.
+        node_labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: >-
+            Labels applied to the pool's nodes at bootstrap. Reserved key
+            prefixes (`aether.cloud/`, `kubernetes.io/`, `k8s.io/`,
+            `node-role.kubernetes.io/`, `node.kubernetes.io/`) are rejected.
+        node_taints:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeTaint'
+          description: >-
+            Taints applied to the pool's nodes at bootstrap (create-only;
+            immutable thereafter). Reserved key prefixes (`aether.cloud/`,
+            `kubernetes.io/`, `k8s.io/`, `node-role.kubernetes.io/`,
+            `node.kubernetes.io/`) are rejected, and a cluster must retain at
+            least one pool with no `NoSchedule`/`NoExecute` taint.
+        drain_timeout_seconds:
+          type: [integer, 'null']
+          minimum: 30
+          maximum: 3600
+          description: >-
+            How long to drain a node in this pool before deleting it anyway.
+            Omit it (or send null) to use the platform default of 600s — the
+            pool then tracks that default rather than being pinned to today's
+            value. 0 is rejected: it means "wait forever" to the underlying
+            machinery, and one pod that refuses to evict would hang the pool's
+            teardown indefinitely.
+        scale_down_delay_seconds:
+          type: [integer, 'null']
+          minimum: 60
+          maximum: 3600
+          description: >-
+            How long a node in this pool must stay underutilised before the
+            autoscaler removes it. Omit it (or send null) to use the platform
+            default of 600s — the pool then tracks that default rather than
+            being pinned to today's value. This acts on the scale-down DECISION,
+            while drain_timeout_seconds bounds the removal once it is decided.
+            Accepted on any pool, but only autoscaling pools have an autoscaler
+            node group, so on a fixed pool it is inert.
+        scale_down_utilization_percent:
+          type: [integer, 'null']
+          minimum: 10
+          maximum: 90
+          description: >-
+            A node counts as underutilised when its CPU and memory requests are
+            both below this share of allocatable capacity. Omit it (or send
+            null) to use the platform default of 50.
+
+    UpdateNodePoolRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        vcpus:
+          type: integer
+          minimum: 1
+          maximum: 128
+        memory_gb:
+          type: integer
+          minimum: 1
+          maximum: 512
+        disk_gb:
+          type: integer
+          minimum: 1
+          maximum: 2048
+        min_nodes:
+          type: integer
+          minimum: 0
+        max_nodes:
+          type: integer
+          minimum: 0
+        desired_nodes:
+          type: integer
+          minimum: 0
+        min_vcpus:
+          type: integer
+          minimum: 0
+          description: >-
+            Optional per-pool CPU autoscaling budget (total pool vCPUs); max > min ⇒ autoscaling.
+            A non-zero minimum must cover at least one node; set BOTH min_vcpus and
+            min_memory_gb to 0 (with the maxima set) to let the pool scale to zero
+            nodes.
+        max_vcpus:
+          type: integer
+          minimum: 1
+          description: Optional per-pool CPU autoscaling budget (total pool vCPUs); max > min ⇒ autoscaling.
+        min_memory_gb:
+          type: integer
+          minimum: 0
+          description: >-
+            Optional per-pool memory autoscaling budget (total pool GB); max > min ⇒ autoscaling.
+            A non-zero minimum must cover at least one node; set BOTH min_vcpus and
+            min_memory_gb to 0 (with the maxima set) to let the pool scale to zero
+            nodes.
+        max_memory_gb:
+          type: integer
+          minimum: 1
+          description: Optional per-pool memory autoscaling budget (total pool GB); max > min ⇒ autoscaling.
+        drain_timeout_seconds:
+          type: [integer, 'null']
+          minimum: 30
+          maximum: 3600
+          description: >-
+            How long to drain a node in this pool before deleting it anyway.
+            Omitting the field leaves whatever the pool already has, and an
+            explicit null is accepted but treated identically (no change) rather
+            than as a reset — a configured timeout cannot be cleared back to the
+            platform default through this endpoint. 0 is rejected — see
+            CreateNodePoolRequest.
+        scale_down_delay_seconds:
+          type: [integer, 'null']
+          minimum: 60
+          maximum: 3600
+          description: >-
+            How long a node in this pool must stay underutilised before the
+            autoscaler removes it. Omitting the field leaves whatever the pool
+            already has, and an explicit null is accepted but treated identically
+            (no change) rather than as a reset — a configured value cannot be
+            cleared back to the platform default through this endpoint. See
+            CreateNodePoolRequest for the meaning and the accepted range.
+        scale_down_utilization_percent:
+          type: [integer, 'null']
+          minimum: 10
+          maximum: 90
+          description: >-
+            A node counts as underutilised when its CPU and memory requests are
+            both below this share of allocatable capacity. Omitting the field
+            (or sending null) leaves whatever the pool already has; there is no
+            way to clear back to the platform default through this endpoint.
+
+    NodePoolList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodePool'
+        next_cursor:
+          type: [string, 'null']
+
+    Machine:
+      type: object
+      required: [name, status, k8s_version, internal_ip, age_seconds, created_at]
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum: [Ready, Provisioning, NotReady, Deleting]
+        k8s_version:
+          type: string
+        internal_ip:
+          type: string
+        age_seconds:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+
+    MachineList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Machine'
+
+    LoadBalancerList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LoadBalancer'
+
+    LoadBalancer:
+      type: object
+      description: >-
+        A Kubernetes load-balancer Service exported from the tenant cluster.
+        Currently returns an empty list; populated pending tenant-cluster integration.
+      required: [service_name, namespace, ports]
+      properties:
+        service_name:
+          type: string
+          description: The Kubernetes Service name.
+        namespace:
+          type: string
+          description: The Kubernetes namespace containing the Service.
+        external_ip:
+          type: string
+          description: The external IP address assigned by the load balancer (if available).
+        dns_name:
+          type: string
+          description: The DNS name associated with the load balancer (if available).
+        ports:
+          type: array
+          items:
+            type: integer
+          description: List of port numbers the load balancer is listening on.
+
+    Registry:
+      type: object
+      required: [id, org_id, harbor_project, endpoint, enabled, quota_gb, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        org_id:
+          type: string
+        harbor_project:
+          type: string
+        endpoint:
+          type: string
+        enabled:
+          type: boolean
+        quota_gb:
+          type: integer
+        used_gb:
+          type: [number, 'null']
+          format: double
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    RegistryDisabled:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+          enum: [false]
+          description: Always false; indicates no registry is provisioned.
+
+    RegistryCredentials:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          description: The Harbor robot username (e.g. robot$aether+org-<slug>).
+        password:
+          type: string
+          description: The robot secret. Shown only once.
+
+    EnableRegistryResult:
+      type: object
+      required: [registry, credentials]
+      properties:
+        registry:
+          $ref: '#/components/schemas/Registry'
+        credentials:
+          $ref: '#/components/schemas/RegistryCredentials'
+
+    RobotCredentialsResponse:
+      type: object
+      required: [credentials]
+      properties:
+        credentials:
+          $ref: '#/components/schemas/RegistryCredentials'
+
+    ScanResult:
+      type: object
+      description: >-
+        Harbor vulnerability scan result. NOTE: this object is serialized from an
+        internal struct that has no JSON tags, so its keys are Go-default
+        PascalCase (Status, ScannedAt, Summary, Vulnerabilities). The shape below
+        documents the data; treat field casing as backend-defined.
+      additionalProperties: true
+      properties:
+        Status:
+          type: string
+        ScannedAt:
+          type: string
+          format: date-time
+        Summary:
+          type: object
+          properties:
+            Critical:
+              type: integer
+            High:
+              type: integer
+            Medium:
+              type: integer
+            Low:
+              type: integer
+            Unknown:
+              type: integer
+        Vulnerabilities:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    RunPolicyResult:
+      type: object
+      required: [deleted_count, freed_bytes]
+      properties:
+        deleted_count:
+          type: integer
+        freed_bytes:
+          type: integer
+          format: int64
+        errors:
+          type: array
+          items:
+            type: [string, 'null']
+
+    Repository:
+      type: object
+      required: [name, tags_count, size_bytes]
+      properties:
+        name:
+          type: string
+        tags_count:
+          type: integer
+        size_bytes:
+          type: integer
+          format: int64
+        last_push:
+          type: [string, 'null']
+          format: date-time
+        vulnerabilities:
+          oneOf:
+            - $ref: '#/components/schemas/VulnSummary'
+            - type: 'null'
+
+    RepositoryList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Repository'
+
+    Tag:
+      type: object
+      required: [name, digest, size_bytes, pushed_at, pulled_at, untagged]
+      properties:
+        name:
+          type: string
+        digest:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+        pushed_at:
+          type: string
+          format: date-time
+        pulled_at:
+          type: string
+          format: date-time
+        untagged:
+          type: boolean
+
+    TagList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tag'
+
+    VulnSummary:
+      type: object
+      required: [critical, high, medium]
+      properties:
+        critical:
+          type: integer
+        high:
+          type: integer
+        medium:
+          type: integer
+
+    RobotAccount:
+      type: object
+      required: [id, org_id, name, permissions, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        org_id:
+          type: string
+        name:
+          type: string
+        permissions:
+          type: array
+          items:
+            type: string
+        harbor_id:
+          type: [integer, 'null']
+          format: int64
+        last_used_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    RobotAccountWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/RobotAccount'
+        - type: object
+          required: [token]
+          properties:
+            token:
+              type: string
+              description: The one-time robot account secret. Shown only at creation.
+
+    RobotAccountList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RobotAccount'
+
+    CreateRobotAccountRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        permissions:
+          type: array
+          items:
+            type: string
+
+    CleanupCondition:
+      type: object
+      required: [type, op, value]
+      properties:
+        type:
+          type: string
+          description: One of age, tag_count, tag_name, untagged.
+        op:
+          type: string
+          description: One of gt, lt, matches, not_matches, eq.
+        value:
+          description: The condition value (type depends on the condition).
+
+    CleanupPolicy:
+      type: object
+      required: [id, org_id, name, action, conditions, repo_scope, schedule, enabled, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        org_id:
+          type: string
+        name:
+          type: string
+        action:
+          type: string
+          description: delete or protect.
+        conditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/CleanupCondition'
+        repo_scope:
+          type: array
+          items:
+            type: string
+        schedule:
+          type: string
+          description: nightly, weekly, or manual.
+        enabled:
+          type: boolean
+        last_run_at:
+          type: [string, 'null']
+          format: date-time
+        last_run_deleted:
+          type: [integer, 'null']
+        last_run_freed_bytes:
+          type: [integer, 'null']
+          format: int64
+        last_run_message:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CleanupPolicyList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CleanupPolicy'
+
+    CreateCleanupPolicyRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        action:
+          type: string
+        conditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/CleanupCondition'
+        repo_scope:
+          type: array
+          items:
+            type: string
+        schedule:
+          type: string
+        enabled:
+          type: [boolean, 'null']
+
+    DryRunResult:
+      type: object
+      required: [repositories, total_tags, total_bytes]
+      properties:
+        repositories:
+          type: array
+          items:
+            $ref: '#/components/schemas/DryRunRepo'
+        total_tags:
+          type: integer
+        total_bytes:
+          type: integer
+          format: int64
+
+    DryRunRepo:
+      type: object
+      required: [name, tag_count, size_bytes]
+      properties:
+        name:
+          type: string
+        tag_count:
+          type: integer
+        size_bytes:
+          type: integer
+          format: int64
+
+    UsageRecord:
+      type: object
+      required: [id, org_id, resource_type, quantity, unit, recorded_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        cluster_id:
+          type: [string, 'null']
+          format: uuid
+        node_pool_id:
+          type: [string, 'null']
+          format: uuid
+        resource_type:
+          type: string
+        quantity:
+          type: number
+          format: double
+        unit:
+          type: string
+        recorded_at:
+          type: string
+          format: date-time
+
+    SubscriptionLine:
+      type: object
+      required: [kind, name, amount_eur, gross_amount_eur, discount_eur]
+      properties:
+        kind:
+          type: string
+          enum: [node_pool, control_plane, plan, plan_overage, public_ip, loadbalancer]
+          description: >-
+            Which flat monthly charge this line is. `plan` is a package fee and
+            `plan_overage` the resources beyond its allowance (both
+            cluster-scoped, with a null `node_pool_id`); `public_ip` is the
+            mandatory public API endpoint every cluster is required to have —
+            one line per cluster per month at the published `public_ip` rate
+            (€4 at the time of writing), a flat month locked the first time the
+            billing sampler observes the endpoint address, so replacing that
+            address within the month does not add a line; `loadbalancer`, by
+            contrast, is one line per public load-balancer address, so a
+            cluster with several produces several.
+        cluster_id:
+          type: [string, 'null']
+          format: uuid
+        node_pool_id:
+          type: [string, 'null']
+          format: uuid
+        name:
+          type: string
+        amount_eur:
+          type: number
+          format: double
+        # P1 discount columns (billing spec §9.1): amount_eur is the NET;
+        # gross - discount = amount by construction.
+        gross_amount_eur:
+          type: number
+          format: double
+        discount_eur:
+          type: number
+          format: double
+
+    AutoscalingRollupLine:
+      type: object
+      required: [pool_name, resource_type, unit, quantity, unit_price_eur, amount_eur]
+      properties:
+        node_pool_id:
+          type: [string, 'null']
+          format: uuid
+        pool_name:
+          type: string
+        resource_type:
+          type: string
+          enum: [vcpu, memory, disk]
+        unit:
+          type: string
+        quantity:
+          type: number
+          format: double
+        unit_price_eur:
+          type: number
+          format: double
+          description: Server-computed per-resource-hour rate from the rate card.
+        amount_eur:
+          type: number
+          format: double
+          description: Server-computed line cost (quantity × unit_price_eur).
+
+    CostBreakdown:
+      type: object
+      required: [org_id, period_start, period_end, subscriptions, autoscaling, subtotal_eur]
+      properties:
+        org_id:
+          type: string
+          format: uuid
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        subscriptions:
+          type: array
+          description: >-
+            Flat monthly committed fees: fixed pools, control plane, packages and
+            package overage, public API endpoints and load balancers (see
+            SubscriptionLine.kind).
+          items:
+            $ref: '#/components/schemas/SubscriptionLine'
+        autoscaling:
+          type: array
+          description: >-
+            Server-priced autoscaling usage aggregated per node pool and
+            resource type.
+          items:
+            $ref: '#/components/schemas/AutoscalingRollupLine'
+        subtotal_eur:
+          type: number
+          format: double
+          description: >-
+            Reconciled month-to-date total (subscriptions + autoscaling).
+            Reconciles to UsageSummary.total_eur to display precision — equal by
+            linearity of the rate card, but float64 round-then-sum vs
+            sum-then-multiply can differ by a few ULPs. Exact-cents parity lands
+            with invoice generation in Phase 4.
+
+    UsageSummary:
+      type: object
+      required: [org_id, period_start, period_end, items, total_eur, subscriptions]
+      properties:
+        org_id:
+          type: string
+          format: uuid
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        items:
+          type: array
+          description: Autoscaling hourly usage records for the period.
+          items:
+            $ref: '#/components/schemas/UsageRecord'
+        total_eur:
+          type: number
+          format: double
+          description: Combined month-to-date total (subscriptions + autoscaling usage).
+        subscriptions:
+          type: array
+          description: >-
+            Flat monthly committed fees: fixed pools, control plane, packages and
+            package overage, public API endpoints and load balancers (see
+            SubscriptionLine.kind).
+          items:
+            $ref: '#/components/schemas/SubscriptionLine'
+
+    DailySpendPoint:
+      type: object
+      required: [date, amount_eur]
+      properties:
+        date:
+          type: string
+          description: The day in YYYY-MM-DD (UTC).
+        amount_eur:
+          type: number
+          format: double
+
+    DailySpendResponse:
+      type: object
+      required: [points, total_eur, series]
+      properties:
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/DailySpendPoint'
+        total_eur:
+          type: number
+          format: double
+        series:
+          type: string
+          enum: [autoscaling]
+          description: >-
+            Names the source series. Daily-spend is autoscaling-only — flat
+            monthly subscriptions are not a daily quantity and live in
+            /billing/breakdown, whose subtotal is the authoritative bill. This
+            label makes the scope explicit so the total isn't mistaken for the
+            whole bill.
+
+    Budget:
+      type: object
+      required: [org_id, monthly_limit_eur, thresholds_pct, created_at, updated_at]
+      properties:
+        org_id:
+          type: string
+          format: uuid
+        monthly_limit_eur:
+          type: number
+          format: double
+          description: The soft monthly spend limit in euros (> 0).
+        thresholds_pct:
+          type: array
+          items:
+            type: integer
+          description: >-
+            Ascending percentages (each 0 < pct <= 100) of the limit at which a
+            one-time usage.alert fires for the month.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SetBudgetRequest:
+      type: object
+      required: [monthly_limit_eur, thresholds_pct]
+      properties:
+        monthly_limit_eur:
+          type: number
+          format: double
+          description: Must be > 0.
+        thresholds_pct:
+          type: array
+          items:
+            type: integer
+          description: >-
+            Non-empty, strictly ascending, each 0 < pct <= 100.
+
+    Invoice:
+      type: object
+      required: [id, org_id, period_start, period_end, subtotal_cents, tax_cents, total_cents, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        subtotal_cents:
+          type: integer
+          format: int64
+        tax_cents:
+          type: integer
+          format: int64
+        total_cents:
+          type: integer
+          format: int64
+        status:
+          type: string
+        pdf_url:
+          type: [string, 'null']
+        created_at:
+          type: string
+          format: date-time
+
+    InvoiceDetail:
+      description: >-
+        A single invoice with its itemized line items. All Invoice fields are
+        present at the top level; `line_items` is the ordered breakdown
+        (subscription lines first, then autoscaling usage).
+      allOf:
+        - $ref: '#/components/schemas/Invoice'
+        - type: object
+          required: [line_items]
+          properties:
+            line_items:
+              type: array
+              items:
+                $ref: '#/components/schemas/InvoiceLineItem'
+
+    InvoiceLineItem:
+      type: object
+      required: [id, invoice_id, position, description, amount_cents, gross_amount_cents, discount_cents]
+      properties:
+        id:
+          type: string
+          format: uuid
+        invoice_id:
+          type: string
+          format: uuid
+        position:
+          type: integer
+          description: Stable render order within the invoice (0-based).
+        description:
+          type: string
+        resource_type:
+          type: [string, 'null']
+          description: Autoscaling resource (`vcpu`/`memory`/`disk`); null on subscription lines.
+        quantity:
+          type: [number, 'null']
+        unit:
+          type: [string, 'null']
+        unit_price_eur:
+          type: [number, 'null']
+        amount_cents:
+          type: integer
+          format: int64
+        # P1 discount columns (billing spec §9.1): amount_cents is the NET,
+        # derived as gross_amount_cents - discount_cents (integer subtraction).
+        gross_amount_cents:
+          type: integer
+          format: int64
+        discount_cents:
+          type: integer
+          format: int64
+
+    InvoiceList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Invoice'
+        next_cursor:
+          type: [string, 'null']
+
+    PaymentMethod:
+      type: object
+      required: [id, org_id, is_default, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        org_id:
+          type: string
+          format: uuid
+        card_brand:
+          type: [string, 'null']
+        card_last4:
+          type: [string, 'null']
+        card_exp_month:
+          type: [integer, 'null']
+        card_exp_year:
+          type: [integer, 'null']
+        is_default:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    PaymentMethodList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PaymentMethod'
+
+    CreatePaymentMethodRequest:
+      type: object
+      required: [stripe_pm_id]
+      properties:
+        stripe_pm_id:
+          type: string
+          description: The Stripe payment method ID to attach.
+        is_default:
+          type: boolean
+
+    SharedStorageQuota:
+      type: object
+      description: >-
+        An organization's shared-storage (CephFS) cap: what is configured, what
+        applies, and what the cluster actually reports. Every optional member is
+        nullable rather than absent — a `0` quota would read as "unlimited", and
+        a `0` observed pair would claim the org has no cap and has written
+        nothing, neither of which can be asserted without a figure.
+      required: [configured_gb, effective_gb, default_gb, observed_quota_bytes, observed_used_bytes]
+      properties:
+        configured_gb:
+          type: [integer, 'null']
+          description: >-
+            The per-org cap in GiB, or `null` when none is set and the platform
+            default applies.
+        effective_gb:
+          type: integer
+          description: The cap in force — `configured_gb` when set, otherwise `default_gb`.
+        default_gb:
+          type: integer
+          description: The platform default cap in GiB.
+        observed_quota_bytes:
+          type: [integer, 'null']
+          format: int64
+          description: >-
+            The quota ceph is currently ENFORCING on the org's CephFS data pool
+            — the configured-vs-observed drift readout. `null` when the
+            management cluster has published no figure or could not be reached.
+        observed_used_bytes:
+          type: [integer, 'null']
+          format: int64
+          description: >-
+            Bytes already written to that pool. `null` under the same conditions
+            as `observed_quota_bytes`.

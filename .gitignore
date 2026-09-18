@@ -1,0 +1,5 @@
+.tmp/
+.worktrees/
+dist/
+*.test
+terraform-provider-aether
