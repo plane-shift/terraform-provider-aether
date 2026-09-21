@@ -203,13 +203,18 @@ func (r *clusterResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	// it "not forward". Order the target against the RESOLVED version the
 	// control plane reports instead. When that is not known, allow the move:
 	// the API's 422 is the judge of a patch it resolved.
+	//
+	// Observed is used here ONLY to allow a move, never to conclude the
+	// cluster is "already there": the API-stored version can be ahead of it
+	// (a rollout in flight or failed), and ModifyPlan cannot see the stored
+	// version. Update decides whether to send the upgrade from a fresh read.
 	if !versions.HasPatch(from) && sameMinor(from, to) {
 		observed := state.ObservedKubernetesVersion
 		if observed.IsNull() || observed.IsUnknown() || observed.ValueString() == "" {
 			return
 		}
 		if versions.SemanticallyEqual(to, observed.ValueString()) {
-			return // pinning the patch it already runs
+			return // allowed; Update checks it against the STORED version
 		}
 		from = observed.ValueString()
 	}
@@ -231,19 +236,6 @@ func sameMinor(a, b string) bool {
 	aMaj, aMin, aErr := versions.Minor(a)
 	bMaj, bMin, bErr := versions.Minor(b)
 	return aErr == nil && bErr == nil && aMaj == bMaj && aMin == bMin
-}
-
-// versionReached reports whether the cluster in state already satisfies the
-// target version: either its configured spelling does ("1.37" -> "1.37.0" is a
-// respelling), or the version the control plane reports does ("1.37" ->
-// "1.37.2" when the platform resolved 1.37 to 1.37.2). Either way there is
-// nothing to upgrade, and posting one would be refused as not incremental.
-func versionReached(target string, state clusterModel) bool {
-	if versions.SemanticallyEqual(target, state.K8sVersion.ValueString()) {
-		return true
-	}
-	o := state.ObservedKubernetesVersion
-	return !o.IsNull() && !o.IsUnknown() && versions.SemanticallyEqual(target, o.ValueString())
 }
 
 // Create creates the cluster and waits for it to reach running (or degraded).
@@ -397,6 +389,18 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 	// accepts it only at its current value) or a guaranteed 422
 	// public_endpoint/immutable; omitting it is the only shape that is right
 	// in both cases. k8s_version has its own endpoint, below.
+	// Read the cluster FIRST: whether an upgrade is needed is decided by the
+	// version the API has STORED, which can be ahead of both the spelling in
+	// state and observed_kubernetes_version (a rollout in flight, or one
+	// that failed). Deciding from either of those can skip an upgrade the
+	// target does not satisfy, and flatten then overwrites the planned value
+	// with the stored one - "Provider produced inconsistent result after
+	// apply". This read is also the whole of an update that sends nothing.
+	current, err := r.getCluster(ctx, clusterID)
+	if err != nil {
+		apierr.ToDiagnostics(err, &resp.Diagnostics, path.Empty())
+		return
+	}
 	calledAPI := false
 	if !plan.Name.Equal(state.Name) {
 		calledAPI = true
@@ -411,10 +415,15 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 			return
 		}
 	}
-	// 2. k8s_version via the upgrade endpoint (ModifyPlan already refused
-	// backwards moves). Any 2xx is success.
+	// 2. k8s_version via the upgrade endpoint. Skipped ONLY when the target is
+	// semantically equal to the stored version ("1.37" vs stored 1.37.4 is a
+	// respelling). Anything else is sent, including a target BELOW the stored
+	// version that ModifyPlan let through on the observed one: the API
+	// refuses it with 422 "target X is not newer than current Y", which
+	// surfaces on k8s_version and leaves the prior state in place. Any 2xx is
+	// success.
 	upgradeTarget := ""
-	if target := plan.K8sVersion.ValueString(); !versionReached(target, state) {
+	if target := plan.K8sVersion.ValueString(); !versions.SemanticallyEqual(target, current.K8sVersion) {
 		calledAPI = true
 		res, err := r.pd.Client.UpgradeClusterWithResponse(ctx, r.pd.orgID, clusterID,
 			client.UpgradeClusterJSONRequestBody{TargetVersion: target})
@@ -438,15 +447,12 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 	// Nothing was sent (a timeouts-only edit, or a version respelling such as
 	// the first apply after an import): there is nothing to wait FOR, and
 	// waiting would block on a cluster that is upgrading for another reason or
-	// fail on one that was already failed. Read it once and record what the
-	// API reports - NOT the planned state, which carries unknowns for the
-	// observed attributes.
+	// fail on one that was already failed. Record the read taken above - NOT
+	// the planned state, which carries unknowns for the observed attributes.
+	// The planned k8s_version survives flatten: it is semantically equal to
+	// the stored version, or the upgrade would have been sent.
 	if !calledAPI {
-		c, err := r.getCluster(ctx, clusterID)
-		if err != nil {
-			apierr.ToDiagnostics(err, &resp.Diagnostics, path.Empty())
-			return
-		}
+		c := current
 		plan.ID = state.ID
 		r.flatten(c, &plan)
 		// The update itself changed nothing remotely, so it succeeds - but a

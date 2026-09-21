@@ -498,3 +498,36 @@ func TestClusterRoutesAreRecordedAndNeedTheToken(t *testing.T) {
 		t.Fatalf("no token = %d", resp.StatusCode)
 	}
 }
+
+func TestSetStoredVersionAheadLeavesObservedAndStatusAndUpgradeChecksTheStoredVersion(t *testing.T) {
+	s := newClusterFake(t)
+	id := create(t, s, `{"name":"a","region":"r","k8s_version":"1.37"}`)["id"].(string)
+	getCluster(t, s, id) // running: observed 1.37.2
+	s.SetLatestPatch("1.37", 5)
+	s.SetStoredVersionAhead("*", "1.37.4")
+	c := getCluster(t, s, id)
+	if c["k8s_version"] != "1.37.4" || c["observed_kubernetes_version"] != "1.37.2" || c["status"] != "running" {
+		t.Fatalf("cluster = %v, want stored 1.37.4, observed 1.37.2, status running", c)
+	}
+	for _, target := range []string{"1.37.2", "1.37.4"} {
+		resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"`+target+`"}`)
+		e := decode(t, b)["error"].(map[string]any)
+		if resp.StatusCode != 422 || e["code"] != "validation_error" || !strings.Contains(e["message"].(string), "is not newer than current 1.37.4") {
+			t.Fatalf("upgrade to %s = %d %s, want 422 'not newer than current 1.37.4'", target, resp.StatusCode, b)
+		}
+	}
+	if resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.37.5"}`); resp.StatusCode != 202 {
+		t.Fatalf("upgrade to a newer patch = %d %s", resp.StatusCode, b)
+	}
+}
+
+func TestSetStoredVersionAheadCanCoexistWithAFailedStatus(t *testing.T) {
+	s := newClusterFake(t)
+	s.StatusSequence("*", "failed")
+	id := create(t, s, `{"name":"a","region":"r","k8s_version":"1.37"}`)["id"].(string)
+	s.SetStoredVersionAhead(id, "1.37.4")
+	c := getCluster(t, s, id)
+	if c["status"] != "failed" || c["k8s_version"] != "1.37.4" || c["observed_kubernetes_version"] != "1.37.2" {
+		t.Fatalf("cluster = %v", c)
+	}
+}

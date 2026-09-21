@@ -191,6 +191,27 @@ func (s *Server) SetLatestPatch(minor string, patch int) {
 	s.clusters.knobs.patches[minor] = patch
 }
 
+// SetStoredVersionAhead puts the cluster in the state a rollout leaves behind
+// (started from the portal, or ended `failed`): the API-stored k8s_version
+// becomes `stored` while observed_kubernetes_version and status are untouched
+// (status still follows StatusSequence). If observed was never reported it is
+// pinned to the version the cluster stored before, as a running cluster would
+// have reported it. Upgrades are validated against the STORED version.
+func (s *Server) SetStoredVersionAhead(id, stored string) {
+	s.clusters.mu.Lock()
+	defer s.clusters.mu.Unlock()
+	s.clusters.init()
+	for cid, c := range s.clusters.clusters {
+		if id == anyCluster || id == cid {
+			if c.observed == "" {
+				c.observed = c.k8sVersion
+			}
+			c.k8sVersion = stored
+			c.mutations++
+		}
+	}
+}
+
 // SetUpgradeLag shapes the asynchronous rollout after POST …/upgrade, counted
 // in GETs of that cluster: the first `gets` reads still answer the old status
 // and old observed_kubernetes_version (the API's row is unchanged until the
@@ -510,7 +531,7 @@ func (cs *clusterStore) upgrade(w http.ResponseWriter, c *fakeCluster, body []by
 		return
 	}
 	if c.upgrading || cs.statusOf(c, false) != "running" {
-		apiError(w, http.StatusConflict, "not_ready", "cluster must be running to upgrade")
+		apiError(w, http.StatusConflict, "not_ready", "Cluster must be running to upgrade")
 		return
 	}
 	target, err := cs.resolve(req.TargetVersion)
@@ -519,14 +540,26 @@ func (cs *clusterStore) upgrade(w http.ResponseWriter, c *fakeCluster, body []by
 			map[string]any{"field": "target_version", "code": "unavailable"})
 		return
 	}
+	// Mirrors aether-api internal/api/handler/upgrade.go validateUpgradeStep,
+	// which compares the target with the STORED k8s_version (not observed);
+	// codes/messages read from that source: 422 validation_error.
 	fMaj, fMin, fPat, ok1 := splitVersion(c.k8sVersion)
 	tMaj, tMin, tPat, ok2 := splitVersion(target)
-	incremental := ok1 && ok2 && tMaj == fMaj &&
-		((tMin == fMin && tPat > fPat) || tMin == fMin+1)
-	if !incremental {
+	switch {
+	case !ok1 || !ok2:
+		apiError(w, http.StatusUnprocessableEntity, "validation_error", "cannot parse "+c.k8sVersion+" or "+target)
+		return
+	case tMaj != fMaj:
 		apiError(w, http.StatusUnprocessableEntity, "validation_error",
-			fmt.Sprintf("cannot upgrade %s to %s: only a higher patch or exactly the next minor", c.k8sVersion, target),
-			map[string]any{"field": "target_version", "code": "not_incremental"})
+			fmt.Sprintf("cross-major upgrades are not supported (current %d.%d.%d → target %d.%d.%d)", fMaj, fMin, fPat, tMaj, tMin, tPat))
+		return
+	case tMin == fMin && tPat <= fPat, tMin < fMin:
+		apiError(w, http.StatusUnprocessableEntity, "validation_error",
+			fmt.Sprintf("target %d.%d.%d is not newer than current %d.%d.%d", tMaj, tMin, tPat, fMaj, fMin, fPat))
+		return
+	case tMin > fMin+1:
+		apiError(w, http.StatusUnprocessableEntity, "validation_error",
+			fmt.Sprintf("upgrades must be incremental: from %d.%d.%d, next allowed minor is %d.%d (got %d.%d)", fMaj, fMin, fPat, fMaj, fMin+1, tMaj, tMin))
 		return
 	}
 	if c.observed == "" {
