@@ -40,7 +40,7 @@ type fakeCluster struct {
 	publicEndpoint                                bool
 	seq                                           int // creation order, for ClusterIDs()
 	mutations                                     int // bumps updated_at
-	reads                                         int // GETs answered since creation / last upgrade / sequence reset
+	reads                                         int // GETs answered since creation / last StatusSequence call (an upgrade does not reset it)
 	deleting                                      bool
 	deleteGetsLeft                                int
 	upgrading                                     bool // a rollout is in flight (see upgrade())
@@ -92,8 +92,10 @@ func lookup[T any](m map[string]T, id string) (T, bool) {
 
 // StatusSequence makes successive GETs of the cluster walk through statuses in
 // order; the LAST status repeats forever. Reads are counted per cluster, and
-// setting a sequence (or POSTing …/upgrade) restarts the walk for the affected
-// clusters. With no sequence a cluster reads "running". A cluster being torn
+// setting a sequence restarts the walk for the affected clusters. POSTing
+// …/upgrade does NOT restart it: an exhausted sequence stays on its last status,
+// and the post-upgrade statuses (old status, "upgrading", then the sequence's
+// current status with observed caught up) come from SetUpgradeLag. With no sequence a cluster reads "running". A cluster being torn
 // down reads "deleting" whatever the sequence says. The Terraform harness'
 // own refreshes are GETs too and consume the sequence.
 func (s *Server) StatusSequence(id string, statuses ...string) {

@@ -339,6 +339,29 @@ func TestUpgradeRolloutLagsBehindByGetCountAndSetUpgradeLagChangesIt(t *testing.
 	}
 }
 
+// An upgrade does not restart the status sequence: the walk is already
+// exhausted (last status repeats), and the post-upgrade statuses come from the
+// upgrade lag alone. A restart would replay "provisioning" after the upgrade.
+func TestUpgradeDoesNotRestartAnExhaustedStatusSequenceItFollowsTheLagWalk(t *testing.T) {
+	s := newClusterFake(t)
+	s.StatusSequence("*", "provisioning", "running")
+	id := create(t, s, `{"name":"a","region":"r","k8s_version":"1.36"}`)["id"].(string)
+	getCluster(t, s, id) // provisioning
+	getCluster(t, s, id) // running: sequence exhausted
+	if resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.37"}`); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("upgrade = %d %s", resp.StatusCode, b)
+	}
+	var got []string
+	for i := 0; i < 5; i++ {
+		c := getCluster(t, s, id)
+		got = append(got, c["status"].(string)+"/"+c["observed_kubernetes_version"].(string))
+	}
+	want := "running/1.36.4,running/1.36.4,upgrading/1.36.4,running/1.37.2,running/1.37.2"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("reads after upgrade = %v\nwant  %s (lag walk, no sequence restart)", got, want)
+	}
+}
+
 func TestUpgradeRequiresARunningClusterElse409NotReady(t *testing.T) {
 	s := newClusterFake(t)
 	s.StatusSequence("*", "provisioning")
