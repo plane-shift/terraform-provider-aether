@@ -463,6 +463,22 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 		case "degraded":
 			resp.Diagnostics.AddWarning("Cluster is degraded", deref(c.StatusMessage))
 		}
+		// Nor must an upgrade that is still rolling out (started earlier, or
+		// from the portal): this branch deliberately does not wait (a no-op
+		// update never blocks), so say that the control plane may not be at
+		// the stored version yet. A missing observed version counts only
+		// while the status says upgrading; before the first rollout settles
+		// it is simply not reported yet.
+		observed := deref(c.ObservedKubernetesVersion)
+		if c.Status == "upgrading" || (observed != "" && !versions.SemanticallyEqual(c.K8sVersion, observed)) {
+			if observed == "" {
+				observed = "none yet"
+			}
+			resp.Diagnostics.AddWarning("Cluster upgrade still in progress",
+				fmt.Sprintf("The cluster is set to Kubernetes %s but its control plane reports %s (status %q). "+
+					"This apply changed nothing in the platform and did not wait for the rollout, so resources that depend on the cluster may still see the old control plane. "+
+					"Re-run apply once the rollout finishes, or check the cluster's status.", c.K8sVersion, observed, c.Status))
+		}
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
