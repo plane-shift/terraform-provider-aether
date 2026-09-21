@@ -765,3 +765,40 @@ func TestClusterResource_ImportedClusterFirstPlanIsNonEmptyForVersionSpelling(t 
 		},
 	})
 }
+
+// MEASURED (terraform 1.5.7 and OpenTofu 1.12.6): a TAINTED cluster whose
+// configuration asks for an older k8s_version is not refused; it plans a
+// replacement and applies at the older version. This measures `taint` only:
+// `terraform apply -replace` is not measurable in this harness, and nothing
+// here claims either way what it does.
+func TestClusterResource_TaintedClusterWithOlderVersion(t *testing.T) {
+	api := setupFake(t)
+	api.StatusSequence("*", "running")
+	api.DeleteBecomes404After("*", 0)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: clusterCfg("1.37")},
+			{
+				Taint:  []string{clusterResource},
+				Config: clusterCfg("1.36"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction(clusterResource, plancheck.ResourceActionReplace),
+				}},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(clusterResource, "k8s_version", "1.36"),
+					func(*terraform.State) error {
+						if n := len(requestsMatching(api, http.MethodPost, clustersRE)); n != 2 {
+							return fmt.Errorf("want 2 cluster POSTs (original + replacement), got %d", n)
+						}
+						if ups := requestsMatching(api, http.MethodPost, upgradeRE); len(ups) != 0 {
+							return fmt.Errorf("a replacement must create, not upgrade; got %d", len(ups))
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}

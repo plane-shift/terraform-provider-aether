@@ -221,7 +221,7 @@ func (r *clusterResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	if !fwd {
 		resp.Diagnostics.AddAttributeError(path.Root("k8s_version"), "Kubernetes downgrade is not supported",
 			fmt.Sprintf("k8s_version would move backwards from %s to %s. Aether only upgrades clusters in place. To run an older version the cluster must be destroyed and created again: "+
-				"`terraform destroy -target=<this resource address>`, then `terraform apply`. `terraform apply -replace` does not bypass this check, because the replacement is planned against the existing cluster first.", from, to))
+				"`terraform destroy -target=<this resource address>` (or `terraform taint <this resource address>`), then `terraform apply`.", from, to))
 	}
 }
 
@@ -449,6 +449,14 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 		}
 		plan.ID = state.ID
 		r.flatten(c, &plan)
+		// The update itself changed nothing remotely, so it succeeds - but a
+		// cluster in a bad state must not pass silently.
+		switch c.Status {
+		case "failed":
+			resp.Diagnostics.AddWarning("Cluster is failed", deref(c.StatusMessage))
+		case "degraded":
+			resp.Diagnostics.AddWarning("Cluster is degraded", deref(c.StatusMessage))
+		}
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
