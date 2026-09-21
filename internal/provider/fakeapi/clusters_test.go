@@ -79,14 +79,14 @@ func TestClusterCreateAnswers202WithARealUUIDAndProvisioning(t *testing.T) {
 	if _, err := uuid.Parse(c["id"].(string)); err != nil {
 		t.Fatalf("id %v is not a UUID: %v", c["id"], err)
 	}
-	if c["org_id"] != testOrg || c["name"] != "prod" || c["region"] != "eu-fi" || c["k8s_version"] != "1.37" {
+	if c["org_id"] != testOrg || c["name"] != "prod" || c["region"] != "eu-fi" || c["k8s_version"] != "1.37.2" {
 		t.Fatalf("body = %v", c)
 	}
 	if c["status"] != "provisioning" {
 		t.Fatalf("status = %v, want provisioning on the POST", c["status"])
 	}
-	if c["observed_kubernetes_version"] != "1.37.0" {
-		t.Fatalf("observed = %v, want 1.37.0", c["observed_kubernetes_version"])
+	if _, has := c["observed_kubernetes_version"]; has {
+		t.Fatalf("observed_kubernetes_version = %v on create, want absent until the cluster first runs", c["observed_kubernetes_version"])
 	}
 	if c["public_endpoint"] != false {
 		t.Fatalf("public_endpoint = %v, want false when omitted", c["public_endpoint"])
@@ -231,42 +231,163 @@ func TestClusterPutRenamesAndRefusesAChangedPublicEndpoint(t *testing.T) {
 	}
 }
 
-func TestClusterUpgradeAnswers202UpdatesVersionsAndRestartsTheWalk(t *testing.T) {
+func upgradePath(id string) string { return clustersPath + "/" + id + "/upgrade" }
+
+func getCluster(t *testing.T, s *Server, id string) map[string]any {
+	t.Helper()
+	resp, b := call(t, s, http.MethodGet, clustersPath+"/"+id, "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET = %d %s", resp.StatusCode, b)
+	}
+	return decode(t, b)
+}
+
+func TestCreateResolvesABareMinorToTheLatestPatchAndKeepsAnExplicitOne(t *testing.T) {
 	s := newClusterFake(t)
-	s.StatusSequence("*", "running")
-	id := create(t, s, `{"name":"a","region":"r","k8s_version":"1.36"}`)["id"].(string)
-	getStatus(t, s, id)
-	s.StatusSequence("*", "upgrading", "running")
-	getStatus(t, s, id)
-	getStatus(t, s, id)
-	resp, b := call(t, s, http.MethodPost, clustersPath+"/"+id+"/upgrade", `{"target_version":"1.37"}`)
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("upgrade = %d %s", resp.StatusCode, b)
+	if got := create(t, s, `{"name":"a","region":"r","k8s_version":"1.36"}`)["k8s_version"]; got != "1.36.4" {
+		t.Fatalf("1.36 resolved to %v, want 1.36.4", got)
 	}
-	cl := decode(t, b)["cluster"].(map[string]any)
-	if cl["k8s_version"] != "1.37" || cl["observed_kubernetes_version"] != "1.37.0" {
-		t.Fatalf("cluster = %v", cl)
-	}
-	if got := getStatus(t, s, id); got != "upgrading" {
-		t.Fatalf("first read after the upgrade = %s, want upgrading (walk restarted)", got)
-	}
-	if got := getStatus(t, s, id); got != "running" {
-		t.Fatalf("second read = %s, want running", got)
-	}
-	if resp, _ := call(t, s, http.MethodPost, clustersPath+"/"+id+"/upgrade", `{}`); resp.StatusCode != 422 {
-		t.Fatalf("upgrade without target_version = %d, want 422", resp.StatusCode)
-	}
-	if resp, _ := call(t, s, http.MethodPost, clustersPath+"/"+uuid.NewString()+"/upgrade", `{"target_version":"1.37"}`); resp.StatusCode != 404 {
-		t.Fatalf("upgrade unknown = %d, want 404", resp.StatusCode)
+	if got := create(t, s, `{"name":"a","region":"r","k8s_version":"1.37.1"}`)["k8s_version"]; got != "1.37.1" {
+		t.Fatalf("explicit patch = %v, want it kept", got)
 	}
 }
 
-func TestClusterUpgradeKeepsAnExplicitPatchAsObserved(t *testing.T) {
+func TestSetLatestPatchChangesResolutionAndTheExplicitCeiling(t *testing.T) {
 	s := newClusterFake(t)
+	s.SetLatestPatch("1.37", 5)
+	if got := create(t, s, `{"name":"a","region":"r","k8s_version":"1.37"}`)["k8s_version"]; got != "1.37.5" {
+		t.Fatalf("resolved to %v, want 1.37.5", got)
+	}
+	if got := create(t, s, `{"name":"a","region":"r","k8s_version":"1.37.5"}`)["k8s_version"]; got != "1.37.5" {
+		t.Fatalf("explicit 1.37.5 = %v", got)
+	}
+	resp, _ := call(t, s, http.MethodPost, clustersPath, `{"name":"a","region":"r","k8s_version":"1.37.6"}`)
+	if resp.StatusCode != 422 {
+		t.Fatalf("patch above the latest = %d, want 422", resp.StatusCode)
+	}
+	resp, _ = call(t, s, http.MethodPost, clustersPath, `{"name":"a","region":"r","k8s_version":"1.99"}`)
+	if resp.StatusCode != 422 {
+		t.Fatalf("unknown minor = %d, want 422", resp.StatusCode)
+	}
+}
+
+func TestObservedVersionIsAbsentUntilTheClusterFirstReadsRunning(t *testing.T) {
+	s := newClusterFake(t)
+	s.StatusSequence("*", "provisioning", "running")
+	id := create(t, s, `{"name":"a","region":"r","k8s_version":"1.37"}`)["id"].(string)
+	if c := getCluster(t, s, id); c["status"] != "provisioning" || c["observed_kubernetes_version"] != nil {
+		t.Fatalf("provisioning read = %v", c)
+	}
+	if c := getCluster(t, s, id); c["status"] != "running" || c["observed_kubernetes_version"] != "1.37.2" {
+		t.Fatalf("running read = %v, want observed = the stored resolved version", c)
+	}
+}
+
+// upgradeCluster creates a running 1.36.4 cluster (observed reported).
+func upgradeCluster(t *testing.T, s *Server) string {
+	t.Helper()
 	id := create(t, s, `{"name":"a","region":"r","k8s_version":"1.36"}`)["id"].(string)
-	_, b := call(t, s, http.MethodPost, clustersPath+"/"+id+"/upgrade", `{"target_version":"1.37.2"}`)
-	if got := decode(t, b)["cluster"].(map[string]any)["observed_kubernetes_version"]; got != "1.37.2" {
-		t.Fatalf("observed = %v, want 1.37.2", got)
+	if c := getCluster(t, s, id); c["observed_kubernetes_version"] != "1.36.4" {
+		t.Fatalf("setup: %v", c)
+	}
+	return id
+}
+
+func TestUpgradeAnswers202WithTheResolvedTargetWhileStillRunningAndOldObserved(t *testing.T) {
+	s := newClusterFake(t)
+	id := upgradeCluster(t, s)
+	resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.37"}`)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("upgrade = %d %s", resp.StatusCode, b)
+	}
+	body := decode(t, b)
+	cl := body["cluster"].(map[string]any)
+	if cl["k8s_version"] != "1.37.2" || cl["status"] != "running" || cl["observed_kubernetes_version"] != "1.36.4" {
+		t.Fatalf("cluster = %v, want resolved target, status still running, observed still old", cl)
+	}
+	if _, ok := body["workers_patched"]; !ok {
+		t.Fatalf("UpgradeResponse counters missing: %s", b)
+	}
+}
+
+func TestUpgradeRolloutLagsBehindByGetCountAndSetUpgradeLagChangesIt(t *testing.T) {
+	s := newClusterFake(t)
+	id := upgradeCluster(t, s)
+	call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.37"}`)
+	var got []string
+	for i := 0; i < 5; i++ {
+		c := getCluster(t, s, id)
+		got = append(got, c["status"].(string)+"/"+c["observed_kubernetes_version"].(string))
+	}
+	want := "running/1.36.4,running/1.36.4,upgrading/1.36.4,running/1.37.2,running/1.37.2"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("reads = %v\nwant  %s", got, want)
+	}
+
+	s.SetUpgradeLag(0, 2)
+	call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.37.2"}`) // same version: refused, no rollout
+	id2 := upgradeCluster(t, s)
+	call(t, s, http.MethodPost, upgradePath(id2), `{"target_version":"1.37"}`)
+	got = nil
+	for i := 0; i < 4; i++ {
+		c := getCluster(t, s, id2)
+		got = append(got, c["status"].(string)+"/"+c["observed_kubernetes_version"].(string))
+	}
+	want = "upgrading/1.36.4,upgrading/1.36.4,running/1.37.2,running/1.37.2"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("with lag (0,2) reads = %v\nwant  %s", got, want)
+	}
+}
+
+func TestUpgradeRequiresARunningClusterElse409NotReady(t *testing.T) {
+	s := newClusterFake(t)
+	s.StatusSequence("*", "provisioning")
+	id := create(t, s, `{"name":"a","region":"r","k8s_version":"1.36"}`)["id"].(string)
+	resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.37"}`)
+	if resp.StatusCode != 409 || decode(t, b)["error"].(map[string]any)["code"] != "not_ready" {
+		t.Fatalf("upgrade of a provisioning cluster = %d %s, want 409 not_ready", resp.StatusCode, b)
+	}
+	// and while a rollout is in flight
+	s2 := newClusterFake(t)
+	id2 := upgradeCluster(t, s2)
+	call(t, s2, http.MethodPost, upgradePath(id2), `{"target_version":"1.37"}`)
+	resp, b = call(t, s2, http.MethodPost, upgradePath(id2), `{"target_version":"1.37"}`)
+	if resp.StatusCode != 409 {
+		t.Fatalf("second upgrade mid-rollout = %d %s, want 409", resp.StatusCode, b)
+	}
+}
+
+func TestUpgradeMustBeIncremental(t *testing.T) {
+	s := newClusterFake(t)
+	s.SetLatestPatch("1.37", 5)
+	id := create(t, s, `{"name":"a","region":"r","k8s_version":"1.35.3"}`)["id"].(string)
+	getCluster(t, s, id)
+	for _, target := range []string{"1.37", "1.35.3", "1.35.2", "1.34.0"} {
+		resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"`+target+`"}`)
+		if resp.StatusCode != 422 {
+			t.Fatalf("upgrade 1.35.3 -> %s = %d %s, want 422", target, resp.StatusCode, b)
+		}
+	}
+	// a higher patch on the same minor is legal, and so is exactly the next minor afterwards
+	if resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.35.5"}`); resp.StatusCode != 202 {
+		t.Fatalf("patch bump = %d %s", resp.StatusCode, b)
+	}
+	for i := 0; i < 4; i++ {
+		getCluster(t, s, id)
+	}
+	if resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.36"}`); resp.StatusCode != 202 {
+		t.Fatalf("next minor = %d %s", resp.StatusCode, b)
+	}
+}
+
+func TestUpgradeValidationAnd404(t *testing.T) {
+	s := newClusterFake(t)
+	id := upgradeCluster(t, s)
+	if resp, _ := call(t, s, http.MethodPost, upgradePath(id), `{}`); resp.StatusCode != 422 {
+		t.Fatalf("upgrade without target_version = %d, want 422", resp.StatusCode)
+	}
+	if resp, _ := call(t, s, http.MethodPost, upgradePath(uuid.NewString()), `{"target_version":"1.37"}`); resp.StatusCode != 404 {
+		t.Fatalf("upgrade unknown = %d, want 404", resp.StatusCode)
 	}
 }
 
@@ -314,6 +435,9 @@ func TestGetFailsAfterDeleteAnswersTheCodeAndCanBeCleared(t *testing.T) {
 	resp, b := call(t, s, http.MethodGet, clustersPath+"/"+id, "")
 	if resp.StatusCode != 403 || decode(t, b)["error"].(map[string]any)["message"] != "token revoked mid-delete" {
 		t.Fatalf("GET = %d %s", resp.StatusCode, b)
+	}
+	if code := decode(t, b)["error"].(map[string]any)["code"]; code != "forbidden" {
+		t.Fatalf("error code = %v, want the API's snake_case code \"forbidden\"", code)
 	}
 	s.GetFailsAfterDelete("*", 0, "")
 	if resp, _ := call(t, s, http.MethodGet, clustersPath+"/"+id, ""); resp.StatusCode != 404 {

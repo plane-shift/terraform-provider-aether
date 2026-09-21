@@ -108,12 +108,13 @@ func TestClusterResource_CreateWaitsForRunningAndTolerates137vs1370(t *testing.T
 			Check: resource.ComposeTestCheckFunc(
 				resource.TestCheckResourceAttr(clusterResource, "status", "running"),
 				resource.TestCheckResourceAttr(clusterResource, "k8s_version", "1.37"),
-				resource.TestCheckResourceAttr(clusterResource, "observed_kubernetes_version", "1.37.0"),
+				// the API stored the RESOLVED patch and reports it once running
+				resource.TestCheckResourceAttr(clusterResource, "observed_kubernetes_version", "1.37.2"),
 				resource.TestCheckResourceAttr(clusterResource, "public_endpoint", "false"),
 				resource.TestCheckResourceAttrSet(clusterResource, "id"),
 			),
 		}, {
-			// second plan must be empty: 1.37 vs API's 1.37.0 is not drift
+			// second plan must be empty: configured 1.37 vs the API's resolved 1.37.2 is not drift
 			Config: clusterCfg("1.37"), PlanOnly: true, ExpectNonEmptyPlan: false,
 		}},
 	})
@@ -154,8 +155,8 @@ func TestClusterResource_UpgradeGoesThroughUpgradeEndpoint(t *testing.T) {
 						return nil
 					},
 					resource.TestCheckResourceAttr(clusterResource, "k8s_version", "1.37"),
-					// The API moved the observed version with the upgrade; state must follow.
-					resource.TestCheckResourceAttr(clusterResource, "observed_kubernetes_version", "1.37.0"),
+					// The API rolled the control plane to the resolved patch; state must follow.
+					resource.TestCheckResourceAttr(clusterResource, "observed_kubernetes_version", "1.37.2"),
 					resource.TestCheckResourceAttr(clusterResource, "status", "running"),
 				),
 			},
@@ -263,7 +264,9 @@ func TestClusterResource_ImportByID(t *testing.T) {
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{
 			{Config: clusterCfg("1.37")},
-			{ResourceName: clusterResource, ImportState: true, ImportStateVerify: true, ImportStateVerifyIgnore: []string{"timeouts"}},
+			{ResourceName: clusterResource, ImportState: true, ImportStateVerify: true, // k8s_version: state keeps the configured spelling ("1.37"), the import
+				// reads the API's resolved "1.37.2"; TestClusterResource_ImportedClusterFirstPlan... pins that.
+				ImportStateVerifyIgnore: []string{"timeouts", "k8s_version"}},
 		},
 	})
 }
@@ -531,35 +534,234 @@ func TestClusterResource_DeleteSurfacesAForbiddenProbePromptly(t *testing.T) {
 // A replacement builds a brand-new cluster, so it may run an OLDER version than
 // the one it replaces. ModifyPlan must refuse backwards moves only when the
 // same plan updates the cluster in place (DowngradeIsRefusedAtPlan is the
-// control for that).
+// control for that). ModifyPlan hand-duplicates the list of replace-forcing
+// attributes, so every one of them is exercised here.
 func TestClusterResource_OlderVersionIsAllowedWhenTheClusterIsReplaced(t *testing.T) {
+	cases := []struct {
+		name  string
+		cfg   string
+		check resource.TestCheckFunc
+	}{
+		{"region", clusterHCL("prod", "eu-fi2", "1.36"), resource.TestCheckResourceAttr(clusterResource, "region", "eu-fi2")},
+		{"public_endpoint", clusterHCL("prod", "eu-fi", "1.36", "public_endpoint = true"), resource.TestCheckResourceAttr(clusterResource, "public_endpoint", "true")},
+		{"plan", clusterHCL("prod", "eu-fi", "1.36", `plan = "starter"`), resource.TestCheckResourceAttr(clusterResource, "plan", "starter")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := setupFake(t)
+			api.StatusSequence("*", "running")
+			api.DeleteBecomes404After("*", 0)
+			resource.UnitTest(t, resource.TestCase{
+				IsUnitTest:               true,
+				ProtoV6ProviderFactories: factories(),
+				Steps: []resource.TestStep{
+					{Config: clusterHCL("prod", "eu-fi", "1.37")},
+					{
+						Config: tc.cfg,
+						ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+							plancheck.ExpectResourceAction(clusterResource, plancheck.ResourceActionReplace),
+						}},
+						Check: resource.ComposeTestCheckFunc(
+							tc.check,
+							resource.TestCheckResourceAttr(clusterResource, "k8s_version", "1.36"),
+							func(*terraform.State) error {
+								if ups := requestsMatching(api, http.MethodPost, upgradeRE); len(ups) != 0 {
+									return fmt.Errorf("a replacement must create, not upgrade; got %d upgrade call(s)", len(ups))
+								}
+								if n := len(requestsMatching(api, http.MethodPost, clustersRE)); n != 2 {
+									return fmt.Errorf("want 2 cluster POSTs (original + replacement), got %d", n)
+								}
+								return nil
+							},
+						),
+					},
+				},
+			})
+		})
+	}
+}
+
+// getsAfterUpgradePOST counts single-cluster GETs recorded after the
+// (first) upgrade POST.
+func getsAfterUpgradePOST(api *fakeapi.Server) int {
+	after, n := false, 0
+	for _, r := range api.Requests() {
+		if r.Method == http.MethodPost && regexp.MustCompile(upgradeRE).MatchString(r.Path) {
+			after = true
+			continue
+		}
+		if after && r.Method == http.MethodGet && regexp.MustCompile(oneClusterRE).MatchString(r.Path) {
+			n++
+		}
+	}
+	return n
+}
+
+// The upgrade POST answers 202 while the row is still `running` with the OLD
+// observed version; status flips to upgrading later and back to running when
+// the rollout is done. An apply that returns on the first `running` probe
+// reports success before the control plane has moved.
+func TestClusterResource_UpgradeWaitsForTheRolloutNotTheFirstRunningProbe(t *testing.T) {
 	api := setupFake(t)
 	api.StatusSequence("*", "running")
-	api.DeleteBecomes404After("*", 0)
+	api.SetUpgradeLag(2, 1) // reads 1-2: old running, read 3: upgrading, read 4: running + new observed
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{
-			{Config: clusterHCL("prod", "eu-fi", "1.37")},
 			{
-				Config: clusterHCL("prod", "eu-fi2", "1.36"),
-				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
-					plancheck.ExpectResourceAction(clusterResource, plancheck.ResourceActionReplace),
-				}},
+				Config: clusterCfg("1.36"),
+				Check:  resource.TestCheckResourceAttr(clusterResource, "observed_kubernetes_version", "1.36.4"),
+			},
+			{
+				Config: clusterCfg("1.37"),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr(clusterResource, "k8s_version", "1.36"),
-					resource.TestCheckResourceAttr(clusterResource, "region", "eu-fi2"),
+					resource.TestCheckResourceAttr(clusterResource, "observed_kubernetes_version", "1.37.2"),
+					resource.TestCheckResourceAttr(clusterResource, "status", "running"),
 					func(*terraform.State) error {
-						if ups := requestsMatching(api, http.MethodPost, upgradeRE); len(ups) != 0 {
-							return fmt.Errorf("a replacement must create, not upgrade; got %d upgrade call(s)", len(ups))
-						}
-						if n := len(requestsMatching(api, http.MethodPost, clustersRE)); n != 2 {
-							return fmt.Errorf("want 2 cluster POSTs (original + replacement), got %d", n)
+						if n := getsAfterUpgradePOST(api); n < 4 {
+							return fmt.Errorf("only %d GET(s) after the upgrade POST; the wait must poll through upgrading to the finished rollout (>= 4)", n)
 						}
 						return nil
 					},
 				),
 			},
+		},
+	})
+}
+
+// "1.37" resolves to 1.37.2 in the API; naming the patch the cluster already
+// runs, or a higher patch of the same minor, is not a downgrade.
+func TestClusterResource_BareMinorToExplicitPatchOfTheSameMinorIsNotADowngrade(t *testing.T) {
+	api := setupFake(t)
+	api.StatusSequence("*", "running")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: clusterCfg("1.37"), Check: resource.TestCheckResourceAttr(clusterResource, "observed_kubernetes_version", "1.37.2")},
+			{
+				// pin what it already runs: must plan and apply (a no-op as far as the API is concerned)
+				Config: clusterCfg("1.37.2"),
+				Check: func(*terraform.State) error {
+					if ups := requestsMatching(api, http.MethodPost, upgradeRE); len(ups) != 0 {
+						return fmt.Errorf("pinning the patch the cluster runs must not upgrade, got %d upgrade call(s)", len(ups))
+					}
+					return nil
+				},
+			},
+			{
+				PreConfig: func() { api.SetLatestPatch("1.37", 5) },
+				Config:    clusterCfg("1.37.5"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(clusterResource, "k8s_version", "1.37.5"),
+					resource.TestCheckResourceAttr(clusterResource, "observed_kubernetes_version", "1.37.5"),
+					func(*terraform.State) error {
+						ups := requestsMatching(api, http.MethodPost, upgradeRE)
+						if len(ups) != 1 {
+							return fmt.Errorf("want exactly one upgrade POST, got %d", len(ups))
+						}
+						if got := bodyOf(t, ups[0])["target_version"]; got != "1.37.5" {
+							return fmt.Errorf("upgrade target_version = %v, want 1.37.5", got)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// Control for the test above: an explicit patch moved to a LOWER patch of the
+// same minor is still a downgrade and is refused at plan.
+func TestClusterResource_LowerPatchOfTheSameMinorIsStillADowngrade(t *testing.T) {
+	api := setupFake(t)
+	api.StatusSequence("*", "running")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: clusterCfg("1.37.2")},
+			{Config: clusterCfg("1.37.1"), ExpectError: regexp.MustCompile(`(?i)downgrade|backwards`)},
+		},
+	})
+	if ups := requestsMatching(api, http.MethodPost, upgradeRE); len(ups) != 0 {
+		t.Fatalf("a refused downgrade must not reach the API, got %d upgrade call(s)", len(ups))
+	}
+}
+
+// An Update that sends nothing (here: only the timeouts attribute changed) has
+// nothing to wait for. It must not block on, or fail with, the cluster's
+// current status — an upgrading or failed cluster included.
+func TestClusterResource_UpdateThatCallsNoAPIDoesNotWait(t *testing.T) {
+	for _, status := range []string{"upgrading", "failed"} {
+		t.Run(status, func(t *testing.T) {
+			api := setupFake(t)
+			api.StatusSequence("*", "running")
+			cfg := func(update string) string {
+				return clusterHCL("prod", "eu-fi", "1.37", fmt.Sprintf(`timeouts = { update = %q }`, update))
+			}
+			resource.UnitTest(t, resource.TestCase{
+				IsUnitTest:               true,
+				ProtoV6ProviderFactories: factories(),
+				Steps: []resource.TestStep{
+					{Config: cfg("5s")},
+					{
+						// The cluster is now upgrading/failed forever; the update timeout is short
+						// so a regression that waits fails in seconds, not in 30 minutes.
+						PreConfig: func() { api.StatusSequence("*", status) },
+						Config:    cfg("6s"),
+						ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+							plancheck.ExpectResourceAction(clusterResource, plancheck.ResourceActionUpdate),
+						}},
+						Check: func(*terraform.State) error {
+							if puts := requestsMatching(api, http.MethodPut, oneClusterRE); len(puts) != 0 {
+								return fmt.Errorf("a timeouts-only change must not PUT, got %d", len(puts))
+							}
+							if ups := requestsMatching(api, http.MethodPost, upgradeRE); len(ups) != 0 {
+								return fmt.Errorf("a timeouts-only change must not upgrade, got %d", len(ups))
+							}
+							return nil
+						},
+					},
+				},
+			})
+		})
+	}
+}
+
+// KNOWN behaviour, documented in the resource docs: the first plan after
+// importing a cluster is NON-empty. Import reads the API's resolved patch
+// ("1.37.2") into state; the configuration says "1.37", and core rejects a
+// planned value that differs from the config for a non-Computed attribute, so
+// the plan is an in-place update of the version spelling (no API call needed).
+func TestClusterResource_ImportedClusterFirstPlanIsNonEmptyForVersionSpelling(t *testing.T) {
+	api := setupFake(t)
+	api.StatusSequence("*", "running")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				// the cluster exists only in the API; nothing in Terraform state yet
+				PreConfig: func() {
+					req, _ := http.NewRequest(http.MethodPost, api.URL()+"/api/v1/organizations/"+testOrg+"/clusters",
+						strings.NewReader(`{"name":"prod","region":"eu-fi","k8s_version":"1.37"}`))
+					req.Header.Set("Authorization", "Bearer "+api.Token())
+					req.Header.Set("Content-Type", "application/json")
+					resp, err := http.DefaultClient.Do(req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_ = resp.Body.Close()
+				},
+				Config:             clusterCfg("1.37"),
+				ResourceName:       clusterResource,
+				ImportState:        true,
+				ImportStatePersist: true,
+				ImportStateIdFunc:  func(*terraform.State) (string, error) { return api.ClusterIDs()[0], nil },
+			},
+			{Config: clusterCfg("1.37"), PlanOnly: true, ExpectNonEmptyPlan: true},
 		},
 	})
 }

@@ -18,9 +18,11 @@ package fakeapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +43,8 @@ type fakeCluster struct {
 	reads                                         int // GETs answered since creation / last upgrade / sequence reset
 	deleting                                      bool
 	deleteGetsLeft                                int
+	upgrading                                     bool // a rollout is in flight (see upgrade())
+	upgradeReads                                  int  // GETs answered since the upgrade POST
 }
 
 type clusterKnobs struct {
@@ -49,6 +53,9 @@ type clusterKnobs struct {
 	deleteAfter    map[string]int
 	getFailAfterDe map[string]getFail
 	nonJSONCreate  bool
+	patches        map[string]int // minor ("1.37") -> latest resolved patch
+	lagGets        int            // GETs after an upgrade POST that still read the old status/observed
+	lagUpgrading   int            // then this many GETs read "upgrading"
 }
 
 type getFail struct {
@@ -70,6 +77,7 @@ func (cs *clusterStore) init() {
 		cs.knobs = clusterKnobs{
 			statuses: map[string][]string{}, messages: map[string]string{},
 			deleteAfter: map[string]int{}, getFailAfterDe: map[string]getFail{},
+			patches: map[string]int{"1.35": 6, "1.36": 4, "1.37": 2}, lagGets: 2, lagUpgrading: 1,
 		}
 	}
 }
@@ -172,6 +180,79 @@ func (s *Server) ClusterIDs() []string {
 	return ids
 }
 
+// SetLatestPatch sets the latest patch the fake has "resolved" for a minor
+// (e.g. "1.37", 5). Bare minors resolve to it at create/upgrade time; an
+// explicit patch above it is refused with 422. Defaults: 1.35->6, 1.36->4,
+// 1.37->2. A minor not in the table is refused with 422 (unsupported).
+func (s *Server) SetLatestPatch(minor string, patch int) {
+	s.clusters.mu.Lock()
+	defer s.clusters.mu.Unlock()
+	s.clusters.init()
+	s.clusters.knobs.patches[minor] = patch
+}
+
+// SetUpgradeLag shapes the asynchronous rollout after POST …/upgrade, counted
+// in GETs of that cluster: the first `gets` reads still answer the old status
+// and old observed_kubernetes_version (the API's row is unchanged until the
+// syncer sees the operator move), the next `upgrading` reads answer status
+// "upgrading", and the read after that answers the sequence's status (normally
+// running) with observed_kubernetes_version = the resolved target. Defaults
+// gets=2, upgrading=1, so the first read that shows the finished upgrade is
+// read number gets+upgrading+1 = 4.
+func (s *Server) SetUpgradeLag(gets, upgrading int) {
+	s.clusters.mu.Lock()
+	defer s.clusters.mu.Unlock()
+	s.clusters.init()
+	s.clusters.knobs.lagGets, s.clusters.knobs.lagUpgrading = gets, upgrading
+}
+
+var codeByStatus = map[int]string{
+	http.StatusBadRequest: "bad_request", http.StatusUnauthorized: "unauthorized", http.StatusForbidden: "forbidden",
+	http.StatusNotFound: "not_found", http.StatusConflict: "conflict", http.StatusUnprocessableEntity: "validation_error",
+	http.StatusTooManyRequests: "rate_limited", http.StatusInternalServerError: "internal", http.StatusServiceUnavailable: "service_unavailable",
+}
+
+func codeFor(status int) string {
+	if c, ok := codeByStatus[status]; ok {
+		return c
+	}
+	return "error"
+}
+
+// resolve mirrors the API: a bare minor becomes MAJOR.MINOR.<latest patch>; an
+// explicit patch must not exceed the minor's latest. Caller holds mu.
+func (cs *clusterStore) resolve(v string) (string, error) {
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 || len(parts) > 3 {
+		return "", fmt.Errorf("%q is not MAJOR.MINOR[.PATCH]", v)
+	}
+	minor := parts[0] + "." + parts[1]
+	latest, ok := cs.knobs.patches[minor]
+	if !ok {
+		return "", fmt.Errorf("Kubernetes %s is not offered", minor)
+	}
+	if len(parts) == 2 {
+		return fmt.Sprintf("%s.%d", minor, latest), nil
+	}
+	n, err := strconv.Atoi(parts[2])
+	if err != nil || n < 0 {
+		return "", fmt.Errorf("%q has no valid patch", v)
+	}
+	if n > latest {
+		return "", fmt.Errorf("patch %d of %s is not resolved yet (latest %d)", n, minor, latest)
+	}
+	return v, nil
+}
+
+// splitVersion returns major, minor, patch of a resolved MAJOR.MINOR.PATCH.
+func splitVersion(v string) (int, int, int, bool) {
+	var a, b, c int
+	if _, err := fmt.Sscanf(v, "%d.%d.%d", &a, &b, &c); err != nil {
+		return 0, 0, 0, false
+	}
+	return a, b, c, true
+}
+
 func apiError(w http.ResponseWriter, code int, errCode, message string, details ...map[string]any) {
 	if details == nil {
 		details = []map[string]any{}
@@ -211,13 +292,6 @@ func (cs *clusterStore) clusterJSON(c *fakeCluster, status string) map[string]an
 		m["endpoint"] = "https://" + short + ".eu-fi.example.test:6443"
 	}
 	return m
-}
-
-func observedFor(requested string) string {
-	if strings.Count(requested, ".") >= 2 {
-		return requested
-	}
-	return requested + ".0"
 }
 
 func (s *Server) orgKnown(id string) bool {
@@ -314,6 +388,29 @@ func (cs *clusterStore) statusOf(c *fakeCluster, advance bool) string {
 	return seq[i]
 }
 
+// readStatus is the status one GET reports, advancing the fake's state: the
+// sequence walk, an in-flight upgrade's lag, and observed_kubernetes_version
+// (unset until the cluster first reads running). Caller holds mu.
+func (cs *clusterStore) readStatus(c *fakeCluster) string {
+	if c.upgrading {
+		c.upgradeReads++
+		switch {
+		case c.upgradeReads <= cs.knobs.lagGets:
+			// still the row as it was before the syncer noticed anything
+		case c.upgradeReads <= cs.knobs.lagGets+cs.knobs.lagUpgrading:
+			return "upgrading"
+		default:
+			c.upgrading = false
+			c.observed = c.k8sVersion
+		}
+	}
+	status := cs.statusOf(c, true)
+	if status == "running" && c.observed == "" {
+		c.observed = c.k8sVersion
+	}
+	return status
+}
+
 func (cs *clusterStore) create(w http.ResponseWriter, org string, body []byte) {
 	var req struct {
 		Name           string  `json:"name"`
@@ -337,10 +434,16 @@ func (cs *clusterStore) create(w http.ResponseWriter, org string, body []byte) {
 		apiError(w, http.StatusUnprocessableEntity, "validation_error", "request validation failed", details...)
 		return
 	}
+	resolved, err := cs.resolve(req.K8sVersion)
+	if err != nil {
+		apiError(w, http.StatusUnprocessableEntity, "validation_error", err.Error(),
+			map[string]any{"field": "k8s_version", "code": "unavailable"})
+		return
+	}
 	cs.next++
 	c := &fakeCluster{
 		id: uuid.NewString(), orgID: org, name: req.Name, region: req.Region,
-		k8sVersion: req.K8sVersion, observed: observedFor(req.K8sVersion), seq: cs.next,
+		k8sVersion: resolved, seq: cs.next,
 	}
 	if req.Plan != nil {
 		c.plan = *req.Plan // "" means custom billing: plan_slug stays absent
@@ -362,7 +465,7 @@ func (cs *clusterStore) create(w http.ResponseWriter, org string, body []byte) {
 func (cs *clusterStore) get(w http.ResponseWriter, c *fakeCluster) {
 	if c.deleting {
 		if f, ok := lookup(cs.knobs.getFailAfterDe, c.id); ok {
-			apiError(w, f.code, http.StatusText(f.code), f.message)
+			apiError(w, f.code, codeFor(f.code), f.message)
 			return
 		}
 		if c.deleteGetsLeft <= 0 {
@@ -372,7 +475,7 @@ func (cs *clusterStore) get(w http.ResponseWriter, c *fakeCluster) {
 		}
 		c.deleteGetsLeft--
 	}
-	writeJSON(w, http.StatusOK, cs.clusterJSON(c, cs.statusOf(c, true)))
+	writeJSON(w, http.StatusOK, cs.clusterJSON(c, cs.readStatus(c)))
 }
 
 func (cs *clusterStore) put(w http.ResponseWriter, c *fakeCluster, body []byte) {
@@ -406,11 +509,36 @@ func (cs *clusterStore) upgrade(w http.ResponseWriter, c *fakeCluster, body []by
 			map[string]any{"field": "target_version", "code": "required"})
 		return
 	}
-	c.k8sVersion = req.TargetVersion
-	c.observed = observedFor(req.TargetVersion)
+	if c.upgrading || cs.statusOf(c, false) != "running" {
+		apiError(w, http.StatusConflict, "not_ready", "cluster must be running to upgrade")
+		return
+	}
+	target, err := cs.resolve(req.TargetVersion)
+	if err != nil {
+		apiError(w, http.StatusUnprocessableEntity, "validation_error", err.Error(),
+			map[string]any{"field": "target_version", "code": "unavailable"})
+		return
+	}
+	fMaj, fMin, fPat, ok1 := splitVersion(c.k8sVersion)
+	tMaj, tMin, tPat, ok2 := splitVersion(target)
+	incremental := ok1 && ok2 && tMaj == fMaj &&
+		((tMin == fMin && tPat > fPat) || tMin == fMin+1)
+	if !incremental {
+		apiError(w, http.StatusUnprocessableEntity, "validation_error",
+			fmt.Sprintf("cannot upgrade %s to %s: only a higher patch or exactly the next minor", c.k8sVersion, target),
+			map[string]any{"field": "target_version", "code": "not_incremental"})
+		return
+	}
+	if c.observed == "" {
+		c.observed = c.k8sVersion // running, so the operator has reported it
+	}
+	// The API answers with the row's k8s_version already the resolved target
+	// while status is STILL running and observed STILL the old version; the
+	// rollout shows up only in later reads (see SetUpgradeLag).
+	c.k8sVersion = target
+	c.upgrading, c.upgradeReads = true, 0
 	c.mutations++
-	c.reads = 0 // the walk restarts: a status sequence can model upgrading -> running
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"cluster": cs.clusterJSON(c, "upgrading"), "workers_patched": 0, "workers_skipped": 0,
+		"cluster": cs.clusterJSON(c, "running"), "workers_patched": 0, "workers_skipped": 0,
 	})
 }

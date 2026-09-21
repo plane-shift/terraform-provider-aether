@@ -107,7 +107,9 @@ func (r *clusterResource) Schema(ctx context.Context, _ resource.SchemaRequest, 
 				MarkdownDescription: "Region id from `data.aether_regions` (e.g. `eu-fi`). Changing it replaces the cluster.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()}},
 			"k8s_version": schema.StringAttribute{Required: true, CustomType: versions.K8sVersionType{},
-				MarkdownDescription: "`MAJOR.MINOR` (resolves to the latest offered patch) or an explicit `MAJOR.MINOR.PATCH` of an offered minor. `1.37` and `1.37.0` are treated as equal. Only forward changes are allowed and go through an upgrade."},
+				MarkdownDescription: "`MAJOR.MINOR` (the platform resolves it to the latest offered patch) or an explicit `MAJOR.MINOR.PATCH` of an offered minor. A bare `1.37` is treated as equal to whichever `1.37.x` the platform resolved it to, so the resolved patch never shows as drift. " +
+					"Changes go through an in-place upgrade, which must move forward and be INCREMENTAL: a higher patch of the same minor, or exactly the next minor. A backwards move is refused at plan; a skipped minor is rejected by the API at apply. " +
+					"After `terraform import`, state holds the resolved `MAJOR.MINOR.PATCH`, so if the configuration says `MAJOR.MINOR` the first plan shows a one-time in-place update of the version spelling; applying it changes nothing in the platform (the provider only re-reads the cluster)."},
 			// Both public_endpoint and plan are IMMUTABLE after create, measured
 			// in the vendored spec: UpdateClusterRequest carries public_endpoint
 			// "accepted only when it equals the cluster's current value ... any
@@ -123,9 +125,20 @@ func (r *clusterResource) Schema(ctx context.Context, _ resource.SchemaRequest, 
 			// and with RequiresReplace it is a REPLACEMENT - correct per the
 			// API, but dropping the attribute is not a no-op, and the
 			// description says so.
+			//
+			// The default stays false (it mirrors the API's schema default;
+			// changing it is an owner decision), but the vendored spec calls a
+			// false cluster an implementation gap with no supported access
+			// path, so the description has to say that plainly.
+			//
+			// region, public_endpoint and plan force replacement: keep them in
+			// step with the replace check in ModifyPlan, which cannot see the
+			// RequiresReplace verdict and lists them by hand.
 			"public_endpoint": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				PlanModifiers:       []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
-				MarkdownDescription: "Expose the API server on a public IP + DNS name (billed per public IP). Defaults to `false`. Immutable: changing it — including removing it from the configuration while it is `true` — replaces the cluster."},
+				PlanModifiers: []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
+				MarkdownDescription: "Expose the API server on a public IPv4 address and DNS name. **Set `true`: it is required for a supported cluster** — the public API endpoint, billed as one public IP per month. " +
+					"`false`, or omitting the attribute, creates a cluster with NO supported access path from outside the platform (no laptop or CI access). " +
+					"Immutable: changing it replaces the cluster. Removing it from the configuration plans the default (`false`), which replaces a cluster created with `true`."},
 			// plan is Optional and NOT Computed: what the configuration says is
 			// what state holds. Measured in aether-api@8e9045a: an omitted plan
 			// is stored NULL and plan_slug is then absent from every response;
@@ -184,6 +197,22 @@ func (r *clusterResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	if versions.SemanticallyEqual(to, from) {
 		return
 	}
+	// A bare-minor spelling in state ("1.37") says nothing about the patch the
+	// cluster runs - the API resolved it to 1.37.<latest> - so "1.37" ->
+	// "1.37.N" cannot be ordered from the spelling alone, and IsForward calls
+	// it "not forward". Order the target against the RESOLVED version the
+	// control plane reports instead. When that is not known, allow the move:
+	// the API's 422 is the judge of a patch it resolved.
+	if !versions.HasPatch(from) && sameMinor(from, to) {
+		observed := state.ObservedKubernetesVersion
+		if observed.IsNull() || observed.IsUnknown() || observed.ValueString() == "" {
+			return
+		}
+		if versions.SemanticallyEqual(to, observed.ValueString()) {
+			return // pinning the patch it already runs
+		}
+		from = observed.ValueString()
+	}
 	fwd, err := versions.IsForward(from, to)
 	if err != nil {
 		resp.Diagnostics.AddAttributeError(path.Root("k8s_version"), "Invalid k8s_version", err.Error())
@@ -191,8 +220,30 @@ func (r *clusterResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	}
 	if !fwd {
 		resp.Diagnostics.AddAttributeError(path.Root("k8s_version"), "Kubernetes downgrade is not supported",
-			fmt.Sprintf("k8s_version would move backwards from %s to %s. Aether only upgrades clusters; recreate the cluster to run an older version.", from, to))
+			fmt.Sprintf("k8s_version would move backwards from %s to %s. Aether only upgrades clusters in place. To run an older version the cluster must be destroyed and created again: "+
+				"`terraform destroy -target=<this resource address>`, then `terraform apply`. `terraform apply -replace` does not bypass this check, because the replacement is planned against the existing cluster first.", from, to))
 	}
+}
+
+// sameMinor reports whether a and b parse to the same MAJOR.MINOR. Either
+// failing to parse is "not the same"; IsForward then reports the parse error.
+func sameMinor(a, b string) bool {
+	aMaj, aMin, aErr := versions.Minor(a)
+	bMaj, bMin, bErr := versions.Minor(b)
+	return aErr == nil && bErr == nil && aMaj == bMaj && aMin == bMin
+}
+
+// versionReached reports whether the cluster in state already satisfies the
+// target version: either its configured spelling does ("1.37" -> "1.37.0" is a
+// respelling), or the version the control plane reports does ("1.37" ->
+// "1.37.2" when the platform resolved 1.37 to 1.37.2). Either way there is
+// nothing to upgrade, and posting one would be refused as not incremental.
+func versionReached(target string, state clusterModel) bool {
+	if versions.SemanticallyEqual(target, state.K8sVersion.ValueString()) {
+		return true
+	}
+	o := state.ObservedKubernetesVersion
+	return !o.IsNull() && !o.IsUnknown() && versions.SemanticallyEqual(target, o.ValueString())
 }
 
 // Create creates the cluster and waits for it to reach running (or degraded).
@@ -259,7 +310,7 @@ func (r *clusterResource) Create(ctx context.Context, req resource.CreateRequest
 		return
 	}
 
-	final, err := r.waitForCluster(ctx, created.Id, createTimeout)
+	final, err := r.waitForCluster(ctx, created.Id, createTimeout, "")
 	if err != nil {
 		resp.Diagnostics.AddError("Cluster did not become running", err.Error())
 		return
@@ -284,31 +335,41 @@ func (r *clusterResource) Read(ctx context.Context, req resource.ReadRequest, re
 		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid cluster id in state", err.Error())
 		return
 	}
-	res, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.orgID, clusterID)
-	if err != nil {
-		resp.Diagnostics.AddError("Cannot read cluster", err.Error())
-		return
-	}
-	if res.StatusCode() == http.StatusNotFound {
+	c, err := r.getCluster(ctx, clusterID)
+	if apierr.IsNotFound(err) {
 		resp.State.RemoveResource(ctx)
 		return
 	}
-	if res.StatusCode() != http.StatusOK {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
+	if err != nil {
+		apierr.ToDiagnostics(err, &resp.Diagnostics, path.Empty())
 		return
 	}
-	if res.JSON200 == nil {
-		resp.Diagnostics.AddError("Aether API answered 200 without a JSON body",
-			fmt.Sprintf("GET %s returned %s with content type %q.",
-				res.HTTPResponse.Request.URL, res.Status(), res.HTTPResponse.Header.Get("Content-Type")))
-		return
-	}
-	r.flatten(res.JSON200, &state)
+	r.flatten(c, &state)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
+// getCluster reads one cluster. A non-200 answer is returned as an
+// *apierr.Error (so apierr.IsNotFound applies), and a 200 whose body is not
+// JSON is an error too: it is not a reading of the cluster.
+func (r *clusterResource) getCluster(ctx context.Context, id client.ClusterID) (*client.Cluster, error) {
+	g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.orgID, id)
+	if err != nil {
+		return nil, err
+	}
+	if g.StatusCode() != http.StatusOK {
+		return nil, apierr.Parse(g.StatusCode(), g.HTTPResponse.Header, g.Body)
+	}
+	if g.JSON200 == nil {
+		return nil, fmt.Errorf("GET %s returned %s with content type %q, not JSON",
+			g.HTTPResponse.Request.URL, g.Status(), g.HTTPResponse.Header.Get("Content-Type"))
+	}
+	return g.JSON200, nil
+}
+
 // Update renames through PUT and upgrades through the upgrade endpoint, then
-// waits for the cluster to return to running (or degraded).
+// waits for the cluster to return to running (or degraded) - after an
+// upgrade, for the control plane to report the new version. An update that
+// sends nothing to the API reads the cluster once instead of waiting.
 func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state clusterModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -336,7 +397,9 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 	// accepts it only at its current value) or a guaranteed 422
 	// public_endpoint/immutable; omitting it is the only shape that is right
 	// in both cases. k8s_version has its own endpoint, below.
+	calledAPI := false
 	if !plan.Name.Equal(state.Name) {
+		calledAPI = true
 		name := plan.Name.ValueString()
 		res, err := r.pd.Client.UpdateClusterWithResponse(ctx, r.pd.orgID, clusterID, client.UpdateClusterJSONRequestBody{Name: &name})
 		if err != nil {
@@ -349,11 +412,12 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 		}
 	}
 	// 2. k8s_version via the upgrade endpoint (ModifyPlan already refused
-	// backwards moves). The response body is not used - the wait below reads
-	// the cluster fresh - so any 2xx is success.
-	if !versions.SemanticallyEqual(plan.K8sVersion.ValueString(), state.K8sVersion.ValueString()) {
+	// backwards moves). Any 2xx is success.
+	upgradeTarget := ""
+	if target := plan.K8sVersion.ValueString(); !versionReached(target, state) {
+		calledAPI = true
 		res, err := r.pd.Client.UpgradeClusterWithResponse(ctx, r.pd.orgID, clusterID,
-			client.UpgradeClusterJSONRequestBody{TargetVersion: plan.K8sVersion.ValueString()})
+			client.UpgradeClusterJSONRequestBody{TargetVersion: target})
 		if err != nil {
 			resp.Diagnostics.AddError("Cannot upgrade cluster", err.Error())
 			return
@@ -362,8 +426,33 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 			apierr.ToDiagnostics(apierr.Parse(code, res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Root("k8s_version"))
 			return
 		}
+		// Wait for the RESOLVED target the API stored (a bare "1.37" becomes
+		// 1.37.<latest>), taken from the typed 202 body. If that body is
+		// unusable the planned version still works as the target: a bare
+		// minor is satisfied by any patch of it.
+		upgradeTarget = target
+		if b := res.JSON202; b != nil && b.Cluster != nil && b.Cluster.K8sVersion != "" {
+			upgradeTarget = b.Cluster.K8sVersion
+		}
 	}
-	final, err := r.waitForCluster(ctx, clusterID, updateTimeout)
+	// Nothing was sent (a timeouts-only edit, or a version respelling such as
+	// the first apply after an import): there is nothing to wait FOR, and
+	// waiting would block on a cluster that is upgrading for another reason or
+	// fail on one that was already failed. Read it once and record what the
+	// API reports - NOT the planned state, which carries unknowns for the
+	// observed attributes.
+	if !calledAPI {
+		c, err := r.getCluster(ctx, clusterID)
+		if err != nil {
+			apierr.ToDiagnostics(err, &resp.Diagnostics, path.Empty())
+			return
+		}
+		plan.ID = state.ID
+		r.flatten(c, &plan)
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		return
+	}
+	final, err := r.waitForCluster(ctx, clusterID, updateTimeout, upgradeTarget)
 	if err != nil {
 		resp.Diagnostics.AddError("Cluster did not return to running", err.Error())
 		return
@@ -443,25 +532,39 @@ type clusterWait struct {
 
 // waitForCluster polls the cluster until running (success), degraded
 // (terminal, with a warning) or failed (an error carrying status_message).
-func (r *clusterResource) waitForCluster(ctx context.Context, id client.ClusterID, timeout time.Duration) (clusterWait, error) {
+//
+// upgradeTarget is the version an upgrade was just requested to ("" for none).
+// The API answers the upgrade POST with the row still `running` and flips it
+// to `upgrading` only later, asynchronously, once the operator starts the
+// rollout (aether-api@8e9045a upgrade.go:126). So `running` alone does not
+// mean the upgrade finished: until observed_kubernetes_version satisfies the
+// target, a `running` reading is reported to the wait as a synthetic,
+// non-terminal status. `failed` and `degraded` keep their meaning throughout.
+func (r *clusterResource) waitForCluster(ctx context.Context, id client.ClusterID, timeout time.Duration, upgradeTarget string) (clusterWait, error) {
 	var last *client.Cluster
 	res, err := wait.ForStatus(ctx, func(ctx context.Context) (string, string, error) {
-		g, err := r.pd.Client.GetClusterWithResponse(ctx, r.pd.orgID, id)
+		// A 200 that is not JSON is an error from getCluster, not an empty
+		// status: an empty status would read "not terminal yet" and poll
+		// until the timeout.
+		c, err := r.getCluster(ctx, id)
 		if err != nil {
 			return "", "", err
 		}
-		if g.StatusCode() != http.StatusOK {
-			return "", "", apierr.Parse(g.StatusCode(), g.HTTPResponse.Header, g.Body)
+		last = c
+		status := string(c.Status)
+		if upgradeTarget != "" && status == "running" {
+			observed := deref(c.ObservedKubernetesVersion)
+			if !versions.SemanticallyEqual(upgradeTarget, observed) {
+				if observed == "" {
+					observed = "none"
+				}
+				// Spelled out, because the wait's timeout error quotes the last
+				// status verbatim.
+				return fmt.Sprintf("running, rollout to %s not yet observed (control plane reports %s)", upgradeTarget, observed),
+					deref(c.StatusMessage), nil
+			}
 		}
-		if g.JSON200 == nil {
-			// A 200 that is not JSON is not a status reading. Returning it as
-			// an empty status would be treated as "not terminal yet" and poll
-			// until the timeout.
-			return "", "", fmt.Errorf("GET %s returned %s with content type %q, not JSON",
-				g.HTTPResponse.Request.URL, g.Status(), g.HTTPResponse.Header.Get("Content-Type"))
-		}
-		last = g.JSON200
-		return string(last.Status), deref(last.StatusMessage), nil
+		return status, deref(c.StatusMessage), nil
 	}, wait.Options{Timeout: timeout, Success: []string{"running"}, Warning: []string{"degraded"}, Failed: []string{"failed"}})
 	if err != nil {
 		return clusterWait{}, err

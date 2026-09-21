@@ -70,6 +70,13 @@ func Minor(v string) (int, int, error) {
 	return p.major, p.minor, err
 }
 
+// HasPatch reports whether v names an explicit patch ("1.37.2", not "1.37").
+// An unparseable v has no patch.
+func HasPatch(v string) bool {
+	p, err := parse(v)
+	return err == nil && p.hasPatch
+}
+
 // SemanticallyEqual reports whether an actual version satisfies a configured
 // one. A configured version without a patch matches ANY patch of that minor;
 // two explicit patches must match exactly.
