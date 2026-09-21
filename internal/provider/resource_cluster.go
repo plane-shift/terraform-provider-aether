@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -280,7 +281,7 @@ func (r *clusterResource) Create(ctx context.Context, req resource.CreateRequest
 	// fall back on. Accepting 200/201 here would take a body the parser never
 	// populated.
 	if res.StatusCode() != http.StatusAccepted {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
+		addAPIError(&resp.Diagnostics, res.StatusCode(), res.HTTPResponse.Header, res.Body, path.Empty())
 		return
 	}
 	// Use the TYPED body and guard it. An id must never come from an
@@ -293,8 +294,7 @@ func (r *clusterResource) Create(ctx context.Context, req resource.CreateRequest
 	created := res.JSON202
 	if created == nil {
 		resp.Diagnostics.AddError("Aether API accepted the cluster but returned no usable body",
-			fmt.Sprintf("POST %s returned %s with content type %q, not JSON. The cluster may exist; check the portal before retrying, since a retry creates a second one.",
-				res.HTTPResponse.Request.URL, res.Status(), res.HTTPResponse.Header.Get("Content-Type")))
+			describeNonJSON(res.HTTPResponse, res.Status())+". The cluster may exist; check the portal before retrying, since a retry creates a second one.")
 		return
 	}
 	plan.ID = types.StringValue(created.Id.String()) // UUID -> canonical text for state
@@ -357,8 +357,7 @@ func (r *clusterResource) getCluster(ctx context.Context, id client.ClusterID) (
 		return nil, apierr.Parse(g.StatusCode(), g.HTTPResponse.Header, g.Body)
 	}
 	if g.JSON200 == nil {
-		return nil, fmt.Errorf("GET %s returned %s with content type %q, not JSON",
-			g.HTTPResponse.Request.URL, g.Status(), g.HTTPResponse.Header.Get("Content-Type"))
+		return nil, errors.New(describeNonJSON(g.HTTPResponse, g.Status()))
 	}
 	return g.JSON200, nil
 }
@@ -416,7 +415,7 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 			return
 		}
 		if res.StatusCode() != http.StatusOK {
-			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
+			addAPIError(&resp.Diagnostics, res.StatusCode(), res.HTTPResponse.Header, res.Body, path.Empty())
 			return
 		}
 	}
@@ -437,7 +436,7 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 			return
 		}
 		if code := res.StatusCode(); code < 200 || code >= 300 {
-			apierr.ToDiagnostics(apierr.Parse(code, res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Root("k8s_version"))
+			addAPIError(&resp.Diagnostics, code, res.HTTPResponse.Header, res.Body, path.Root("k8s_version"))
 			return
 		}
 		// Wait for the RESOLVED target the API stored (a bare "1.37" becomes
@@ -525,7 +524,7 @@ func (r *clusterResource) Delete(ctx context.Context, req resource.DeleteRequest
 	// 200 and 202 are both documented; 404 means it is already gone, which is
 	// what Delete wants - the wait below confirms it on its first probe.
 	if code := res.StatusCode(); code != http.StatusNotFound && (code < 200 || code >= 300) {
-		apierr.ToDiagnostics(apierr.Parse(code, res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
+		addAPIError(&resp.Diagnostics, code, res.HTTPResponse.Header, res.Body, path.Empty())
 		return
 	}
 	err = wait.ForGone(ctx, func(ctx context.Context) (bool, error) {
