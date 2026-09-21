@@ -554,3 +554,47 @@ func TestSetStoredVersionAheadCanCoexistWithAFailedStatus(t *testing.T) {
 		t.Fatalf("cluster = %v", c)
 	}
 }
+
+// N3-3: a target on a LOWER minor is a step the API refuses as "must be
+// incremental", not as "not newer" (that wording is for the same minor).
+func TestUpgradeToALowerMinorAnswersTheIncrementalMessage(t *testing.T) {
+	s := newClusterFake(t)
+	id := upgradeCluster(t, s) // stored 1.36.4, running
+	resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.35"}`)
+	e := decode(t, b)["error"].(map[string]any)
+	if resp.StatusCode != 422 || e["code"] != "validation_error" || !strings.Contains(e["message"].(string), "upgrades must be incremental") {
+		t.Fatalf("upgrade 1.36.4 -> 1.35 = %d %s, want 422 'upgrades must be incremental'", resp.StatusCode, b)
+	}
+	// the same-minor wording is untouched
+	resp, b = call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.36.4"}`)
+	e = decode(t, b)["error"].(map[string]any)
+	if resp.StatusCode != 422 || !strings.Contains(e["message"].(string), "is not newer than current 1.36.4") {
+		t.Fatalf("upgrade 1.36.4 -> 1.36.4 = %d %s, want 'not newer than current'", resp.StatusCode, b)
+	}
+}
+
+// N3-4: a bare MAJOR.MINOR stored version reads as MAJOR.MINOR.0.
+func TestSplitVersionReadsABareMinorAsPatchZero(t *testing.T) {
+	for in, want := range map[string][3]int{"1.37": {1, 37, 0}, "1.37.4": {1, 37, 4}} {
+		a, b, c, ok := splitVersion(in)
+		if !ok || [3]int{a, b, c} != want {
+			t.Fatalf("splitVersion(%q) = %d.%d.%d ok=%v, want %v", in, a, b, c, ok, want)
+		}
+	}
+	for _, bad := range []string{"", "1", "x.y", "1.x"} {
+		if _, _, _, ok := splitVersion(bad); ok {
+			t.Fatalf("splitVersion(%q) reported ok", bad)
+		}
+	}
+}
+
+func TestUpgradeFromABareMinorStoredVersionIsNotACannotParse(t *testing.T) {
+	s := newClusterFake(t)
+	id := create(t, s, `{"name":"a","region":"r","k8s_version":"1.36"}`)["id"].(string)
+	getCluster(t, s, id)
+	s.SetStoredVersionAhead(id, "1.36") // bare minor, as a portal-started rollout might leave it
+	resp, b := call(t, s, http.MethodPost, upgradePath(id), `{"target_version":"1.37"}`)
+	if resp.StatusCode != 202 {
+		t.Fatalf("upgrade from stored 1.36 -> 1.37 = %d %s, want 202", resp.StatusCode, b)
+	}
+}
