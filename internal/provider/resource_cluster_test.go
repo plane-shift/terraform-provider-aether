@@ -527,3 +527,39 @@ func TestClusterResource_DeleteSurfacesAForbiddenProbePromptly(t *testing.T) {
 		},
 	})
 }
+
+// A replacement builds a brand-new cluster, so it may run an OLDER version than
+// the one it replaces. ModifyPlan must refuse backwards moves only when the
+// same plan updates the cluster in place (DowngradeIsRefusedAtPlan is the
+// control for that).
+func TestClusterResource_OlderVersionIsAllowedWhenTheClusterIsReplaced(t *testing.T) {
+	api := setupFake(t)
+	api.StatusSequence("*", "running")
+	api.DeleteBecomes404After("*", 0)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: clusterHCL("prod", "eu-fi", "1.37")},
+			{
+				Config: clusterHCL("prod", "eu-fi2", "1.36"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction(clusterResource, plancheck.ResourceActionReplace),
+				}},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(clusterResource, "k8s_version", "1.36"),
+					resource.TestCheckResourceAttr(clusterResource, "region", "eu-fi2"),
+					func(*terraform.State) error {
+						if ups := requestsMatching(api, http.MethodPost, upgradeRE); len(ups) != 0 {
+							return fmt.Errorf("a replacement must create, not upgrade; got %d upgrade call(s)", len(ups))
+						}
+						if n := len(requestsMatching(api, http.MethodPost, clustersRE)); n != 2 {
+							return fmt.Errorf("want 2 cluster POSTs (original + replacement), got %d", n)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
