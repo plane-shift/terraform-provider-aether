@@ -34,9 +34,6 @@ func createPool(t *testing.T, s *Server, cid, body string) map[string]any {
 func getPoolResp(t *testing.T, s *Server, cid, id string) (*http.Response, map[string]any) {
 	t.Helper()
 	resp, b := call(t, s, http.MethodGet, poolsPath(cid)+"/"+id, "")
-	if resp.StatusCode != http.StatusOK {
-		return resp, decode(t, b)
-	}
 	return resp, decode(t, b)
 }
 

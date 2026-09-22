@@ -32,6 +32,8 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -287,7 +289,7 @@ func inRange(field string, v *int, lo, hi int) []map[string]any {
 	return nil
 }
 
-func itoa(n int) string { b, _ := json.Marshal(n); return string(b) }
+func itoa(n int) string { return strconv.Itoa(n) }
 
 func validateKnobs(drain, delay, util *int) []map[string]any {
 	var d []map[string]any
@@ -346,7 +348,7 @@ func validateBudget(vcpus, mem, minV, maxV, minM, maxM int) []map[string]any {
 
 func hasReserved(key string) bool {
 	for _, p := range reservedPrefixes {
-		if len(key) >= len(p) && key[:len(p)] == p {
+		if strings.HasPrefix(key, p) {
 			return true
 		}
 	}

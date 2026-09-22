@@ -236,6 +236,28 @@ func TestNodePoolResource_APoolThatNeverLeavesDegradedFailsAtTheCreateTimeoutWit
 	})
 }
 
+// M-2 (review round 1): "deleting" mid-create (an out-of-band delete racing
+// the create wait) must fail fast naming the status, never burn the create
+// timeout - waitForPool's Failed list already includes "deleting" (choice 2,
+// ACCEPT in the round-1 review); this pins it with a bounded elapsed time.
+func TestNodePoolResource_APoolThatGoesDeletingMidCreateFailsFastNamingDeleting(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	api.NodePoolStatusSequence("*", "provisioning", "provisioning", "deleting")
+	started := time.Now()
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      poolHCL(cid, "workers", `timeouts = { create = "20s" }`),
+			ExpectError: loose("reached deleting"),
+		}},
+	})
+	if d := time.Since(started); d > 15*time.Second {
+		t.Errorf("a pool that went deleting mid-create took %s to fail, want well under the 20s create timeout (it should fail on the probe that first sees deleting, not by timing out)", d)
+	}
+}
+
 // ---------------------------------------------------------------- 3
 
 func TestNodePoolResource_ScalingAFixedPoolSendsAllThreeCountsAndWaitsForConvergence(t *testing.T) {
@@ -424,6 +446,60 @@ func TestNodePoolResource_AutoscalingNodeCountChangeDoesNotWaitAndCurrentNodesDr
 	})
 }
 
+// M-3 (review round 1): a node-count change AND a budget change in ONE apply
+// must decide "wait or not" from the PLANNED budget, not the (still-fixed)
+// prior: countsChanged is true here, but the pool is autoscaling as of this
+// PUT, so the update must return promptly instead of waiting for
+// current_nodes == desired_nodes (which the platform will never do for an
+// autoscaling pool). A bounded elapsed time is the proof: waiting would run
+// into the 20s update timeout, since current_nodes never moves in the fake
+// for an autoscaling pool.
+func TestNodePoolResource_CombinedNodeCountAndBudgetChangeUsesThePlannedBudgetAndDoesNotWait(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	started := time.Now()
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: poolHCL(cid, "workers", "desired_nodes = 1")},
+			{
+				Config: poolHCL(cid, "workers", "desired_nodes = 3", autoscalingBudget),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction(poolResource, plancheck.ResourceActionUpdate),
+				}},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(poolResource, "desired_nodes", "3"),
+					resource.TestCheckResourceAttr(poolResource, "max_vcpus", "8"),
+					// the platform never scales an autoscaling pool to desired_nodes;
+					// a resource that waited for it would also never see this because
+					// the fake's autoscaling pools never move current_nodes on their own
+					resource.TestCheckResourceAttr(poolResource, "current_nodes", "1"),
+					func(*terraform.State) error {
+						puts := requestsMatching(api, http.MethodPut, onePoolRE)
+						if len(puts) != 1 {
+							return fmt.Errorf("want one PUT, got %d", len(puts))
+						}
+						body := bodyOf(t, puts[0])
+						for k, want := range map[string]float64{
+							"min_nodes": 3, "desired_nodes": 3, "max_nodes": 3,
+							"min_vcpus": 2, "max_vcpus": 8, "min_memory_gb": 4, "max_memory_gb": 16,
+						} {
+							if err := expectNumber(body, k, want); err != nil {
+								return err
+							}
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+	if d := time.Since(started); d > 15*time.Second {
+		t.Errorf("the combined node-count and budget change took %s, want well under the 20s update timeout (it must not wait once the planned budget makes the pool autoscaling)", d)
+	}
+}
+
 // ---------------------------------------------------------------- 5
 
 func TestNodePoolResource_NameSizeLabelsTaintsAndClusterChangesEachReplaceAndNeverPut(t *testing.T) {
@@ -539,7 +615,7 @@ func TestNodePoolResource_DrainTimeoutIsOmittedUntilSetThenPutAndCannotBeRemoved
 				// The API can never clear it (omitted and null both keep the stored
 				// value), so removing it is refused at plan time, never a silent replace.
 				Config:      poolHCL(cid, "workers"),
-				ExpectError: regexp.MustCompile(`(?is)drain_timeout_seconds`),
+				ExpectError: regexp.MustCompile(`(?is)drain_timeout_seconds.*cannot be removed`),
 			},
 		},
 	})
@@ -568,6 +644,87 @@ func TestNodePoolResource_DrainTimeoutOutsideTheApisWindowIsRefusedAtValidation(
 	if posts := requestsMatching(api, http.MethodPost, poolsRE); len(posts) != 0 {
 		t.Fatalf("a value refused at validation must not reach the API, got %d POST(s)", len(posts))
 	}
+}
+
+// I-1 (review round 1): the drain-removal refusal's only documented escape
+// hatch is `-replace`, and that command hits the SAME refusal - Terraform
+// core's first PlanResourceChange call for `-replace` carries the REAL prior
+// state, and an error there returns before the null-prior replan ever runs.
+// Only a TAINTED object is planned with a null prior, so `terraform taint`
+// (or `tofu taint`) is the one remedy that actually works. Both halves are
+// pinned together: the refusal text must name taint (RED against the current
+// `-replace` wording), and tainting must really let the removal through.
+func TestNodePoolResource_DrainTimeoutRemovalRefusalPointsAtTaintAndTaintingWorks(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	withDrain := poolHCL(cid, "workers", "drain_timeout_seconds = 300")
+	withoutDrain := poolHCL(cid, "workers")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: withDrain},
+			{
+				// a plain apply removing the attribute (no taint): refused, and the
+				// message must point the practitioner at the remedy that actually works
+				Config:      withoutDrain,
+				ExpectError: regexp.MustCompile(`(?is)terraform\s+taint|tofu\s+taint`),
+			},
+			{
+				// the documented remedy, applied for real: taint, then remove the
+				// attribute. One DELETE of the old pool, one new POST carrying no
+				// drain_timeout_seconds, and state reads null for it afterwards.
+				Taint:  []string{poolResource},
+				Config: withoutDrain,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckNoResourceAttr(poolResource, "drain_timeout_seconds"),
+					func(*terraform.State) error {
+						if n := len(requestsMatching(api, http.MethodDelete, onePoolRE)); n != 1 {
+							return fmt.Errorf("want one DELETE from tainting the old pool, got %d", n)
+						}
+						posts := requestsMatching(api, http.MethodPost, poolsRE)
+						if len(posts) != 2 {
+							return fmt.Errorf("want the original create plus one new POST from the taint, got %d", len(posts))
+						}
+						return forbidKeys(bodyOf(t, posts[len(posts)-1]), "drain_timeout_seconds")
+					},
+				),
+			},
+		},
+	})
+}
+
+// M-1 (review round 1): the drain refusal's replacement detection was
+// untested. Dropping drain_timeout_seconds together with a REPLACING
+// attribute change (here: a rename) must be a normal replace, never the
+// removal refusal - the new pool never carries the setting either way, so
+// refusing would only block a change that was already going to replace it.
+func TestNodePoolResource_RenameAndDrainRemovalTogetherReplacesWithoutRefusal(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: poolHCL(cid, "workers", "drain_timeout_seconds = 300")},
+			{
+				Config: poolHCL(cid, "workers2"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction(poolResource, plancheck.ResourceActionReplace),
+				}},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckNoResourceAttr(poolResource, "drain_timeout_seconds"),
+					func(*terraform.State) error {
+						body, err := lastBody(t, api, http.MethodPost, poolsRE)
+						if err != nil {
+							return err
+						}
+						return forbidKeys(body, "drain_timeout_seconds")
+					},
+				),
+			},
+		},
+	})
 }
 
 // ---------------------------------------------------------------- 7
@@ -655,6 +812,61 @@ func TestNodePoolResource_ExplicitEmptyLabelsStayEmptyAndPlanEmpty(t *testing.T)
 		Steps: []resource.TestStep{
 			{Config: cfg, Check: resource.TestCheckResourceAttr(poolResource, "node_labels.%", "0")},
 			{Config: cfg, PlanOnly: true, ExpectNonEmptyPlan: false},
+		},
+	})
+}
+
+// M-2 (review round 1): node_labels = {} / node_taints = [] in config against
+// a NULL prior must never replace the pool - mapContentChanged/
+// listContentChanged already treat "both sides zero-length" as no change, but
+// that null-to-empty transition itself was untested. A real ImportState
+// establishes the null prior (a freshly imported pool that never had either
+// attribute set), rather than relying on whatever a plain create happens to
+// leave in state.
+func TestNodePoolResource_EmptyLabelsAndTaintsAgainstAnImportedNullPriorDoNotReplace(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	base := poolHCL(cid, "workers")
+	empty := poolHCL(cid, "workers", `node_labels = {}`, `node_taints = []`)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: base, Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckNoResourceAttr(poolResource, "node_labels.%"),
+				resource.TestCheckNoResourceAttr(poolResource, "node_taints.#"),
+			)},
+			{
+				ResourceName: poolResource, ImportState: true, ImportStateVerify: true,
+				ImportStateIdFunc: func(s *terraform.State) (string, error) {
+					rs := s.RootModule().Resources[poolResource]
+					if rs == nil {
+						return "", fmt.Errorf("%s is not in state", poolResource)
+					}
+					return rs.Primary.Attributes["cluster_id"] + "/" + rs.Primary.ID, nil
+				},
+				ImportStateVerifyIgnore: []string{"timeouts"},
+			},
+			{
+				Config: empty,
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction(poolResource, plancheck.ResourceActionUpdate),
+				}},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(poolResource, "node_labels.%", "0"),
+					resource.TestCheckResourceAttr(poolResource, "node_taints.#", "0"),
+					func(*terraform.State) error {
+						if n := len(requestsMatching(api, http.MethodDelete, onePoolRE)); n != 0 {
+							return fmt.Errorf("the null-to-empty move must never replace the pool, got %d DELETE(s)", n)
+						}
+						if n := len(requestsMatching(api, http.MethodPut, onePoolRE)); n != 0 {
+							return fmt.Errorf("labels/taints are immutable and must never be PUT, got %d PUT(s)", n)
+						}
+						return nil
+					},
+				),
+			},
+			{Config: empty, PlanOnly: true, ExpectNonEmptyPlan: false},
 		},
 	})
 }
