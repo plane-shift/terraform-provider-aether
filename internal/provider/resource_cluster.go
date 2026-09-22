@@ -140,8 +140,8 @@ func (r *clusterResource) Schema(ctx context.Context, _ resource.SchemaRequest, 
 			"public_endpoint": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(true),
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
 				MarkdownDescription: "Expose the API server on a public IPv4 address and DNS name. Defaults to `true` — the public API endpoint, billed as one public IP per month (see the platform's pricing); omitting the attribute therefore creates the endpoint and incurs that charge. " +
-					"`false` creates a cluster with NO supported access path from outside the platform (no laptop or CI access) — kept for a future platform change. " +
-					"Immutable: changing it replaces the cluster. Removing it from the configuration plans the default (`true`), which replaces a cluster created with `false`."},
+					"`false` is still accepted by the API but is not a supported configuration (vendored OpenAPI, tracked internally as I-14): the cluster has NO supported access path from outside the platform (no laptop or CI access). " +
+					"Immutable: changing it replaces the cluster. Removing it from the configuration plans the default (`true`), which replaces a cluster created with `false` — including an imported cluster that reads `false`; set `public_endpoint = false` explicitly to keep it."},
 			// plan is Optional and NOT Computed: what the configuration says is
 			// what state holds. Measured in aether-api@8e9045a: an omitted plan
 			// is stored NULL and plan_slug is then absent from every response;
@@ -619,11 +619,12 @@ func (r *clusterResource) flatten(c *client.Cluster, m *clusterModel) {
 	}
 	// Cluster.public_endpoint is *bool and NOT in the schema's `required`
 	// list (measured in api/openapi.yaml), so it can legitimately be absent.
-	// Absent maps to FALSE rather than null, on purpose: the attribute is
-	// Optional+Computed with Default false, so a null here would contradict a
-	// planned false and produce "Provider produced inconsistent result after
-	// apply". The API's own reading agrees - a cluster with no public endpoint
-	// reads false (the gap it calls I-14), not a third state. Do NOT use
+	// The API always echoes the key in practice (measured), so absent never
+	// happens today. Absent still maps to FALSE here, matching the API's own
+	// reading of a cluster with no public endpoint (the gap it calls I-14)
+	// rather than a third state - but with Default now `true`, an absent key
+	// would contradict a planned `true` and surface as "Provider produced
+	// inconsistent result after apply" rather than silently pass. Do NOT use
 	// types.BoolPointerValue here, for that reason.
 	m.PublicEndpoint = types.BoolValue(c.PublicEndpoint != nil && *c.PublicEndpoint)
 	m.Plan = optString(c.PlanSlug)

@@ -195,7 +195,8 @@ live API's.
 ### 4.1 `aether_cluster`
 
 Configured: `name`, `region` (**replace**), `k8s_version`, `public_endpoint` (default
-`false`), `plan` (optional). Computed: `id`, `status`, `status_message`, `endpoint`,
+`true` — owner ruling 2026-09-22: the platform currently has no supported access path
+without it; may change), `plan` (optional). Computed: `id`, `status`, `status_message`, `endpoint`,
 `observed_kubernetes_version`, `capi_cluster_name`, `keycloak_realm`, `harbor_project`,
 `ceph_pool`, `lb_subnet`, `worker_subnet`, `created_at`, `updated_at`.
 
