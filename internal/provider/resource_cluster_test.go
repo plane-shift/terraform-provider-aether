@@ -110,8 +110,18 @@ func TestClusterResource_CreateWaitsForRunningAndTolerates137vs1370(t *testing.T
 				resource.TestCheckResourceAttr(clusterResource, "k8s_version", "1.37"),
 				// the API stored the RESOLVED patch and reports it once running
 				resource.TestCheckResourceAttr(clusterResource, "observed_kubernetes_version", "1.37.2"),
-				resource.TestCheckResourceAttr(clusterResource, "public_endpoint", "false"),
+				// owner ruling 2026-09-22: omitting public_endpoint now defaults
+				// to true, not false — a cluster created with no access path is
+				// no longer the default outcome.
+				resource.TestCheckResourceAttr(clusterResource, "public_endpoint", "true"),
 				resource.TestCheckResourceAttrSet(clusterResource, "id"),
+				func(*terraform.State) error {
+					posts := requestsMatching(api, http.MethodPost, clustersRE)
+					if len(posts) != 1 || bodyOf(t, posts[0])["public_endpoint"] != true {
+						return fmt.Errorf("create must send public_endpoint=true when the config omits it, got %v", posts)
+					}
+					return nil
+				},
 			),
 		}, {
 			// second plan must be empty: configured 1.37 vs the API's resolved 1.37.2 is not drift
@@ -387,6 +397,46 @@ func TestClusterResource_PublicEndpointChangeReplaces(t *testing.T) {
 	})
 }
 
+// Removing public_endpoint from the configuration plans the default (true,
+// per the owner's 2026-09-22 ruling), not "no change". A cluster whose state
+// holds false is therefore replaced when the attribute is dropped, exactly
+// as it would be if the config had switched it to true explicitly.
+func TestClusterResource_RemovingPublicEndpointFromStateFalsePlansTheDefaultAndReplaces(t *testing.T) {
+	api := setupFake(t)
+	api.StatusSequence("*", "running")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				Config: clusterHCL("prod", "eu-fi", "1.37", "public_endpoint = false"),
+				Check:  resource.TestCheckResourceAttr(clusterResource, "public_endpoint", "false"),
+			},
+			{
+				// public_endpoint dropped entirely: nothing to override, so the
+				// schema default (true) is what gets planned.
+				Config: clusterHCL("prod", "eu-fi", "1.37"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction(clusterResource, plancheck.ResourceActionReplace),
+				}},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(clusterResource, "public_endpoint", "true"),
+					func(*terraform.State) error {
+						posts := requestsMatching(api, http.MethodPost, clustersRE)
+						if len(posts) != 2 || bodyOf(t, posts[1])["public_endpoint"] != true {
+							return fmt.Errorf("the replacement must POST public_endpoint=true, got %v", posts)
+						}
+						if puts := requestsMatching(api, http.MethodPut, oneClusterRE); len(puts) != 0 {
+							return fmt.Errorf("public_endpoint must never be PUT, got %d PUT(s)", len(puts))
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
 // A cluster deleted behind Terraform's back is a re-create, not an error.
 func TestClusterResource_ClusterDeletedOutOfBandIsRecreated(t *testing.T) {
 	api := setupFake(t)
@@ -543,7 +593,10 @@ func TestClusterResource_OlderVersionIsAllowedWhenTheClusterIsReplaced(t *testin
 		check resource.TestCheckFunc
 	}{
 		{"region", clusterHCL("prod", "eu-fi2", "1.36"), resource.TestCheckResourceAttr(clusterResource, "region", "eu-fi2")},
-		{"public_endpoint", clusterHCL("prod", "eu-fi", "1.36", "public_endpoint = true"), resource.TestCheckResourceAttr(clusterResource, "public_endpoint", "true")},
+		// Baseline step 1 omits public_endpoint, so it plans the default —
+		// true since the owner's 2026-09-22 ruling — so this case must move
+		// AWAY from true to still force a replace.
+		{"public_endpoint", clusterHCL("prod", "eu-fi", "1.36", "public_endpoint = false"), resource.TestCheckResourceAttr(clusterResource, "public_endpoint", "false")},
 		{"plan", clusterHCL("prod", "eu-fi", "1.36", `plan = "starter"`), resource.TestCheckResourceAttr(clusterResource, "plan", "starter")},
 	}
 	for _, tc := range cases {
