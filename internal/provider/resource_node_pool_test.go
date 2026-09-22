@@ -470,6 +470,162 @@ func TestNodePoolResource_ImportedMismatchedMinMaxConvergesToDesiredWithoutIncon
 	})
 }
 
+// N-1 (review round 3, adjudicated - fix now): a min/max-ONLY change on a
+// FIXED pool (desired_nodes unchanged) takes the same convergence wait as a
+// real scale (Update's `countsChanged && !autoscaling` guard does not
+// distinguish the two), but nothing is converging - desired_nodes never
+// moved. "autoscaling" here is the schema's actual (budget-only) meaning:
+// max_vcpus > min_vcpus || max_memory_gb > min_memory_gb: node-count bounds
+// never decide it, so a bounds-only edit stays "fixed" and hits the wait
+// regardless of what the new min/max values are; one variant is the whole
+// space, not a special case of it.
+//
+// api.SetNodePoolCurrentNodes forces the pool to read `running` with
+// current_nodes short of desired_nodes and disables the fake's own scaling
+// simulation (existing knob; no new one needed) - reproducing a state that
+// is abnormal in a real deployment (the reconciler would not report
+// `running` while short) but isolates the ONE thing under test: whether
+// Update decides to wait at all, not whether the wait, once started, would
+// eventually converge. The PUT itself puts current back out of sync with
+// desired, which restarts the fake's normal reconciler simulation (still
+// with the DEFAULT scale lag - deliberately not stalled forever - so a
+// buggy wait genuinely converges after a few polls instead of hanging the
+// whole test suite): count the GETs of the pool made AFTER that PUT. The
+// fix (wait only when desired_nodes itself changed) should make it zero;
+// today it is the default lag's several convergence polls.
+//
+// The complementary control - a real desired_nodes change on a fixed pool
+// MUST still wait - is already pinned by
+// TestNodePoolResource_ScalingAFixedPoolSendsAllThreeCountsAndWaitsForConvergence
+// and is not duplicated here.
+func TestNodePoolResource_MinMaxOnlyChangeOnAFixedPoolDoesNotWaitForConvergence(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	started := time.Now()
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				Config: poolHCL(cid, "workers", "min_nodes = 3", "desired_nodes = 3", "max_nodes = 3"),
+				Check: func(*terraform.State) error {
+					// forced AFTER create settles: current_nodes reads short of
+					// desired_nodes on every GET until the next PUT restarts the walk
+					api.SetNodePoolCurrentNodes("*", 2)
+					return nil
+				},
+			},
+			{
+				// desired_nodes is UNCHANGED (3); only the bounds move, and they stay
+				// well inside the fixed shape (no budget in play at all)
+				Config: poolHCL(cid, "workers", "min_nodes = 2", "desired_nodes = 3", "max_nodes = 4"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(poolResource, "min_nodes", "2"),
+					resource.TestCheckResourceAttr(poolResource, "max_nodes", "4"),
+					func(*terraform.State) error {
+						puts := requestsMatching(api, http.MethodPut, onePoolRE)
+						if len(puts) != 1 {
+							return fmt.Errorf("want exactly one PUT, got %d", len(puts))
+						}
+						seen, afterPut := 0, false
+						for _, r := range api.Requests() {
+							if r.Method == http.MethodPut && r.Path == puts[0].Path {
+								afterPut = true
+								continue
+							}
+							if afterPut && r.Method == http.MethodGet && r.Path == puts[0].Path {
+								seen++
+							}
+						}
+						if seen > 1 {
+							return fmt.Errorf("a min/max-only change waited for convergence: %d GET(s) of the pool after the PUT, want at most 1 (the single read-once path)", seen)
+						}
+						return nil
+					},
+					func(*terraform.State) error {
+						if d := time.Since(started); d > 2*time.Second {
+							return fmt.Errorf("a min/max-only change took %s; want well under the 20s update timeout (no convergence wait should run at all)", d)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// M-15 (review round 3, adjudicated - fix now): ModifyPlan's I-2 unknown-set
+// (updated_at, status, status_message, current_nodes) excludes
+// first_ready_at with the reasoning "nothing a node-count PUT does can move
+// it" - wrong: the reconciler latches first_ready_at the first time
+// current_nodes > 0 (contract §6), exactly like status and updated_at,
+// which ARE in the set. A pool imported while still `provisioning`
+// (first_ready_at null) that then reaches `running` for the first time
+// DURING a min/max-only apply hits the identical "Provider produced
+// inconsistent result after apply" failure I-2 exists to prevent, just on
+// first_ready_at instead of updated_at.
+//
+// No new fake knob needed: NodePoolStatusSequence("*","provisioning") set
+// BEFORE the pool is ever read keeps p.everRunning false (so first_ready_at
+// stays absent) through the import and the settle step; PreConfig then
+// flips the sequence to "running" (which restarts the per-pool walk) only
+// for the real trigger step, so first_ready_at latches for the first time
+// on that step's own read - matching "imported while provisioning, then
+// gets a min/max-only change".
+func TestNodePoolResource_ImportedWhileProvisioningThenMinMaxOnlyChangeDoesNotFailOnFirstReadyAt(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	api.NodePoolStatusSequence("*", "provisioning") // before anything ever reads the pool
+	// seeded directly with min_nodes/max_nodes that do NOT equal desired_nodes,
+	// out of band, so this address is never "already managed" for the import
+	poolID := seedJSON(t, api, "/organizations/"+testOrg+"/clusters/"+cid+"/nodepools",
+		`{"name":"workers","vcpus":2,"memory_gb":4,"disk_gb":20,"min_nodes":1,"desired_nodes":2,"max_nodes":5}`)
+	matching := poolHCL(cid, "workers", "min_nodes = 1", "desired_nodes = 2", "max_nodes = 5")
+	omitted := poolHCL(cid, "workers", "desired_nodes = 2")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				ResourceName: poolResource, ImportState: true, ImportStatePersist: true,
+				Config:        matching,
+				ImportStateId: cid + "/" + poolID,
+				ImportStateCheck: func(is []*terraform.InstanceState) error {
+					if len(is) != 1 {
+						return fmt.Errorf("want exactly one imported instance, got %d", len(is))
+					}
+					if v, has := is[0].Attributes["first_ready_at"]; has {
+						return fmt.Errorf("imported first_ready_at = %q, want absent (the pool never reached running)", v)
+					}
+					if got := is[0].Attributes["current_nodes"]; got != "0" {
+						return fmt.Errorf("imported current_nodes = %q, want 0 (still provisioning)", got)
+					}
+					return nil
+				},
+			},
+			{
+				// settles `timeouts` into state (see the I-2 import test above for
+				// why this step is load-bearing, not decorative); still provisioning
+				Config: matching,
+				Check:  resource.TestCheckNoResourceAttr(poolResource, "first_ready_at"),
+			},
+			{
+				// Two-entry sequence, not one: "terraform plan"/"apply" always
+				// refreshes state first (a plain GET), and that refresh must still
+				// see "provisioning" (so the PRIOR the framework diffs against is
+				// genuinely null) - only the read AFTER it, inside Update itself,
+				// may see "running" and latch first_ready_at. A single-entry
+				// "running" sequence here would flip on the refresh itself, before
+				// Update ever runs, which settles first_ready_at into the prior
+				// exactly like the timeouts attribute above and hides the bug
+				// (measured: came back GREEN, matching the earlier I-2 lesson).
+				PreConfig: func() { api.NodePoolStatusSequence("*", "provisioning", "running") },
+				Config:    omitted,
+			},
+		},
+	})
+}
+
 // ---------------------------------------------------------------- 4
 
 const autoscalingBudget = `min_vcpus = 2
