@@ -160,7 +160,7 @@ func (r *nodePoolResource) Schema(ctx context.Context, _ resource.SchemaRequest,
 			// the old one in the same pass with no capacity overlap (measured,
 			// aether-controllers@f2f515d). Replacement is the honest plan.
 			"name": schema.StringAttribute{Required: true,
-				MarkdownDescription: "Pool name (lowercase letters, digits and `-`, at most 40 characters). Changing it REPLACES the pool: the platform would destroy and recreate every node on a rename anyway, so the plan says so. The old pool is deleted before the new one is created, because a pool keeps its name until its deletion completes. Under `lifecycle { create_before_destroy = true }` a same-name replacement (e.g. a `vcpus`/`memory_gb`/`disk_gb` change) fails with the API's 409 \"Node pool already exists\", because the deleting pool still holds its name.",
+				MarkdownDescription: "Pool name (lowercase letters, digits and `-`, at most 40 characters). Changing it REPLACES the pool: the platform would destroy and recreate every node on a rename anyway, so the plan says so. The old pool is deleted before the new one is created, because a pool keeps its name until its deletion completes. Under `lifecycle { create_before_destroy = true }` a same-name replacement (e.g. a `vcpus`/`memory_gb`/`disk_gb` change) fails with the API's 409 \"Node pool already exists\", because the old pool is still LIVE (not yet deleted) and still holds its name when the new one's create runs.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
 				Validators: []validator.String{stringvalidator.LengthBetween(1, 40),
 					stringvalidator.RegexMatches(poolNameRE, "must start and end with a lowercase letter or digit, and contain only lowercase letters, digits and `-` in between")}},
@@ -264,14 +264,18 @@ func (r *nodePoolResource) Configure(_ context.Context, req resource.ConfigureRe
 	r.pd = fromProviderData(req.ProviderData, &resp.Diagnostics)
 }
 
-// ModifyPlan does two things the attribute plan modifiers cannot:
+// ModifyPlan does three things the attribute plan modifiers cannot:
 //
 //  1. min_nodes / max_nodes left null in the configuration are planned EQUAL
 //     to the planned desired_nodes, mirroring the API's create default. They
 //     are Computed, so setting the planned value is legal. It has to happen
 //     here, after the attribute modifiers, because it reads desired_nodes'
 //     FINAL planned value (UseStateForUnknown has already run on it).
-//  2. Removing drain_timeout_seconds after it was set is refused: the API
+//  2. When that rewrite (or an import's stored bounds) leaves min_nodes or
+//     max_nodes different from state, the four attributes an Update's
+//     PUT+re-read can move (updated_at, status, status_message,
+//     current_nodes) are marked unknown in the plan - see the comment below.
+//  3. Removing drain_timeout_seconds after it was set is refused: the API
 //     cannot clear it, so the plan would promise a null the API never
 //     reports. A replacement is never chosen silently instead.
 func (r *nodePoolResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
@@ -295,7 +299,42 @@ func (r *nodePoolResource) ModifyPlan(ctx context.Context, req resource.ModifyPl
 	}
 	var state nodePoolModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
-	if resp.Diagnostics.HasError() || state.DrainTimeoutSeconds.IsNull() || !plan.DrainTimeoutSeconds.IsNull() {
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	// I-2 (review round 2, blocking): the framework only marks null-in-config
+	// Computed attributes unknown when Terraform core's proposed plan (built
+	// BEFORE this method runs) already differs from the prior state
+	// SOMEWHERE in the object (fwserver/server_planresourcechange.go
+	// ~205-252, v1.19.0). Removing min_nodes/max_nodes from config, or
+	// importing a pool whose stored bounds differ from desired_nodes, gives a
+	// proposed plan IDENTICAL to the prior state at that point - Optional+
+	// Computed with null config keeps the prior value - so updated_at,
+	// status, status_message and current_nodes all stay planned at their
+	// prior KNOWN values. The rewrite above then moves min_nodes/max_nodes,
+	// Update sends a PUT, and the real re-read moves those four - "provider
+	// produced inconsistent result after apply" (measured). Whenever the
+	// FINAL planned min/max (after the rewrite) differs from state, defer
+	// those four to the real post-apply read, exactly as a create would.
+	// first_ready_at, id and created_at are excluded: nothing a node-count
+	// PUT does can move them.
+	finalMin, finalMax := plan.MinNodes, plan.MaxNodes
+	if config.MinNodes.IsNull() {
+		finalMin = plan.DesiredNodes
+	}
+	if config.MaxNodes.IsNull() {
+		finalMax = plan.DesiredNodes
+	}
+	if !finalMin.Equal(state.MinNodes) || !finalMax.Equal(state.MaxNodes) {
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("updated_at"), types.StringUnknown())...)
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("status"), types.StringUnknown())...)
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("status_message"), types.StringUnknown())...)
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("current_nodes"), types.Int64Unknown())...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+	if state.DrainTimeoutSeconds.IsNull() || !plan.DrainTimeoutSeconds.IsNull() {
 		return
 	}
 	// A plan that replaces the pool creates a NEW one without the setting,
