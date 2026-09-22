@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -48,6 +49,13 @@ const (
 	poolStatusDegraded = "degraded"
 	poolStatusDeleting = "deleting"
 )
+
+// poolNameRE mirrors the API's name validation (contract §3,
+// internal/model/name.go:97-122 in aether-api@8e9045a): starts and ends
+// with a lowercase letter or digit, `-` allowed only in between. Plan-time
+// only - the length check stays a separate validator, and the API's
+// composed-name 51-character check has no plan-time equivalent.
+var poolNameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
 var (
 	_ resource.Resource                = &nodePoolResource{}
@@ -152,9 +160,10 @@ func (r *nodePoolResource) Schema(ctx context.Context, _ resource.SchemaRequest,
 			// the old one in the same pass with no capacity overlap (measured,
 			// aether-controllers@f2f515d). Replacement is the honest plan.
 			"name": schema.StringAttribute{Required: true,
-				MarkdownDescription: "Pool name (lowercase letters, digits and `-`, at most 40 characters). Changing it REPLACES the pool: the platform would destroy and recreate every node on a rename anyway, so the plan says so. The old pool is deleted before the new one is created, because a pool keeps its name until its deletion completes.",
+				MarkdownDescription: "Pool name (lowercase letters, digits and `-`, at most 40 characters). Changing it REPLACES the pool: the platform would destroy and recreate every node on a rename anyway, so the plan says so. The old pool is deleted before the new one is created, because a pool keeps its name until its deletion completes. Under `lifecycle { create_before_destroy = true }` a same-name replacement (e.g. a `vcpus`/`memory_gb`/`disk_gb` change) fails with the API's 409 \"Node pool already exists\", because the deleting pool still holds its name.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
-				Validators:          []validator.String{stringvalidator.LengthBetween(1, 40)}},
+				Validators: []validator.String{stringvalidator.LengthBetween(1, 40),
+					stringvalidator.RegexMatches(poolNameRE, "must start and end with a lowercase letter or digit, and contain only lowercase letters, digits and `-` in between")}},
 			// The API accepts a size change, but it never reaches a machine: the
 			// machine template is written once at pool creation and never
 			// updated, so existing AND future nodes keep the old size while the
@@ -212,7 +221,7 @@ func (r *nodePoolResource) Schema(ctx context.Context, _ resource.SchemaRequest,
 			// and is never sent. Once set, the API cannot clear it (omitted and
 			// null both keep the stored value), so ModifyPlan refuses a removal.
 			"drain_timeout_seconds": schema.Int64Attribute{Optional: true,
-				MarkdownDescription: "How long a node being removed may take to drain, 30-3600 seconds. Omit it to track the platform default (currently 600). **Once set it cannot be removed**: the API has no way to clear it, so removing it from the configuration is refused at plan time. Set an explicit value instead (e.g. `600`), or recreate the pool.",
+				MarkdownDescription: "How long a node being removed may take to drain, 30-3600 seconds. Omit it to track the platform default (currently 600). **Once set it cannot be removed**: the API has no way to clear it, so removing it from the configuration is refused at plan time. Set an explicit value instead (e.g. `600`), or recreate the pool: taint it (`terraform taint`/`tofu taint`) then apply with the attribute removed - `-replace` and `replace_triggered_by` hit the same refusal and do not work here.",
 				Validators:          []validator.Int64{int64validator.Between(30, 3600)}},
 			"scale_down_delay_seconds": keptKnobInt64("Autoscaling: how long a node must be unneeded before it is removed, 60-3600 seconds. Omit it for the platform default (currently 600). Once set, the API cannot clear it: removing it from the configuration keeps the stored value.",
 				int64validator.Between(60, 3600)),
@@ -301,9 +310,12 @@ func (r *nodePoolResource) ModifyPlan(ctx context.Context, req resource.ModifyPl
 		return
 	}
 	resp.Diagnostics.AddAttributeError(path.Root("drain_timeout_seconds"), "drain_timeout_seconds cannot be removed",
-		fmt.Sprintf("drain_timeout_seconds is set to %d on this pool, and the Aether API has no way to clear it back to the platform default. "+
-			"Keep an explicit value instead (the platform default is 600 seconds), or recreate the pool: "+
-			"`terraform apply -replace=<this resource address>` with the attribute removed.", state.DrainTimeoutSeconds.ValueInt64()))
+		fmt.Sprintf("drain_timeout_seconds is set to %d on this pool, and the Aether API has no way to clear it back to the platform default (currently 600 seconds). "+
+			"Keep an explicit value instead, or recreate the pool: taint it first - `terraform taint <this resource address>` (or `tofu taint <this resource address>`) - "+
+			"then apply with the attribute removed; a tainted object is planned with no prior state, so this refusal does not fire on that apply. "+
+			"`terraform apply -replace=<address>` and `lifecycle { replace_triggered_by = [...] }` do NOT work here: Terraform plans the forced replacement only after a first "+
+			"plan against the real prior state, which hits this same refusal and returns before the replace decision is made (read from Terraform core's source; not exercised by a test here).",
+			state.DrainTimeoutSeconds.ValueInt64()))
 }
 
 // contentDiffers mirrors mapContentChanged/listContentChanged for
@@ -441,7 +453,7 @@ func poolIDsFromState(m *nodePoolModel, diags *diag.Diagnostics) (client.Cluster
 	clusterID, err := parseID(m.ClusterID.ValueString())
 	if err != nil {
 		diags.AddAttributeError(path.Root("cluster_id"), "Invalid cluster_id in state", err.Error())
-		return clusterID, clusterID, false
+		return clusterID, client.PoolID{}, false
 	}
 	poolID, err := parseID(m.ID.ValueString())
 	if err != nil {
@@ -493,6 +505,16 @@ func (r *nodePoolResource) Update(ctx context.Context, req resource.UpdateReques
 	current, err := r.getPool(ctx, clusterID, poolID)
 	if err != nil {
 		apierr.ToDiagnostics(err, &resp.Diagnostics, path.Empty())
+		return
+	}
+	// A PUT on a deleting pool answers 200 but is never applied (measured
+	// contract): the reconciler never syncs a deleting pool's fields, so the
+	// change would silently go nowhere. Refuse here instead of reporting a
+	// success that never happens - this is also what makes the pre-read above
+	// pay for itself on the non-waiting path.
+	if string(current.Status) == poolStatusDeleting {
+		resp.Diagnostics.AddError("Cannot update node pool",
+			fmt.Sprintf("node pool %q is being deleted; the API accepts a PUT on it but never applies it.", state.Name.ValueString()))
 		return
 	}
 
