@@ -297,6 +297,11 @@ func TestPoolPutOnAnAutoscalingPoolIsInertForDesiredAndNeverScales(t *testing.T)
 func TestPoolPutIsAPartialMergeWithNullMeaningKeep(t *testing.T) {
 	s, cid := newPoolFake(t)
 	id := createPool(t, s, cid, `{"name":"a","vcpus":2,"memory_gb":4,"disk_gb":20,"drain_timeout_seconds":120,"scale_down_delay_seconds":300}`)["id"].(string)
+	// M-13 (review round 2): captured on THIS pool before the PUTs, not on a
+	// different, newly created pool - two pools created moments apart can
+	// share a timestamp in the fake's second-granularity clock, which would
+	// make that comparison pass even if updated_at never moved at all.
+	before := getPool(t, s, cid, id)["updated_at"]
 	code, p := putPool(t, s, cid, id, `{"drain_timeout_seconds":null,"scale_down_utilization_percent":50}`)
 	if code != 200 || num(p, "drain_timeout_seconds") != 120 || num(p, "scale_down_delay_seconds") != 300 || num(p, "scale_down_utilization_percent") != 50 || p["name"] != "a" {
 		t.Fatalf("PUT = %d %v: null must keep the stored knob, omitted fields stay", code, p)
@@ -309,8 +314,8 @@ func TestPoolPutIsAPartialMergeWithNullMeaningKeep(t *testing.T) {
 	if code != 200 || num(p, "max_vcpus") != 0 || num(p, "min_memory_gb") != 0 {
 		t.Fatalf("explicit zeros = %d %v, want them written (back to a fixed pool)", code, p)
 	}
-	if updated := getPool(t, s, cid, id)["updated_at"]; updated == createPool(t, s, cid, `{"name":"x","vcpus":2,"memory_gb":4,"disk_gb":20}`)["updated_at"] {
-		t.Fatalf("updated_at did not move with the PUTs")
+	if after := getPool(t, s, cid, id)["updated_at"]; after == before {
+		t.Fatalf("updated_at did not move with the PUTs: before=%v after=%v", before, after)
 	}
 }
 

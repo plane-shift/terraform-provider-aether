@@ -73,12 +73,14 @@ func seedJSON(t *testing.T, api *fakeapi.Server, path, body string) string {
 }
 
 // poolBlock renders one aether_node_pool resource; extra lines go inside the
-// block. Short timeouts are added unless the extras carry their own.
+// block. Short timeouts are added unless the extras carry their own, in
+// which case any PHASE the caller left unmentioned is filled in short too
+// (M-14): a caller overriding only `create`, say, must not silently fall
+// back to the framework's 30m/20m update/delete defaults on the phases it
+// didn't mention - a regression there would hang for 20-30 min instead of
+// failing fast.
 func poolBlock(res, clusterID, name string, vcpus, mem, disk int, extra ...string) string {
-	body := strings.Join(extra, "\n")
-	if !strings.Contains(body, "timeouts") {
-		body += "\n" + shortTimeout
-	}
+	body := strings.Join(withDefaultPoolTimeouts(extra), "\n")
 	return fmt.Sprintf(`
 resource "aether_node_pool" %q {
   cluster_id = %q
@@ -89,6 +91,37 @@ resource "aether_node_pool" %q {
 %s
 }
 `, res, clusterID, name, vcpus, mem, disk, body)
+}
+
+// timeoutPhaseRE captures one create/update/delete = "<duration>" pair
+// (including a deliberately invalid duration string, which must round-trip
+// unchanged for tests that exercise validation).
+var timeoutPhaseRE = regexp.MustCompile(`(create|update|delete)\s*=\s*"([^"]*)"`)
+
+// withDefaultPoolTimeouts returns extra with its `timeouts = {...}` entry
+// (if any) rewritten to carry all three phases, defaulting any phase the
+// caller did not mention to "20s" and leaving every phase the caller DID
+// mention untouched (including an intentionally invalid value). A caller
+// with no timeouts entry at all gets the plain shortTimeout block, as before.
+func withDefaultPoolTimeouts(extra []string) []string {
+	for i, e := range extra {
+		if !strings.Contains(e, "timeouts") {
+			continue
+		}
+		given := map[string]string{}
+		for _, m := range timeoutPhaseRE.FindAllStringSubmatch(e, -1) {
+			given[m[1]] = m[2]
+		}
+		for _, phase := range []string{"create", "update", "delete"} {
+			if _, ok := given[phase]; !ok {
+				given[phase] = "20s"
+			}
+		}
+		out := append([]string(nil), extra...)
+		out[i] = fmt.Sprintf(`timeouts = { create = %q, update = %q, delete = %q }`, given["create"], given["update"], given["delete"])
+		return out
+	}
+	return append(append([]string(nil), extra...), shortTimeout)
 }
 
 func poolHCL(clusterID, name string, extra ...string) string {
@@ -329,6 +362,108 @@ func TestNodePoolResource_ScalingKeepsAnExplicitMinAndMaxAndSendsThemWithDesired
 						}
 						return forbidKeys(body, "name", "vcpus", "memory_gb", "disk_gb", "node_labels", "node_taints")
 					},
+				),
+			},
+		},
+	})
+}
+
+// I-2 (review round 2, blocking): ModifyPlan sets min_nodes/max_nodes = the
+// planned desired_nodes whenever they are left null in config (:287-292),
+// but the framework marks an Optional+Computed attribute unknown in the plan
+// only when the PROPOSED value already differs from the prior - and that
+// check runs BEFORE ModifyPlan. So when the config change removes ONLY
+// min_nodes/max_nodes (desired_nodes staying put), the framework's
+// proposed-vs-prior comparison sees no change anywhere and plans every
+// observed attribute (updated_at, status, current_nodes, first_ready_at) at
+// its KNOWN prior value; ModifyPlan then changes min_nodes/max_nodes anyway,
+// which forces an Update PUT, and the API/fake moves updated_at on that PUT
+// - so the apply fails "Provider produced inconsistent result after apply"
+// on an attribute nothing in config or the plan even touched.
+func TestNodePoolResource_RemovingExplicitMinMaxConvergesToDesiredWithoutInconsistentResult(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: poolHCL(cid, "workers", "desired_nodes = 2", "min_nodes = 1", "max_nodes = 3")},
+			{
+				// desired_nodes is UNCHANGED here; only min_nodes/max_nodes leave
+				// config, so ModifyPlan's normalisation is the only thing moving
+				Config: poolHCL(cid, "workers", "desired_nodes = 2"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(poolResource, "min_nodes", "2"),
+					resource.TestCheckResourceAttr(poolResource, "max_nodes", "2"),
+				),
+			},
+		},
+	})
+}
+
+// I-2, second trigger (review round 2, blocking): the same inconsistency,
+// reached through import instead of an update. A pool whose STORED
+// min/max already differ from its desired_nodes (the contract's COALESCE
+// write can produce this, and so can a legacy row) is imported with a
+// config that EXPLICITLY matches the stored bounds, then RE-APPLIED with
+// that same config once (settling the `timeouts` attribute into state -
+// import never populates it, so a config carrying one always looks like a
+// fresh change on the FIRST post-import apply, and that unrelated change is
+// what makes the framework mark every other Computed attribute including
+// updated_at unknown, incidentally masking the real bug; measured with
+// TF_LOG=debug against "Detected value change ... tf_attribute_path=timeouts"
+// on the first post-import apply, absent once settled). The THIRD step then
+// removes min_nodes/max_nodes from config, mirroring test (a)'s shape - a
+// step where NOTHING else in config or state differs beforehand - and hits
+// the identical bug.
+func TestNodePoolResource_ImportedMismatchedMinMaxConvergesToDesiredWithoutInconsistentResult(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	// seeded directly with min_nodes/max_nodes that do NOT equal desired_nodes -
+	// out of band, so this address is never "already managed" for the import
+	poolID := seedJSON(t, api, "/organizations/"+testOrg+"/clusters/"+cid+"/nodepools",
+		`{"name":"workers","vcpus":2,"memory_gb":4,"disk_gb":20,"min_nodes":1,"desired_nodes":2,"max_nodes":5}`)
+	matching := poolHCL(cid, "workers", "min_nodes = 1", "desired_nodes = 2", "max_nodes = 5")
+	omitted := poolHCL(cid, "workers", "desired_nodes = 2")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				ResourceName: poolResource, ImportState: true, ImportStatePersist: true,
+				Config:        matching,
+				ImportStateId: cid + "/" + poolID,
+				ImportStateCheck: func(is []*terraform.InstanceState) error {
+					if len(is) != 1 {
+						return fmt.Errorf("want exactly one imported instance, got %d", len(is))
+					}
+					for k, want := range map[string]string{"min_nodes": "1", "desired_nodes": "2", "max_nodes": "5"} {
+						if got := is[0].Attributes[k]; got != want {
+							return fmt.Errorf("imported %s = %q, want %q (the mismatched stored bounds)", k, got, want)
+						}
+					}
+					return nil
+				},
+			},
+			{
+				// same config again: settles `timeouts` into state (never set by
+				// import) with nothing else changing, so this is a true no-op for
+				// every OTHER attribute - it must not PUT
+				Config: matching,
+				Check: func(*terraform.State) error {
+					if n := len(requestsMatching(api, http.MethodPut, onePoolRE)); n != 0 {
+						return fmt.Errorf("settling timeouts alone must not PUT, got %d PUT(s)", n)
+					}
+					return nil
+				},
+			},
+			{
+				// removing min_nodes/max_nodes from config: must converge them to
+				// desired_nodes without an inconsistent result
+				Config: omitted,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(poolResource, "min_nodes", "2"),
+					resource.TestCheckResourceAttr(poolResource, "max_nodes", "2"),
 				),
 			},
 		},
@@ -819,33 +954,53 @@ func TestNodePoolResource_ExplicitEmptyLabelsStayEmptyAndPlanEmpty(t *testing.T)
 // M-2 (review round 1): node_labels = {} / node_taints = [] in config against
 // a NULL prior must never replace the pool - mapContentChanged/
 // listContentChanged already treat "both sides zero-length" as no change, but
-// that null-to-empty transition itself was untested. A real ImportState
-// establishes the null prior (a freshly imported pool that never had either
-// attribute set), rather than relying on whatever a plain create happens to
-// leave in state.
+// that null-to-empty transition itself was untested.
+//
+// M-10 (review round 2): the prior version of this test used ImportState
+// with the pool ALREADY created (and managed) by a preceding apply step,
+// which is exactly the case ImportStatePersist cannot handle for the default
+// (non-plannable) import kind: terraform-plugin-testing only removes the
+// resource address from the persisted working-directory state before
+// importing into it when the import kind is plannable
+// (testing_new_import_state.go ~:166-182), so persisting an import at an
+// address already managed by THIS test run fails with Terraform's own
+// "Resource already managed by Terraform". The prior comment's claim that
+// the ImportState step "establishes the null prior" was therefore wrong: it
+// ran in a SIDE working directory and never touched the real one - the test
+// still passed only because step 1's own state already had null labels/
+// taints. Fixed here by seeding the pool OUT OF BAND (never applied by this
+// test run, so the address is never "already managed") and using
+// ImportStatePersist: true for real: the import is the FIRST thing that
+// writes aether_node_pool.p into this test's actual state, so the null prior
+// step 3 plans against is genuinely the one the import produced. There is no
+// prior terraform-managed state to compare against, so ImportStateVerify
+// (which requires one) is replaced by ImportStateCheck, asserting the same
+// null labels/taints directly on the imported state.
 func TestNodePoolResource_EmptyLabelsAndTaintsAgainstAnImportedNullPriorDoNotReplace(t *testing.T) {
 	api := setupFake(t)
 	cid := seedCluster(t, api, "c")
+	poolID := seedPool(t, api, cid, "workers") // out of band: never applied/managed by this test run
 	base := poolHCL(cid, "workers")
 	empty := poolHCL(cid, "workers", `node_labels = {}`, `node_taints = []`)
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{
-			{Config: base, Check: resource.ComposeTestCheckFunc(
-				resource.TestCheckNoResourceAttr(poolResource, "node_labels.%"),
-				resource.TestCheckNoResourceAttr(poolResource, "node_taints.#"),
-			)},
 			{
-				ResourceName: poolResource, ImportState: true, ImportStateVerify: true,
-				ImportStateIdFunc: func(s *terraform.State) (string, error) {
-					rs := s.RootModule().Resources[poolResource]
-					if rs == nil {
-						return "", fmt.Errorf("%s is not in state", poolResource)
+				ResourceName: poolResource, ImportState: true, ImportStatePersist: true,
+				Config:        base,
+				ImportStateId: cid + "/" + poolID,
+				ImportStateCheck: func(is []*terraform.InstanceState) error {
+					if len(is) != 1 {
+						return fmt.Errorf("want exactly one imported instance, got %d", len(is))
 					}
-					return rs.Primary.Attributes["cluster_id"] + "/" + rs.Primary.ID, nil
+					for _, k := range []string{"node_labels.%", "node_taints.#"} {
+						if v, has := is[0].Attributes[k]; has {
+							return fmt.Errorf("imported state carries %s = %q, want it absent (null)", k, v)
+						}
+					}
+					return nil
 				},
-				ImportStateVerifyIgnore: []string{"timeouts"},
 			},
 			{
 				Config: empty,
@@ -869,6 +1024,31 @@ func TestNodePoolResource_EmptyLabelsAndTaintsAgainstAnImportedNullPriorDoNotRep
 			{Config: empty, PlanOnly: true, ExpectNonEmptyPlan: false},
 		},
 	})
+}
+
+// M-4 / M-11 (review round 1/2): a pool that reads "deleting" on Update's
+// pre-read must refuse the change instead of sending a PUT the API accepts
+// but never applies to a deleting pool (contract §7: a PUT on a deleting
+// pool answers 200 but the reconciler never syncs it). The refusal fires
+// before any PUT is sent - resource_node_pool.go's pre-read + status check.
+func TestNodePoolResource_UpdateOnADeletingPoolIsRefusedBeforeAnyPUT(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: poolHCL(cid, "workers", "desired_nodes = 1")},
+			{
+				PreConfig:   func() { api.NodePoolStatusSequence("*", "deleting") },
+				Config:      poolHCL(cid, "workers", "desired_nodes = 2"),
+				ExpectError: loose("being deleted"),
+			},
+		},
+	})
+	if puts := requestsMatching(api, http.MethodPut, onePoolRE); len(puts) != 0 {
+		t.Fatalf("an update refused on a deleting pool must never PUT, got %d PUT(s)", len(puts))
+	}
 }
 
 // ---------------------------------------------------------------- 9
