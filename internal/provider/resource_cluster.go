@@ -128,10 +128,12 @@ func (r *clusterResource) Schema(ctx context.Context, _ resource.SchemaRequest, 
 			// The default is true by owner ruling 2026-09-22: the platform
 			// currently has no supported access path to a cluster without the
 			// public endpoint (the vendored OpenAPI's I-14), so omitting the
-			// attribute must produce a usable cluster. The API's own schema
-			// default is still false (server-side Cluster.public_endpoint
-			// defaults false), so the provider always sends the value explicitly
-			// on create rather than relying on the API to default it. The owner
+			// attribute must produce a usable cluster. The API's own create
+			// request schema still defaults it to false (CreateClusterRequest.
+			// public_endpoint, api/openapi.yaml:3716-3717 - the Cluster response
+			// object carries no default at all), so the provider always sends
+			// the value explicitly on create rather than relying on the API to
+			// default it. The owner
 			// noted this may change in the future.
 			//
 			// region, public_endpoint and plan force replacement: keep them in

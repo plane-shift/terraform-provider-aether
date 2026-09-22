@@ -2245,13 +2245,15 @@ func (r *clusterResource) flatten(c *client.Cluster, m *clusterModel) {
 	}
 	// Cluster.public_endpoint is *bool and is NOT in the schema's `required`
 	// list (measured in api/openapi.yaml), so it can legitimately be absent.
-	// Absent is mapped to FALSE rather than null, on purpose: the Terraform
-	// attribute is Optional+Computed with Default: booldefault.StaticBool(false),
-	// so a null here would put an unknown-shaped value into an attribute
-	// Terraform requires to be known and produce "provider produced
-	// inconsistent result after apply". The API's own reading agrees - a
-	// cluster with no public endpoint reads false (an implementation gap it
-	// calls I-14), not a separate third state. Do NOT use
+	// The API always echoes the key in practice (measured), so absent never
+	// happens today. Absent is still mapped to FALSE here, matching the API's
+	// own reading of a cluster with no public endpoint (an implementation gap
+	// it calls I-14), not a separate third state - but the Terraform
+	// attribute is Optional+Computed with Default: booldefault.StaticBool(true)
+	// (owner ruling 2026-09-22: the platform currently has no supported
+	// access path without it; may change), so an absent key would now
+	// contradict a planned `true` and surface as "provider produced
+	// inconsistent result after apply" rather than silently pass. Do NOT use
 	// types.BoolPointerValue here, for that reason.
 	m.PublicEndpoint = types.BoolValue(c.PublicEndpoint != nil && *c.PublicEndpoint)
 	m.Plan = optString(c.PlanSlug)
