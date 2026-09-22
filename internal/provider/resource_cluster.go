@@ -121,24 +121,27 @@ func (r *clusterResource) Schema(ctx context.Context, _ resource.SchemaRequest, 
 			//
 			// Optional+Computed with a static default has a subtlety:
 			// REMOVING public_endpoint from the configuration plans the default
-			// (false), not "no change". If state holds true, that is a change,
-			// and with RequiresReplace it is a REPLACEMENT - correct per the
-			// API, but dropping the attribute is not a no-op, and the
-			// description says so.
+			// (true), not "no change". If state holds false, that is a change,
+			// and with RequiresReplace it is a REPLACEMENT; if state holds true it
+			// is a no-op. The description says so.
 			//
-			// The default stays false (it mirrors the API's schema default;
-			// changing it is an owner decision), but the vendored spec calls a
-			// false cluster an implementation gap with no supported access
-			// path, so the description has to say that plainly.
+			// The default is true by owner ruling 2026-09-22: the platform
+			// currently has no supported access path to a cluster without the
+			// public endpoint (the vendored OpenAPI's I-14), so omitting the
+			// attribute must produce a usable cluster. The API's own schema
+			// default is still false (server-side Cluster.public_endpoint
+			// defaults false), so the provider always sends the value explicitly
+			// on create rather than relying on the API to default it. The owner
+			// noted this may change in the future.
 			//
 			// region, public_endpoint and plan force replacement: keep them in
 			// step with the replace check in ModifyPlan, which cannot see the
 			// RequiresReplace verdict and lists them by hand.
-			"public_endpoint": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(false),
+			"public_endpoint": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(true),
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
-				MarkdownDescription: "Expose the API server on a public IPv4 address and DNS name. **Set `true`: it is required for a supported cluster** — the public API endpoint, billed as one public IP per month. " +
-					"`false`, or omitting the attribute, creates a cluster with NO supported access path from outside the platform (no laptop or CI access). " +
-					"Immutable: changing it replaces the cluster. Removing it from the configuration plans the default (`false`), which replaces a cluster created with `true`."},
+				MarkdownDescription: "Expose the API server on a public IPv4 address and DNS name. Defaults to `true` — the public API endpoint, billed as one public IP per month (see the platform's pricing); omitting the attribute therefore creates the endpoint and incurs that charge. " +
+					"`false` creates a cluster with NO supported access path from outside the platform (no laptop or CI access) — kept for a future platform change. " +
+					"Immutable: changing it replaces the cluster. Removing it from the configuration plans the default (`true`), which replaces a cluster created with `false`."},
 			// plan is Optional and NOT Computed: what the configuration says is
 			// what state holds. Measured in aether-api@8e9045a: an omitted plan
 			// is stored NULL and plan_slug is then absent from every response;
