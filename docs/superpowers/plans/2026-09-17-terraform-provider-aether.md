@@ -1677,7 +1677,7 @@ func (v K8sVersionValue) StringSemanticEquals(ctx context.Context, newValuable b
 - Produces: `NewClusterResource() resource.Resource`; model `clusterModel` with `tfsdk` tags = attribute names below; helpers `defaultTimeouts(ctx, m timeouts.Value) (create, update, delete time.Duration)`.
 
 Schema (attribute → framework type; C=Configured, P=Computed, R=RequiresReplace):
-`id` P (UseStateForUnknown) · `name` C · `region` C+R · `k8s_version` C, `CustomType: versions.K8sVersionType{}` · `public_endpoint` C+**R**, Optional+Computed, `Default: booldefault.StaticBool(false)` · `plan` C+**R** Optional · `status`, `status_message`, `endpoint`, `observed_kubernetes_version`, `capi_cluster_name`, `keycloak_realm`, `harbor_project`, `ceph_pool`, `lb_subnet`, `worker_subnet`, `created_at`, `updated_at` P · `timeouts` (framework-timeouts `timeouts.Attributes(ctx, timeouts.Opts{Create: true, Update: true, Delete: true})`).
+`id` P (UseStateForUnknown) · `name` C · `region` C+R · `k8s_version` C, `CustomType: versions.K8sVersionType{}` · `public_endpoint` C+**R**, Optional+Computed, `Default: booldefault.StaticBool(true)` (owner ruling 2026-09-22: the platform currently has no supported access path without it; may change) · `plan` C+**R** Optional · `status`, `status_message`, `endpoint`, `observed_kubernetes_version`, `capi_cluster_name`, `keycloak_realm`, `harbor_project`, `ceph_pool`, `lb_subnet`, `worker_subnet`, `created_at`, `updated_at` P · `timeouts` (framework-timeouts `timeouts.Attributes(ctx, timeouts.Opts{Create: true, Update: true, Delete: true})`).
 
 - [ ] **Step 1 [TEST-WRITER]: fakeapi cluster routes + resource tests**
 
@@ -1737,7 +1737,9 @@ func TestClusterResource_CreateWaitsForRunningAndTolerates137vs1370(t *testing.T
 				resource.TestCheckResourceAttr("aether_cluster.c", "status", "running"),
 				resource.TestCheckResourceAttr("aether_cluster.c", "k8s_version", "1.37"),
 				resource.TestCheckResourceAttr("aether_cluster.c", "observed_kubernetes_version", "1.37.0"),
-				resource.TestCheckResourceAttr("aether_cluster.c", "public_endpoint", "false"),
+				// default true (owner ruling 2026-09-22: the platform currently has no
+				// supported access path without it; may change)
+				resource.TestCheckResourceAttr("aether_cluster.c", "public_endpoint", "true"),
 				resource.TestCheckResourceAttrSet("aether_cluster.c", "id"),
 			),
 		}, {
@@ -1907,12 +1909,14 @@ func (r *clusterResource) Schema(ctx context.Context, _ resource.SchemaRequest, 
 			// change to either can only be honoured by replacement; without
 			// RequiresReplace the provider plans an in-place update the API
 			// will reject.
-			"public_endpoint": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(false),
+			// Default true (owner ruling 2026-09-22: the platform currently has
+			// no supported access path without it; may change).
+			"public_endpoint": schema.BoolAttribute{Optional: true, Computed: true, Default: booldefault.StaticBool(true),
 				PlanModifiers:       []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
 				MarkdownDescription: "Expose the API server on a public IP + DNS name (billed per public IP). Immutable: changing it replaces the cluster."},
 			// Optional+Computed with a static default has a subtlety here:
 			// REMOVING public_endpoint from the configuration plans the
-			// default (false), not "no change". If state holds true, that is a
+			// default (true), not "no change". If state holds false, that is a
 			// change, and with RequiresReplace it is a REPLACEMENT - correct
 			// per the API, but it means dropping the attribute is not a no-op.
 			// The attribute's description has to say so, and the acceptance
@@ -2241,13 +2245,15 @@ func (r *clusterResource) flatten(c *client.Cluster, m *clusterModel) {
 	}
 	// Cluster.public_endpoint is *bool and is NOT in the schema's `required`
 	// list (measured in api/openapi.yaml), so it can legitimately be absent.
-	// Absent is mapped to FALSE rather than null, on purpose: the Terraform
-	// attribute is Optional+Computed with Default: booldefault.StaticBool(false),
-	// so a null here would put an unknown-shaped value into an attribute
-	// Terraform requires to be known and produce "provider produced
-	// inconsistent result after apply". The API's own reading agrees - a
-	// cluster with no public endpoint reads false (an implementation gap it
-	// calls I-14), not a separate third state. Do NOT use
+	// The API always echoes the key in practice (measured), so absent never
+	// happens today. Absent is still mapped to FALSE here, matching the API's
+	// own reading of a cluster with no public endpoint (an implementation gap
+	// it calls I-14), not a separate third state - but the Terraform
+	// attribute is Optional+Computed with Default: booldefault.StaticBool(true)
+	// (owner ruling 2026-09-22: the platform currently has no supported
+	// access path without it; may change), so an absent key would now
+	// contradict a planned `true` and surface as "provider produced
+	// inconsistent result after apply" rather than silently pass. Do NOT use
 	// types.BoolPointerValue here, for that reason.
 	m.PublicEndpoint = types.BoolValue(c.PublicEndpoint != nil && *c.PublicEndpoint)
 	m.Plan = optString(c.PlanSlug)

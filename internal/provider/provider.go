@@ -263,7 +263,7 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 }
 
 func (p *aetherProvider) Resources(context.Context) []func() resource.Resource {
-	return []func() resource.Resource{} // filled task by task
+	return []func() resource.Resource{NewClusterResource}
 }
 
 func (p *aetherProvider) DataSources(context.Context) []func() datasource.DataSource {

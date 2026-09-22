@@ -107,3 +107,20 @@ func TestValue_SemanticEqualsHook(t *testing.T) {
 		t.Fatalf("unknown vs known must not be equal: eq=%v diags=%v", eq, diags)
 	}
 }
+
+// HasPatch's documented contract: true only for an explicit patch, and an
+// unparseable v has no patch. "v1.37.2" is parseable (a leading "v" is
+// accepted everywhere in this package), so it has one.
+func TestHasPatch(t *testing.T) {
+	for _, c := range []struct {
+		v    string
+		want bool
+	}{
+		{"1.37", false}, {"1.37.2", true}, {"1.37.0", true}, {"v1.37.2", true}, {"v1.37", false},
+		{"", false}, {"1", false}, {"1.37.", false}, {"1.37.x", false}, {"1.37.02", false}, {"bogus", false},
+	} {
+		if got := HasPatch(c.v); got != c.want {
+			t.Errorf("HasPatch(%q) = %v, want %v", c.v, got, c.want)
+		}
+	}
+}
