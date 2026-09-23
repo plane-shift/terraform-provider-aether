@@ -23,8 +23,9 @@ import (
 // (see fakeapi/networks.go and the SDD task-8 measured contract).
 // internal/provider/resource_cluster_network.go landed in 333f06e, and the
 // r1 fixes (task-8-review-r1.md M-1/M-2) landed in a256239: every test in
-// this file is GREEN except one, deliberately RED pending the coder's round-3
-// fix (task-8-review-r2.md NEW-1) - marked at its definition.
+// this file is GREEN. task-8-review-r2.md's proposed NEW-1 test was rejected
+// by measurement rather than written - see the M-3 test's comment below for
+// why, and task-8-tests-report.md for the full record.
 //
 // There is no wait/convergence signal anywhere in this API (contract §7), so
 // every test here runs at plan/apply speed with no polling and needs no
@@ -739,18 +740,18 @@ func TestClusterNetworkResource_NonCanonicalPrefixLengthIsRefusedAtPlanWithZeroC
 //
 // What this test actually proves (measured, not assumed - see task-8-tests-report.md for the full
 // record): it is Terraform CORE's own apply-time behaviour that catches this, not put()'s manual
-// apply-time re-check (resource_cluster_network.go:386-397). Terraform re-invokes the provider's
+// apply-time re-check (the checkCIDRs call inside put()). Terraform re-invokes the provider's
 // ValidateResourceConfig (and PlanResourceChange) against the now-resolved config as part of its own
 // "plan for apply" step, for ANY attribute that was unknown at the initial plan and becomes known
 // before apply - this is standard core behaviour for cross-resource and function-derived unknowns
 // alike, not something specific to this provider or to timestamp(). Confirmed two ways: (1) the
 // failure surfaces as "Error running apply", never "Error running pre-apply plan" - proving the
 // value was genuinely unknown through the initial plan and only re-checked once resolved; (2)
-// deleting put()'s entire apply-time CIDR-recheck block (the `if !diags.HasError() { ... checkCIDRs
-// ... } ` at :389-397) and rebuilding left this test GREEN, unchanged - cidrListValidator alone,
-// re-invoked by core, still refuses the value before any request. put()'s own recheck is real
-// defense-in-depth (it also protects a hypothetical direct API-client caller of this Go package, and
-// costs nothing), but this test cannot and does not isolate it - no test can, since core's
+// deleting the `if !diags.HasError() { ... checkCIDRs ... }` block guarding the checkCIDRs call
+// inside put() and rebuilding left this test GREEN, unchanged - cidrListValidator alone, re-invoked
+// by core, still refuses the value before any request. put()'s own recheck is real defense-in-depth
+// (it also protects a hypothetical direct API-client caller of this Go package, and costs nothing),
+// but this test cannot and does not isolate it - no test can, since core's
 // re-validation is unconditional for this HCL shape. This is why NEW-1 (an equivalent apply-time
 // bounds recheck proposed for the rate limit) was rejected rather than written: the identical
 // mechanism already re-invokes int64validator.Between on the resolved value, so no HCL scenario
