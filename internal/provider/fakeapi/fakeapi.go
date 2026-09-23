@@ -39,6 +39,7 @@ type Server struct {
 	bodyReadErr error
 	clusters    clusterStore // see clusters.go; own lock
 	pools       poolStore    // see nodepools.go; own lock
+	networks    networkStore // see networks.go; own lock
 	// Handlers lets a test override a route: key "METHOD /path" (path after /api/v1).
 	Handlers map[string]http.HandlerFunc
 }
@@ -150,6 +151,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	case s.routeNodePools(w, r, path, body):
 		// served by nodepools.go
+	case s.routeClusterNetwork(w, r, path, body):
+		// served by networks.go
 	case s.routeClusters(w, r, path, body):
 		// served by clusters.go
 	default:
