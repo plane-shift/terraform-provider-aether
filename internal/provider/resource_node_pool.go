@@ -316,8 +316,11 @@ func (r *nodePoolResource) ModifyPlan(ctx context.Context, req resource.ModifyPl
 	// produced inconsistent result after apply" (measured). Whenever the
 	// FINAL planned min/max (after the rewrite) differs from state, defer
 	// those four to the real post-apply read, exactly as a create would.
-	// first_ready_at, id and created_at are excluded: nothing a node-count
-	// PUT does can move them.
+	// first_ready_at is in the set too (M-15): it is not PUT-driven either -
+	// the reconciler latches it the first time current_nodes > 0 - so a pool
+	// whose state still has it null (imported while provisioning, or an
+	// autoscaling pool at 0 nodes) can see it move under the same apply.
+	// Only id and created_at are excluded: they are immutable.
 	finalMin, finalMax := plan.MinNodes, plan.MaxNodes
 	if config.MinNodes.IsNull() {
 		finalMin = plan.DesiredNodes
@@ -330,6 +333,7 @@ func (r *nodePoolResource) ModifyPlan(ctx context.Context, req resource.ModifyPl
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("status"), types.StringUnknown())...)
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("status_message"), types.StringUnknown())...)
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("current_nodes"), types.Int64Unknown())...)
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("first_ready_at"), types.StringUnknown())...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
@@ -618,7 +622,14 @@ func (r *nodePoolResource) Update(ctx context.Context, req resource.UpdateReques
 	// Whether the pool autoscales is decided by the budget it has AFTER this
 	// PUT, which is the planned budget (Default 0 keeps it always known).
 	autoscaling := plan.MaxVcpus.ValueInt64() > plan.MinVcpus.ValueInt64() || plan.MaxMemoryGb.ValueInt64() > plan.MinMemoryGb.ValueInt64()
-	if countsChanged && !autoscaling {
+	wasAutoscaling := state.MaxVcpus.ValueInt64() > state.MinVcpus.ValueInt64() || state.MaxMemoryGb.ValueInt64() > state.MinMemoryGb.ValueInt64()
+	// The platform converges on desired_nodes only (N-1): wait when it
+	// changed, or when the pool leaves autoscaling for fixed (the replica
+	// count is then set from desired_nodes). A min/max-only edit - sent with
+	// all three counts above - moves nothing the platform converges on, and
+	// on a pool already short of desired_nodes the wait could never finish.
+	// Never wait on a pool that autoscales after this PUT.
+	if !autoscaling && (!plan.DesiredNodes.Equal(state.DesiredNodes) || wasAutoscaling) {
 		// A PUT never changes status: straight after it the pool still reads
 		// `running` with the OLD current_nodes, so the wait converges on
 		// current_nodes == desired_nodes, not on the status alone.
@@ -631,9 +642,10 @@ func (r *nodePoolResource) Update(ctx context.Context, req resource.UpdateReques
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
-	// Everything else - budgets, knobs, node counts on an autoscaling pool
-	// (inert after create) - has NO convergence signal in the API: no
-	// generation, no status change. Read once and return.
+	// Everything else - budgets and knobs on a pool that stays as it was,
+	// node counts on an autoscaling pool (inert after create), min/max-only
+	// (bounds-only) edits on a fixed pool - has NO convergence signal in the
+	// API: no generation, no status change. Read once and return.
 	after, err := r.getPool(ctx, clusterID, poolID)
 	if err != nil {
 		apierr.ToDiagnostics(err, &resp.Diagnostics, path.Empty())
