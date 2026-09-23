@@ -759,6 +759,7 @@ func TestMemberResource_GuardListFailureIsAnErrorWithNoDelete(t *testing.T) {
 func TestMemberResource_GuardUnparseableCursorIsAnErrorWithNoDelete(t *testing.T) {
 	api := setupFake(t)
 	var id string
+	var mu sync.Mutex
 	calls := 0
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
@@ -768,7 +769,9 @@ func TestMemberResource_GuardUnparseableCursorIsAnErrorWithNoDelete(t *testing.T
 			{
 				PreConfig: func() {
 					api.Handlers[memberListRoute] = func(w http.ResponseWriter, r *http.Request) {
+						mu.Lock()
 						calls++
+						mu.Unlock()
 						fakeapi.WriteJSON(w, http.StatusOK, listPage("not-a-uuid"))
 					}
 				},
@@ -778,6 +781,8 @@ func TestMemberResource_GuardUnparseableCursorIsAnErrorWithNoDelete(t *testing.T
 			recoverStep(t, api, id),
 		},
 	})
+	mu.Lock()
+	defer mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("list called %d times, want 1 (an unusable cursor ends the guard)", calls)
 	}
@@ -825,7 +830,7 @@ func TestMemberResource_GuardNonAdvancingCursorDoesNotLoop(t *testing.T) {
 }
 
 // I-1. Fails if the guard trusts the ROLE IN STATE instead of re-reading the
-// member: the refresh (the harness' two GETs) is scripted to report `member`
+// member: the refresh (the harness' one GET) is scripted to report `member`
 // while the fake - and every later GET - says `owner` (the only owner). Only
 // a Delete that re-reads the live member sees the owner and refuses. Mechanism:
 // GETs 1..destroyStepRefreshGets come from the harness' refresh and are the
