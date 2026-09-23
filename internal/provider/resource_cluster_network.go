@@ -386,9 +386,9 @@ func (r *clusterNetworkResource) put(ctx context.Context, m *clusterNetworkModel
 	// Defense-in-depth only. An entry unknown at plan time (built from
 	// another resource's output) is NOT sent unchecked: Terraform core
 	// re-runs the schema validators on the resolved config before
-	// ApplyResourceChange (measured on both terraform and tofu,
-	// plugin-framework v1.19.0), so cidrListValidator has already refused
-	// it. This re-check only guards against that engine behaviour changing.
+	// ApplyResourceChange (measured by the test-writer with plugin-framework
+	// v1.19.0, see TestClusterNetworkResource_ApplyTimeCIDRRecheckRefusesAnEntryUnknownAtPlan),
+	// so cidrListValidator has already refused it. This re-check only guards against that engine behaviour changing.
 	// For the same reason the api_server_rate_limit bounds are not re-checked
 	// here: their int64 validators already run on the resolved config.
 	if !diags.HasError() {
