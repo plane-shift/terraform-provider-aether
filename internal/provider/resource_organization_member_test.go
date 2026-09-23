@@ -544,7 +544,7 @@ func TestMemberResource_DeleteOfAnAlreadyRemovedMemberIsSuccess(t *testing.T) {
 					}
 				},
 				Config: providerOnlyHCL,
-				Check:  resource.TestCheckNoResourceAttr(memberResource, "id"),
+				Check:  checkAbsentFromState(memberResource),
 			},
 		},
 	})

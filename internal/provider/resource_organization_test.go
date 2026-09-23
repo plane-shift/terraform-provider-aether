@@ -395,7 +395,7 @@ func TestOrganizationResource_DestroyIsStateOnlyAndMakesNoWrites(t *testing.T) {
 				PreConfig: func() { seen = len(api.Requests()) },
 				Config:    providerOnlyHCL,
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckNoResourceAttr(orgResource, "id"),
+					checkAbsentFromState(orgResource),
 					func(*terraform.State) error {
 						for _, r := range requestsSince(api, seen) {
 							if r.Method != http.MethodGet {
@@ -471,4 +471,15 @@ func TestOrganizationResource_Read404RemovesTheResourceFromState(t *testing.T) {
 			{PreConfig: func() { delete(api.Handlers, route) }, Config: providerOnlyHCL},
 		},
 	})
+}
+
+// checkAbsentFromState fails if addr is still in state. (TestCheckNoResourceAttr
+// cannot be used after a destroy: it errors "Not found" on an absent resource.)
+func checkAbsentFromState(addr string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		if _, ok := s.RootModule().Resources[addr]; ok {
+			return fmt.Errorf("%s is still in state after destroy", addr)
+		}
+		return nil
+	}
 }
