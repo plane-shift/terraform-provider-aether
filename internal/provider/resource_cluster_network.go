@@ -383,9 +383,14 @@ func (r *clusterNetworkResource) put(ctx context.Context, m *clusterNetworkModel
 	if body.AuthorizedCidrs == nil {
 		body.AuthorizedCidrs = []string{}
 	}
-	// Config validators do not run again at apply, so an entry that was
-	// unknown at plan time (built from another resource's output) has not
-	// been checked yet: check the whole planned list before it is sent.
+	// Defense-in-depth only. An entry unknown at plan time (built from
+	// another resource's output) is NOT sent unchecked: Terraform core
+	// re-runs the schema validators on the resolved config before
+	// ApplyResourceChange (measured on both terraform and tofu,
+	// plugin-framework v1.19.0), so cidrListValidator has already refused
+	// it. This re-check only guards against that engine behaviour changing.
+	// For the same reason the api_server_rate_limit bounds are not re-checked
+	// here: their int64 validators already run on the resolved config.
 	if !diags.HasError() {
 		known := make([]bool, len(body.AuthorizedCidrs))
 		for i := range known {
