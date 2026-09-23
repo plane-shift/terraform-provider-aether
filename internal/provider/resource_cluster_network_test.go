@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -19,11 +20,10 @@ import (
 
 // These tests drive aether_cluster_network through a real terraform (or tofu)
 // binary against the in-process fake, which reproduces what aether-api DOES
-// (see fakeapi/networks.go and the SDD task-8 measured contract). The
-// resource itself (internal/provider/resource_cluster_network.go,
-// NewClusterNetworkResource registered in provider.go) does not exist yet:
-// this file is RED by design until the coder lands it - see
-// task-8-tests-report.md for the exact symbols required.
+// (see fakeapi/networks.go and the SDD task-8 measured contract).
+// internal/provider/resource_cluster_network.go landed in 333f06e; most tests
+// here are GREEN. Two are deliberately RED, pending the coder's round-1 fix
+// (task-8-review-r1.md M-1/M-2) - marked at their definition.
 //
 // There is no wait/convergence signal anywhere in this API (contract §7), so
 // every test here runs at plan/apply speed with no polling and needs no
@@ -71,6 +71,32 @@ func compactJSON(t *testing.T, b []byte) string {
 		t.Fatalf("request body is not compactable JSON: %q: %v", b, err)
 	}
 	return buf.String()
+}
+
+// selfDeletingNotFound returns an http.HandlerFunc that answers 404 exactly
+// once, then removes ITSELF from api.Handlers[path] so a later request to the
+// same path falls through to the fake's normal routing (used where the
+// harness' own automatic post-apply refresh reads the same path again right
+// after a step's apply, and must not trip the same forced 404 a second time).
+//
+// The delete is guarded by a local mutex (task-8-review-r1.md N-4): this
+// closure runs on whatever goroutine net/http assigns the connection to,
+// which is not necessarily the test's own goroutine, so mutating the shared
+// api.Handlers map from inside it is a potential concurrent write. A local
+// mutex closes that within THIS test's own accesses to the map; it does not
+// establish mutual exclusion with fakeapi's internal serve(), which reads the
+// same map under its own unexported lock - closing that fully would need an
+// exported synchronization point on fakeapi.Server, out of scope here. A
+// targeted `-race` run (task-8-review-r1.md N-4) found no actual race, since
+// these requests are issued sequentially in practice.
+func selfDeletingNotFound(api *fakeapi.Server, path, message string) http.HandlerFunc {
+	var mu sync.Mutex
+	return func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		delete(api.Handlers, path)
+		mu.Unlock()
+		fakeapi.WriteJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": message}})
+	}
 }
 
 // ---------------------------------------------------------------- 1
@@ -195,6 +221,38 @@ func TestClusterNetworkResource_UpdateReordersAndChangesTheListInConfigOrder(t *
 						}
 						return nil
 					},
+					// M-5 (task-8-review-r1.md): Update's "0 GETs" property had no
+					// test - only Create's did. step.Check runs right after this
+					// step's own apply and before the harness' unconditional
+					// post-apply "perpetual diff" refresh (which DOES GET, and is
+					// not what this measures) - but requestsMatching accumulates
+					// over the WHOLE test, including step 1's create and its own
+					// end-of-step refresh cycle, so a plain "count all GETs == 0"
+					// would always be nonzero by step 2. Instead: find the LAST PUT
+					// to this path (step 2's own Update) and count GETs of it AFTER
+					// that point only.
+					func(*terraform.State) error {
+						reqs := api.Requests()
+						lastPUT := -1
+						for i, r := range reqs {
+							if r.Method == http.MethodPut && strings.HasSuffix(r.Path, "/network") {
+								lastPUT = i
+							}
+						}
+						if lastPUT == -1 {
+							return fmt.Errorf("no PUT of the network was recorded at all")
+						}
+						gets := 0
+						for _, r := range reqs[lastPUT+1:] {
+							if r.Method == http.MethodGet && strings.HasSuffix(r.Path, "/network") {
+								gets++
+							}
+						}
+						if gets != 0 {
+							return fmt.Errorf("update GET the network %d time(s) after its own PUT; Update must never poll after its PUT", gets)
+						}
+						return nil
+					},
 				),
 			},
 		},
@@ -266,8 +324,14 @@ func TestClusterNetworkResource_AddingTheRateLimitBlockBackIsReflectedInState(t 
 			},
 		},
 	})
-	if reqs := api.Requests(); len(reqs) == 0 {
-		t.Fatal("no requests recorded at all")
+	// N-3 (task-8-review-r1.md): `len(api.Requests()) == 0` can never fail
+	// once any step has run - replaced with a count that pins the real
+	// property: one PUT per apply step (create without a rate limit, then
+	// update adding one back) plus resource.UnitTest's own end-of-test
+	// teardown destroy PUT (see the comment on test 6/DeleteSendsExactly...
+	// for why the destroy is always a third PUT here, not a DELETE call).
+	if n := len(requestsMatching(api, http.MethodPut, networkRE)); n != 3 {
+		t.Fatalf("want exactly 3 PUTs (create, update, teardown destroy), got %d", n)
 	}
 }
 
@@ -333,6 +397,12 @@ func TestClusterNetworkResource_ImportOfANeverConfiguredClusterReadsEmptyCIDRsAn
 					if got := is[0].Attributes["id"]; got != cid {
 						return fmt.Errorf("imported id = %q, want the cluster id %q", got, cid)
 					}
+					// M-5 (task-8-review-r1.md): the zero-time -> RFC3339 text
+					// flattening had no test at resource level; a regression that
+					// nulled it instead would pass silently otherwise.
+					if got := is[0].Attributes["updated_at"]; got != "0001-01-01T00:00:00Z" {
+						return fmt.Errorf("imported updated_at = %q, want the zero-time RFC3339 text (not null) for a never-configured cluster (§2)", got)
+					}
 					if reqs := requestsMatching(api, http.MethodPut, networkRE); len(reqs) != 0 {
 						return fmt.Errorf("import must never PUT (adopt-only), got %d PUT(s) by the time the import finished: %v", len(reqs), reqs)
 					}
@@ -374,10 +444,7 @@ func TestClusterNetworkResource_Read404RemovesFromStateAndNextPlanRecreates(t *t
 					// this same path again right after Create) sees the freshly
 					// created row instead of tripping the same 404 a second time
 					// and wrongly wiping the just-created resource from state.
-					api.Handlers[networkGetPath] = func(w http.ResponseWriter, r *http.Request) {
-						delete(api.Handlers, networkGetPath)
-						fakeapi.WriteJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "Resource not found"}})
-					}
+					api.Handlers[networkGetPath] = selfDeletingNotFound(api, networkGetPath, "Resource not found")
 				},
 				Config: cfg,
 				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
@@ -508,4 +575,153 @@ func TestClusterNetworkResource_ClusterIDChangePlansReplace(t *testing.T) {
 			},
 		},
 	})
+}
+
+// ---------------------------------------------------------------- r1 gaps (task-8-review-r1.md M-5)
+
+// Fails if Delete treats a 404 on its own PUT as an error instead of success
+// (the CLUSTER is already gone, contract §8 - there is nothing left to
+// reset). Forced via a Handlers override on the OLD cluster's PUT path only,
+// exercised through a cluster_id replace so the override lands on exactly the
+// DELETE half of the apply: the new cluster's create PUT is a different path
+// (a different cluster id) and is never touched by it, so the test can tell
+// "Delete succeeded on a 404" from "the whole apply failed for some other
+// reason" - a genuinely removed cluster (api.RemoveCluster) would make BOTH
+// halves 404 and could not distinguish the two.
+func TestClusterNetworkResource_DeletePUTAnswering404OnAnAlreadyGoneClusterIsSuccess(t *testing.T) {
+	api := setupFake(t)
+	cidA := seedCluster(t, api, "a")
+	cidB := seedCluster(t, api, "b")
+	oldPutPath := "PUT /organizations/" + testOrg + "/clusters/" + cidA + "/network"
+	oldPutRE := "/clusters/" + cidA + "/network$"
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: networkHCL(cidA, []string{"10.0.0.0/24"})},
+			{
+				PreConfig: func() {
+					api.Handlers[oldPutPath] = func(w http.ResponseWriter, r *http.Request) {
+						fakeapi.WriteJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "Resource not found"}})
+					}
+				},
+				Config: networkHCL(cidB, []string{"10.0.0.0/24"}),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction(networkResource, plancheck.ResourceActionReplace),
+				}},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(networkResource, "cluster_id", cidB),
+					func(*terraform.State) error {
+						// oldPutRE also matches step 1's own create PUT for cidA (same
+						// path, same cluster): 2 total is create + this step's destroy.
+						if n := len(requestsMatching(api, http.MethodPut, oldPutRE)); n != 2 {
+							return fmt.Errorf("want exactly 2 PUTs on the old cluster's path (the original create plus the destroy that got 404'd), got %d", n)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() { delete(api.Handlers, oldPutPath) },
+				Config:    networkHCL(cidB, []string{"10.0.0.0/24"}), PlanOnly: true, ExpectNonEmptyPlan: false,
+			},
+		},
+	})
+}
+
+// Fails if a non-200 PUT is swallowed instead of surfacing the API's own
+// message, or if any state is left behind despite the failure. Forced via a
+// Handlers override (the plan-time validators make a real 422 unreachable
+// through normal config, and the fake's other error shapes are all driven by
+// the request BODY, which the resource always builds correctly - so a raw
+// override is the only way to exercise this path at all). The second step's
+// empty-config PlanOnly proves nothing was persisted: Create never calls
+// resp.State.Set before checking for an error today, but a regression that
+// reordered those two calls would leave an orphaned resource, and the empty
+// config would then plan a non-empty (destroy) diff for it.
+func TestClusterNetworkResource_CreateSurfacesAPUTErrorAndLeavesNoState(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	putPath := "PUT /organizations/" + testOrg + "/clusters/" + cid + "/network"
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					api.Handlers[putPath] = func(w http.ResponseWriter, r *http.Request) {
+						fakeapi.WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "internal_error", "message": "simulated PUT failure for test"}})
+					}
+				},
+				Config:      networkHCL(cid, []string{"10.0.0.0/24"}),
+				ExpectError: loose("simulated PUT failure for test"),
+			},
+			{
+				PreConfig: func() { delete(api.Handlers, putPath) },
+				Config:    `provider "aether" {}`,
+				PlanOnly:  true, ExpectNonEmptyPlan: false,
+			},
+		},
+	})
+}
+
+// ---------------------------------------------------------------- r1 RED (task-8-review-r1.md M-1, M-2)
+//
+// Both tests below are EXPECTED RED until the coder lands the corresponding
+// fix. Message substrings are coordinated with the coder via
+// task-8-tests-report.md: M-1's fix must produce an error containing
+// "must be a canonical lower-case UUID" (exact substring); M-2's message is
+// left to the coder's choice among the concepts already in use on this
+// validator (canonical / network address / host bits).
+
+// M-1: a non-canonical cluster_id (upper case) must be refused at PLAN time,
+// with zero network-route HTTP calls. Today parseID accepts it and flatten
+// silently overwrites ClusterID with the canonical form AFTER a real PUT has
+// already happened ("Provider produced inconsistent result after apply",
+// task-8-review-r1.md M-1) - this test is RED until a plan-time
+// canonical-UUID validator is added to cluster_id.
+func TestClusterNetworkResource_UpperCaseClusterIDIsRefusedAtPlanWithZeroCalls(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	upper := strings.ToUpper(cid)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      networkHCL(upper, []string{"10.0.0.0/24"}),
+			ExpectError: regexp.MustCompile(`(?is)must be a canonical lower-case UUID`),
+		}},
+	})
+	if reqs := requestsMatching(api, http.MethodGet, networkRE); len(reqs) != 0 {
+		t.Fatalf("an upper-case cluster_id reached the API with a GET: %v", reqs)
+	}
+	if reqs := requestsMatching(api, http.MethodPut, networkRE); len(reqs) != 0 {
+		t.Fatalf("an upper-case cluster_id reached the API with a PUT: %v", reqs)
+	}
+}
+
+// M-2: `10.0.0.0/08` parses successfully (go1.26.5 net.ParseCIDR accepts a
+// leading-zero prefix length) and has no host bits set, so today's validator
+// accepts it - but the platform CRD's prefix-length pattern
+// `([0-9]|[12][0-9]|3[0-2])$` does not match "08", so the merge patch is
+// refused and the CP-proxy silently keeps enforcing the OLD policy (contract
+// §7.3): exactly the divergence this validator exists to prevent. RED until
+// the coder requires the canonical string form (`ipnet.String() == entry`).
+func TestClusterNetworkResource_NonCanonicalPrefixLengthIsRefusedAtPlanWithZeroCalls(t *testing.T) {
+	const neverSeededCluster = "11111111-1111-4111-8111-111111111111"
+	api := setupFake(t)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      networkHCL(neverSeededCluster, []string{"10.0.0.0/08"}),
+			ExpectError: regexp.MustCompile(`(?is)canonical|network address|host bits`),
+		}},
+	})
+	if reqs := requestsMatching(api, http.MethodGet, networkRE); len(reqs) != 0 {
+		t.Fatalf("a non-canonical prefix length reached the API with a GET: %v", reqs)
+	}
+	if reqs := requestsMatching(api, http.MethodPut, networkRE); len(reqs) != 0 {
+		t.Fatalf("a non-canonical prefix length reached the API with a PUT: %v", reqs)
+	}
 }
