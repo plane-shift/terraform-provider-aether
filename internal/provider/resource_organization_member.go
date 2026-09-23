@@ -30,6 +30,10 @@ var (
 // (the API's maximum).
 const memberListPageSize = 100
 
+// memberListMaxPages bounds the guard's cursor loop (10,000 members), so an
+// API that repeated a cursor could not spin it until the context expired.
+const memberListMaxPages = 100
+
 // lastOwnerRefusal is the T9-4 diagnostic, verbatim.
 const lastOwnerRefusal = "refusing to remove the last owner: the API has no guard (aether-api #302) and the organization would become unmanageable (roles and deletion need an owner login)"
 
@@ -63,7 +67,8 @@ func (r *organizationMemberResource) Schema(_ context.Context, _ resource.Schema
 		MarkdownDescription: "A member of the provider's organization. " +
 			"The API creates the membership only. The address must already have an Aether login account (created through the portal invitation flow; aether-api #302), otherwise the member cannot sign in. Destroying the resource removes the membership and leaves the login account in place. " +
 			"There is no in-place update: changing `email` or `role` replaces the membership (it is removed, then created again with a new `id`). Do not set `create_before_destroy`: the new membership would be created while the old one still holds the address, which the API refuses (409). " +
-			"Removing or replacing the organization's last `owner` is refused, because the API has no such guard and nobody could change roles or delete the organization afterwards.",
+			"Removing or replacing the organization's last `owner` is refused, because the API has no such guard and nobody could change roles or delete the organization afterwards. The check reads the member's current role from the API and is serialised within a single run; the platform itself has no guard, so a concurrent removal in the portal or another run is not prevented. " +
+			"Transferring ownership in one apply (adding the new owner and demoting or removing the old one) depends on the order Terraform runs the two changes, and is refused when the old owner goes first: give the demoted owner's resource a `depends_on` on the new owner's resource, or use two applies (add the new owner, then demote the old one).",
 		Attributes: map[string]schema.Attribute{
 			"id": immutableComputed("Membership UUID (not a user id). It changes when the membership is replaced."),
 			"email": schema.StringAttribute{Required: true,
@@ -71,8 +76,8 @@ func (r *organizationMemberResource) Schema(_ context.Context, _ resource.Schema
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
 				Validators:          []validator.String{memberEmailValidator{}}},
 			"role": schema.StringAttribute{Required: true,
-				MarkdownDescription: "One of `owner`, `admin`, `member`, `viewer`. Changing it replaces the membership (removed, then created with the new role). " +
-					"The portal never offers `owner`; granting it here cannot be undone from Terraform, because only an owner or admin login may change roles and a replacement of the last owner is refused.",
+				MarkdownDescription: "One of `owner`, `admin`, `member`, `viewer`. Changing it replaces the membership: a DELETE followed by a POST, which gives the membership a new `id`. " +
+					"The portal never offers `owner`. An `owner` can be demoted from Terraform like any other role; only the last owner is protected, and removing or replacing it is refused.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 				Validators:    []validator.String{stringvalidator.OneOf("owner", "admin", "member", "viewer")}},
 			"invited_by":  immutableComputed("UUID of the user who invited the member. Always null for a membership created through the API."),
@@ -190,9 +195,21 @@ func (r *organizationMemberResource) Update(ctx context.Context, req resource.Up
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
-// Delete removes the membership. Removing an owner (by the role in state)
-// first runs the last-owner guard (T9-4). 204 and 404 (already gone) are
-// success.
+// Delete removes the membership. 204 and 404 (already gone) are success.
+//
+// The last-owner guard (T9-4, amended r1 = T9-14) decides on the LIVE role,
+// never the role in state: the member is re-read first (GET), so a membership
+// promoted to owner out of band is still guarded even under -refresh=false. A
+// 404 on that read means the membership is already gone: success, no DELETE.
+//
+// For an owner, the guard's member list AND the DELETE run under
+// providerData.ownerDeleteMu. Terraform deletes resources in parallel, and
+// without the lock two owner deletes in one run (a destroy of a config that
+// manages both of the org's owners) would each see the other as "another
+// owner" and both succeed, leaving the organization with none. The lock is
+// per provider process, i.e. per Terraform run: it cannot serialise against
+// the portal or a second run - the platform itself has no guard (aether-api
+// #302). Non-owner deletes take neither the lock nor the list.
 func (r *organizationMemberResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state organizationMemberModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -204,7 +221,24 @@ func (r *organizationMemberResource) Delete(ctx context.Context, req resource.De
 		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid id in state", err.Error())
 		return
 	}
-	if state.Role.ValueString() == string(client.MemberRoleOwner) {
+	g, err := r.pd.Client.GetMemberWithResponse(ctx, r.pd.orgID, id)
+	if err != nil {
+		resp.Diagnostics.AddError("Cannot read organization member for the last-owner check", err.Error())
+		return
+	}
+	switch {
+	case g.StatusCode() == http.StatusNotFound:
+		return // already gone
+	case g.StatusCode() != http.StatusOK:
+		addAPIError(&resp.Diagnostics, g.StatusCode(), g.HTTPResponse.Header, g.Body, path.Empty())
+		return
+	case g.JSON200 == nil:
+		resp.Diagnostics.AddError("Aether API returned no usable organization member", describeNonJSON(g.HTTPResponse, g.Status()))
+		return
+	}
+	if g.JSON200.Role == client.MemberRoleOwner {
+		r.pd.ownerDeleteMu.Lock()
+		defer r.pd.ownerDeleteMu.Unlock()
 		gone, d := r.guardLastOwner(ctx, id)
 		resp.Diagnostics.Append(d...)
 		if resp.Diagnostics.HasError() || gone {
@@ -221,17 +255,24 @@ func (r *organizationMemberResource) Delete(ctx context.Context, req resource.De
 	}
 }
 
-// guardLastOwner lists every member (following next_cursor) and refuses with
-// an error when no owner OTHER than id exists: the API has no such guard, and
-// an organization without an owner can no longer change roles or be deleted.
-// gone reports that the membership is already gone - a 404 during the check,
-// or id absent from the complete list - so there is nothing to delete and no
-// owner to lose.
-func (r *organizationMemberResource) guardLastOwner(ctx context.Context, id client.OrgID) (gone bool, diags diag.Diagnostics) {
+// guardLastOwner lists every member (following next_cursor; a repeated cursor
+// or more than memberListMaxPages pages is an error) and refuses with an error when no owner OTHER
+// than id exists: the API has no such guard, and an organization without an
+// owner can no longer change roles or be deleted. gone reports that the
+// membership is already gone - a 404 during the check, or id absent from the
+// complete list - so there is nothing to delete and no owner to lose. The
+// caller holds providerData.ownerDeleteMu.
+func (r *organizationMemberResource) guardLastOwner(ctx context.Context, id client.MemberID) (gone bool, diags diag.Diagnostics) {
 	limit := memberListPageSize
 	params := &client.ListMembersParams{Limit: &limit}
 	seen := false
-	for {
+	cursors := map[string]bool{} // every cursor followed so far
+	for page := 1; ; page++ {
+		if page > memberListMaxPages {
+			diags.AddError("Cannot complete the last-owner check",
+				fmt.Sprintf("The member list did not end within %d pages of %d members; the API may be repeating a cursor. The membership was not removed.", memberListMaxPages, memberListPageSize))
+			return false, diags
+		}
 		res, err := r.pd.Client.ListMembersWithResponse(ctx, r.pd.orgID, params)
 		if err != nil {
 			diags.AddError("Cannot list organization members for the last-owner check", err.Error())
@@ -263,6 +304,14 @@ func (r *organizationMemberResource) guardLastOwner(ctx context.Context, id clie
 			diags.AddError("Aether API returned an unusable member list cursor", err.Error())
 			return false, diags
 		}
+		// A cursor already followed would return the same page again: fail
+		// now rather than loop until the page bound.
+		if cursors[cursor.String()] {
+			diags.AddError("Cannot complete the last-owner check",
+				fmt.Sprintf("The member list returned cursor %s a second time, so the list would never end. The membership was not removed.", cursor))
+			return false, diags
+		}
+		cursors[cursor.String()] = true
 		params = &client.ListMembersParams{Limit: &limit, Cursor: &cursor}
 	}
 	if !seen {
