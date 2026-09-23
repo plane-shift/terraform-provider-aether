@@ -267,13 +267,22 @@ func (cs *clusterStore) resolve(v string) (string, error) {
 	return v, nil
 }
 
-// splitVersion returns major, minor, patch of a resolved MAJOR.MINOR.PATCH.
+// splitVersion returns major, minor, patch of MAJOR.MINOR[.PATCH]; a bare
+// MAJOR.MINOR (what SetStoredVersionAhead can leave behind) reads as patch 0.
 func splitVersion(v string) (int, int, int, bool) {
-	var a, b, c int
-	if _, err := fmt.Sscanf(v, "%d.%d.%d", &a, &b, &c); err != nil {
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 || len(parts) > 3 {
 		return 0, 0, 0, false
 	}
-	return a, b, c, true
+	n := [3]int{}
+	for i, p := range parts {
+		x, err := strconv.Atoi(p)
+		if err != nil || x < 0 {
+			return 0, 0, 0, false
+		}
+		n[i] = x
+	}
+	return n[0], n[1], n[2], true
 }
 
 func apiError(w http.ResponseWriter, code int, errCode, message string, details ...map[string]any) {
@@ -555,11 +564,13 @@ func (cs *clusterStore) upgrade(w http.ResponseWriter, c *fakeCluster, body []by
 		apiError(w, http.StatusUnprocessableEntity, "validation_error",
 			fmt.Sprintf("cross-major upgrades are not supported (current %d.%d.%d → target %d.%d.%d)", fMaj, fMin, fPat, tMaj, tMin, tPat))
 		return
-	case tMin == fMin && tPat <= fPat, tMin < fMin:
+	case tMin == fMin && tPat <= fPat:
 		apiError(w, http.StatusUnprocessableEntity, "validation_error",
 			fmt.Sprintf("target %d.%d.%d is not newer than current %d.%d.%d", tMaj, tMin, tPat, fMaj, fMin, fPat))
 		return
-	case tMin > fMin+1:
+	case tMin != fMin+1 && tMin != fMin:
+		// Any other minor - above the next one OR below the current one - is not
+		// an incremental step (a lower minor is NOT reported as "not newer").
 		apiError(w, http.StatusUnprocessableEntity, "validation_error",
 			fmt.Sprintf("upgrades must be incremental: from %d.%d.%d, next allowed minor is %d.%d (got %d.%d)", fMaj, fMin, fPat, fMaj, fMin+1, tMaj, tMin))
 		return
