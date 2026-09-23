@@ -92,23 +92,26 @@ func (r *clusterNetworkResource) Schema(ctx context.Context, _ resource.SchemaRe
 		MarkdownDescription: "The network policy of an `aether_cluster`: which source addresses may reach its public control-plane endpoint, and the API-server connection rate limit. There is exactly one policy per cluster. " +
 			"Creating this resource OVERWRITES whatever policy the cluster has (for example one set in the portal) with the configuration; import to adopt an existing policy instead. " +
 			"Destroying this resource OPENS the cluster's public endpoint to any source address and resets the API-server rate limit to the platform default. " +
-			"The platform applies the policy asynchronously; this resource never waits for enforcement.",
+			"The platform applies the policy asynchronously; this resource never waits for enforcement. " +
+			"Do not set `create_before_destroy` on this resource: a replacement of the same cluster would run the destroy, which opens the endpoint, after the create.",
 		Attributes: map[string]schema.Attribute{
 			"id": immutableComputed("Same as `cluster_id` (the policy has no id of its own)."),
 			"cluster_id": schema.StringAttribute{Required: true,
 				MarkdownDescription: "UUID of the `aether_cluster` the policy belongs to. Changing it replaces the resource, which first OPENS the old cluster's endpoint (see the resource description).",
-				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()}},
+				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
+				Validators:          []validator.String{canonicalUUIDValidator{}}},
 			// A List, not a Set: the API stores and echoes the entries verbatim
 			// and in order, so the configured order is the truth.
 			"authorized_cidrs": schema.ListAttribute{Required: true, ElementType: types.StringType,
 				MarkdownDescription: "Source-address allowlist in CIDR notation (e.g. `203.0.113.0/24`, `198.51.100.7/32`). An empty list (`[]`) accepts connections from ANY source address; authentication still applies. " +
-					"Each entry must be an IPv4 network address (no host bits set, so `10.0.0.0/8`, not `10.0.0.1/8`) and appear only once: the API accepts IPv6, host bits and duplicates, but the platform then rejects the policy and silently keeps enforcing the previous one, so those are refused at plan time.",
+					"Each entry must be an IPv4 network address in canonical form (no host bits set and no leading zeros, so `10.0.0.0/8`, not `10.0.0.1/8` or `10.0.0.0/08`) and appear only once: the API accepts the other spellings, IPv6 and duplicates, but the platform's cluster schema accepts only IPv4 network prefixes without duplicates, so the platform would keep enforcing the previous policy; those are refused at plan time (or at apply, for an entry not known until then).",
 				Validators: []validator.List{cidrListValidator{}}},
 			// Optional and NOT Computed: absent means "the platform default",
 			// which is never sent and never echoed. Removing the block omits the
 			// key from the PUT, which clears the stored value.
 			"api_server_rate_limit": schema.SingleNestedAttribute{Optional: true,
-				MarkdownDescription: "API-server connection rate limit. Omit it for the platform default; removing it resets the limit to that default.",
+				MarkdownDescription: "API-server connection rate limit. Omit it for the platform default; removing it resets the limit to that default. " +
+					"The rate limit takes effect only when the cluster's control-plane proxy is (re)created; a running proxy keeps the limit it booted with.",
 				Attributes: map[string]schema.Attribute{
 					"max_connections_per_second": rateLimitInt64("New connections per second allowed (1-2147483647)."),
 					"burst":                      rateLimitInt64("Connections allowed in a burst above the per-second rate (1-2147483647)."),
@@ -121,16 +124,96 @@ func (r *clusterNetworkResource) Schema(ctx context.Context, _ resource.SchemaRe
 	}
 }
 
-// cidrListValidator refuses, at plan time, the authorized_cidrs entries the
-// API accepts (200) but the platform does not: anything that is not IPv4
-// CIDR notation, an address with host bits set, and duplicates. The platform
-// resource rejects such a policy and the control-plane proxy keeps enforcing
-// the OLD one while the API reports the new one - a silent divergence that
-// only a plan-time refusal prevents (measured contract §7.3).
+// canonicalUUIDValidator requires cluster_id to be canonical lower-case UUID
+// text. parseID also accepts upper case (and braces), but the API answers
+// with the canonical form, so a non-canonical value would be written by the
+// PUT and then fail with "inconsistent result after apply" - refused at plan
+// time instead, before any request.
+type canonicalUUIDValidator struct{}
+
+func (canonicalUUIDValidator) Description(context.Context) string {
+	return "must be a canonical lower-case UUID"
+}
+
+func (v canonicalUUIDValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (canonicalUUIDValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	s := req.ConfigValue.ValueString()
+	if u, err := parseID(s); err != nil || u.String() != s {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid cluster_id",
+			fmt.Sprintf("%q must be a canonical lower-case UUID (36 characters, lower-case hex and hyphens, e.g. the `id` of an `aether_cluster`).", s))
+	}
+}
+
+// cidrProblem is one refused authorized_cidrs entry.
+type cidrProblem struct {
+	index           int
+	summary, detail string
+}
+
+// checkCIDRs returns the authorized_cidrs entries the API accepts (200) but
+// the platform does not: anything that is not canonical IPv4 CIDR notation
+// for a network address, and duplicates. The platform's cluster schema
+// accepts only IPv4 network prefixes without duplicates, so such a policy is
+// expected to be rejected there while the API reports it stored, and the
+// control-plane proxy keeps enforcing the OLD one - a silent divergence
+// (measured contract §7.3). known[i] false skips entry i (unknown at plan
+// time); it is checked again at apply, when it is known.
+//
+// This is the one check behind both the plan-time validator and the
+// apply-time re-check in put().
+func checkCIDRs(entries []string, known []bool) []cidrProblem {
+	var out []cidrProblem
+	seen := map[string]int{} // canonical network -> first index
+	for i, entry := range entries {
+		if !known[i] {
+			continue
+		}
+		ip, ipnet, err := net.ParseCIDR(entry)
+		if err != nil {
+			out = append(out, cidrProblem{i, "Invalid CIDR",
+				fmt.Sprintf("%q is not in CIDR notation (address/prefix-length, e.g. 203.0.113.0/24; a single address is written 198.51.100.7/32).", entry)})
+			continue
+		}
+		// The mask length, not ip.To4(): an IPv4-mapped IPv6 prefix
+		// (::ffff:10.0.0.0/104) has a 4-byte IP but is still an IPv6 network.
+		if len(ipnet.Mask) != net.IPv4len {
+			out = append(out, cidrProblem{i, "Only IPv4 CIDRs are supported",
+				fmt.Sprintf("%q is not an IPv4 CIDR. The platform's cluster schema accepts IPv4 network prefixes only; an IPv6 entry would be stored by the API but leave the platform enforcing the previous policy.", entry)})
+			continue
+		}
+		if !ip.Equal(ipnet.IP) {
+			out = append(out, cidrProblem{i, "CIDR has host bits set",
+				fmt.Sprintf("%q has host bits set; use its network address %q instead.", entry, ipnet.String())})
+			continue
+		}
+		// ParseCIDR accepts spellings the platform's schema does not, such as
+		// a leading-zero prefix length (10.0.0.0/08).
+		if ipnet.String() != entry {
+			out = append(out, cidrProblem{i, "CIDR is not in canonical form",
+				fmt.Sprintf("%q is not in canonical form; write the network address as %q.", entry, ipnet.String())})
+			continue
+		}
+		if first, dup := seen[entry]; dup {
+			out = append(out, cidrProblem{i, "Duplicate CIDR",
+				fmt.Sprintf("%q is a duplicate of entry %d; the platform's cluster schema accepts no duplicates and the platform would keep enforcing the previous policy.", entry, first)})
+			continue
+		}
+		seen[entry] = i
+	}
+	return out
+}
+
+// cidrListValidator runs checkCIDRs at plan time, on the entries already known.
 type cidrListValidator struct{}
 
 func (cidrListValidator) Description(context.Context) string {
-	return "each entry must be an IPv4 network address in CIDR notation, and entries must be unique"
+	return "each entry must be an IPv4 network address in canonical CIDR notation, and entries must be unique"
 }
 
 func (v cidrListValidator) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
@@ -139,39 +222,15 @@ func (cidrListValidator) ValidateList(_ context.Context, req validator.ListReque
 	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
 		return
 	}
-	seen := map[string]int{} // canonical network -> first index
-	for i, e := range req.ConfigValue.Elements() {
-		s, ok := e.(types.String)
-		if !ok || s.IsNull() || s.IsUnknown() {
-			continue // an unknown entry is checked when it is known
+	elems := req.ConfigValue.Elements()
+	entries, known := make([]string, len(elems)), make([]bool, len(elems))
+	for i, e := range elems {
+		if s, ok := e.(types.String); ok && !s.IsNull() && !s.IsUnknown() {
+			entries[i], known[i] = s.ValueString(), true
 		}
-		p := req.Path.AtListIndex(i)
-		entry := s.ValueString()
-		ip, ipnet, err := net.ParseCIDR(entry)
-		if err != nil {
-			resp.Diagnostics.AddAttributeError(p, "Invalid CIDR",
-				fmt.Sprintf("%q is not in CIDR notation (address/prefix-length, e.g. 203.0.113.0/24; a single address is written 198.51.100.7/32).", entry))
-			continue
-		}
-		// The mask length, not ip.To4(): an IPv4-mapped IPv6 prefix
-		// (::ffff:10.0.0.0/104) has a 4-byte IP but is still an IPv6 network.
-		if len(ipnet.Mask) != net.IPv4len {
-			resp.Diagnostics.AddAttributeError(p, "Only IPv4 CIDRs are supported",
-				fmt.Sprintf("%q is not an IPv4 CIDR. The platform accepts IPv4 entries only; an IPv6 entry would be stored by the API but make the platform keep enforcing the previous policy.", entry))
-			continue
-		}
-		if !ip.Equal(ipnet.IP) {
-			resp.Diagnostics.AddAttributeError(p, "CIDR has host bits set",
-				fmt.Sprintf("%q has host bits set; use its network address %q instead.", entry, ipnet.String()))
-			continue
-		}
-		key := ipnet.String()
-		if first, dup := seen[key]; dup {
-			resp.Diagnostics.AddAttributeError(p, "Duplicate CIDR",
-				fmt.Sprintf("%q is a duplicate of entry %d; the platform refuses a policy with duplicate entries and would keep enforcing the previous one.", entry, first))
-			continue
-		}
-		seen[key] = i
+	}
+	for _, p := range checkCIDRs(entries, known) {
+		resp.Diagnostics.AddAttributeError(req.Path.AtListIndex(p.index), p.summary, p.detail)
 	}
 }
 
@@ -196,7 +255,7 @@ func (r *clusterNetworkResource) Create(ctx context.Context, req resource.Create
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	resp.Diagnostics.Append(r.put(ctx, &plan, "Cannot set cluster network policy")...)
+	resp.Diagnostics.Append(r.put(ctx, &plan, true)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -253,7 +312,7 @@ func (r *clusterNetworkResource) Update(ctx context.Context, req resource.Update
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	resp.Diagnostics.Append(r.put(ctx, &plan, "Cannot update cluster network policy")...)
+	resp.Diagnostics.Append(r.put(ctx, &plan, false)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -310,7 +369,7 @@ func (r *clusterNetworkResource) ImportState(ctx context.Context, req resource.I
 // put sends m as the whole policy and flattens the response into m. The
 // response IS the stored row, so it is recorded as-is: no read follows,
 // because a read could not show anything the PUT answer does not.
-func (r *clusterNetworkResource) put(ctx context.Context, m *clusterNetworkModel, summary string) diag.Diagnostics {
+func (r *clusterNetworkResource) put(ctx context.Context, m *clusterNetworkModel, creating bool) diag.Diagnostics {
 	var diags diag.Diagnostics
 	clusterID, err := parseID(m.ClusterID.ValueString())
 	if err != nil {
@@ -323,6 +382,18 @@ func (r *clusterNetworkResource) put(ctx context.Context, m *clusterNetworkModel
 	diags.Append(m.AuthorizedCidrs.ElementsAs(ctx, &body.AuthorizedCidrs, false)...)
 	if body.AuthorizedCidrs == nil {
 		body.AuthorizedCidrs = []string{}
+	}
+	// Config validators do not run again at apply, so an entry that was
+	// unknown at plan time (built from another resource's output) has not
+	// been checked yet: check the whole planned list before it is sent.
+	if !diags.HasError() {
+		known := make([]bool, len(body.AuthorizedCidrs))
+		for i := range known {
+			known[i] = true
+		}
+		for _, p := range checkCIDRs(body.AuthorizedCidrs, known) {
+			diags.AddAttributeError(path.Root("authorized_cidrs").AtListIndex(p.index), p.summary, p.detail)
+		}
 	}
 	if !m.ApiServerRateLimit.IsNull() && !m.ApiServerRateLimit.IsUnknown() {
 		var rl rateLimitModel
@@ -337,6 +408,10 @@ func (r *clusterNetworkResource) put(ctx context.Context, m *clusterNetworkModel
 	}
 	res, err := r.pd.Client.UpsertClusterNetworkWithResponse(ctx, r.pd.orgID, clusterID, body)
 	if err != nil {
+		summary := "Cannot update cluster network policy"
+		if creating {
+			summary = "Cannot set cluster network policy"
+		}
 		diags.AddError(summary, err.Error())
 		return diags
 	}
@@ -345,8 +420,14 @@ func (r *clusterNetworkResource) put(ctx context.Context, m *clusterNetworkModel
 		return diags
 	}
 	if res.JSON200 == nil {
+		// On create nothing is saved to state, so a refresh would read nothing;
+		// on update the prior state is kept and the next plan shows the diff.
+		advice := " The policy was probably written, but it is not recorded in state: apply again (the PUT is idempotent), or import the cluster's policy to adopt it."
+		if !creating {
+			advice = " The policy was probably written, but state still holds the previous policy: apply again (the PUT is idempotent)."
+		}
 		diags.AddError("Aether API accepted the cluster network policy but returned no usable body",
-			describeNonJSON(res.HTTPResponse, res.Status())+". The policy was probably written; run a refresh to record it.")
+			describeNonJSON(res.HTTPResponse, res.Status())+"."+advice)
 		return diags
 	}
 	diags.Append(flattenClusterNetwork(ctx, res.JSON200, m)...)
