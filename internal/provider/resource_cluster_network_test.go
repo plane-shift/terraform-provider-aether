@@ -301,8 +301,14 @@ func TestClusterNetworkResource_DeleteSendsExactlyEmptyCIDRsWithNoRateLimitKey(t
 // ---------------------------------------------------------------- 7
 
 // Fails if importing a cluster that was never PUT does not read back the
-// synthetic §2 default (empty list, null rate limit), or if `id` is not set
-// to the cluster id.
+// synthetic §2 default (empty list, null rate limit), if `id` is not set to
+// the cluster id, or if import itself issues any PUT (adopt-only). The PUT
+// count is asserted INSIDE ImportStateCheck, which runs right after the
+// import completes and before resource.UnitTest's own end-of-test teardown
+// destroy - that destroy PUTs the T8-1 delete body `{"authorized_cidrs":[]}`
+// for the resource ImportStatePersist just wrote into state, and counting it
+// here would wrongly fail (or wrongly pass) on a request the import itself
+// never made.
 func TestClusterNetworkResource_ImportOfANeverConfiguredClusterReadsEmptyCIDRsAndNullRateLimit(t *testing.T) {
 	api := setupFake(t)
 	cid := seedCluster(t, api, "c") // never PUT: the network row does not exist yet
@@ -327,35 +333,67 @@ func TestClusterNetworkResource_ImportOfANeverConfiguredClusterReadsEmptyCIDRsAn
 					if got := is[0].Attributes["id"]; got != cid {
 						return fmt.Errorf("imported id = %q, want the cluster id %q", got, cid)
 					}
+					if reqs := requestsMatching(api, http.MethodPut, networkRE); len(reqs) != 0 {
+						return fmt.Errorf("import must never PUT (adopt-only), got %d PUT(s) by the time the import finished: %v", len(reqs), reqs)
+					}
 					return nil
 				},
 			},
 		},
 	})
-	if reqs := requestsMatching(api, http.MethodPut, networkRE); len(reqs) != 0 {
-		t.Fatalf("import must never PUT (adopt-only), got %d PUT(s): %v", len(reqs), reqs)
-	}
 }
 
 // ---------------------------------------------------------------- 8
 
 // Fails if a 404 on Read (the CLUSTER is gone) does not remove the resource
-// from state - the next plan must then recreate it, not error or no-op.
+// from state - the next plan must then recreate it, not error or no-op. The
+// cluster is kept registered on the fake and only the network GET is forced
+// to 404 exactly once (a Handlers override that deletes itself on first use):
+// a genuinely removed cluster (api.RemoveCluster) would also make the
+// recreate's own PUT 404, so the test could never observe whether Create
+// actually succeeds after the removal - only that a PUT was attempted. This
+// still fails exactly when the brief requires: if Read treats 404 as an
+// error instead of removing the resource, the pre-apply plan/refresh errors
+// out (a genuine test failure) instead of ever reaching the plan check; if
+// Read instead leaves the resource in state (ignores the 404), the plan
+// check below sees NoOp/Update instead of Create.
 func TestClusterNetworkResource_Read404RemovesFromStateAndNextPlanRecreates(t *testing.T) {
 	api := setupFake(t)
 	cid := seedCluster(t, api, "c")
 	cfg := networkHCL(cid, []string{"10.0.0.0/24"})
+	networkGetPath := "GET /organizations/" + testOrg + "/clusters/" + cid + "/network"
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{
 			{Config: cfg},
 			{
-				PreConfig: func() { api.RemoveCluster(cid) },
-				Config:    cfg,
+				PreConfig: func() {
+					// One-shot: self-deletes on first use, so the harness' own
+					// automatic post-apply "perpetual diff" refresh (which reads
+					// this same path again right after Create) sees the freshly
+					// created row instead of tripping the same 404 a second time
+					// and wrongly wiping the just-created resource from state.
+					api.Handlers[networkGetPath] = func(w http.ResponseWriter, r *http.Request) {
+						delete(api.Handlers, networkGetPath)
+						fakeapi.WriteJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "Resource not found"}})
+					}
+				},
+				Config: cfg,
 				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
 					plancheck.ExpectResourceAction(networkResource, plancheck.ResourceActionCreate),
 				}},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(networkResource, "authorized_cidrs.#", "1"),
+					resource.TestCheckResourceAttr(networkResource, "authorized_cidrs.0", "10.0.0.0/24"),
+					func(*terraform.State) error {
+						puts := requestsMatching(api, http.MethodPut, networkRE)
+						if len(puts) != 2 {
+							return fmt.Errorf("want the original create PUT plus the recreate's PUT, got %d", len(puts))
+						}
+						return nil
+					},
+				),
 			},
 		},
 	})
