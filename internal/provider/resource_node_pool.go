@@ -272,9 +272,10 @@ func (r *nodePoolResource) Configure(_ context.Context, req resource.ConfigureRe
 //     here, after the attribute modifiers, because it reads desired_nodes'
 //     FINAL planned value (UseStateForUnknown has already run on it).
 //  2. When that rewrite (or an import's stored bounds) leaves min_nodes or
-//     max_nodes different from state, the four attributes an Update's
+//     max_nodes different from state, the five attributes an Update's
 //     PUT+re-read can move (updated_at, status, status_message,
-//     current_nodes) are marked unknown in the plan - see the comment below.
+//     current_nodes, first_ready_at) are marked unknown in the plan - see
+//     the comment below.
 //  3. Removing drain_timeout_seconds after it was set is refused: the API
 //     cannot clear it, so the plan would promise a null the API never
 //     reports. A replacement is never chosen silently instead.
