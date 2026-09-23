@@ -103,6 +103,20 @@ func (s *Server) SeedMemberWithID(org, id, email, role string) {
 	s.orgStore.members.add(org, email, role).id = id
 }
 
+// SetMemberRole changes a stored member's role out of band (no request is
+// recorded), as the portal or an owner login could. It reports whether the
+// member exists. No validation: any string is stored.
+func (s *Server) SetMemberRole(org, id, role string) bool {
+	s.orgStore.mu.Lock()
+	defer s.orgStore.mu.Unlock()
+	m, _ := s.orgStore.members.find(org, id)
+	if m == nil {
+		return false
+	}
+	m.role = role
+	return true
+}
+
 // RemoveMember deletes a membership out of band (no request is recorded).
 func (s *Server) RemoveMember(org, id string) {
 	s.orgStore.mu.Lock()
@@ -165,14 +179,20 @@ func (s *Server) routeMembers(w http.ResponseWriter, r *http.Request, path strin
 		// the same 403 (§8).
 		apiError(w, http.StatusForbidden, "token_not_permitted", "API tokens may not modify member roles — use an owner or admin login")
 	case http.MethodDelete:
+		// Find AND remove under ONE lock section: two concurrent DELETEs of
+		// the same member must yield exactly one 204 and one 404, as the real
+		// API's single DELETE ... statement does.
 		s.orgStore.mu.Lock()
-		m, _ := s.orgStore.members.find(org, mid)
+		m, i := s.orgStore.members.find(org, mid)
+		if m != nil {
+			l := s.orgStore.members.byOrg[org]
+			s.orgStore.members.byOrg[org] = append(l[:i:i], l[i+1:]...)
+		}
 		s.orgStore.mu.Unlock()
 		if m == nil {
 			apiError(w, http.StatusNotFound, "not_found", "Member not found")
 			return true
 		}
-		s.RemoveMember(org, mid)
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		apiError(w, http.StatusMethodNotAllowed, "method_not_allowed", "no route "+r.Method+" "+path)

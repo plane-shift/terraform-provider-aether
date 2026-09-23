@@ -246,3 +246,58 @@ func TestSeedMemberWithIDControlsListPosition(t *testing.T) {
 		t.Fatalf("GET seeded = %d %s", resp.StatusCode, gb)
 	}
 }
+
+// Fails if DELETE looks the member up and removes it under separate lock
+// sections: two concurrent DELETEs of one member must give exactly one 204
+// and one 404 (the real API removes with a single statement). Run repeatedly
+// so a split lock is caught; the assertion is deterministic for a correct fake.
+func TestMemberConcurrentDeletesYieldExactlyOne204AndOne404(t *testing.T) {
+	const racers = 8
+	s := newClusterFake(t)
+	for round := 0; round < 300; round++ {
+		id := s.SeedMember(testOrg, fmt.Sprintf("r%d@x.io", round), "viewer")
+		codes := make(chan int, racers)
+		start := make(chan struct{})
+		for g := 0; g < racers; g++ {
+			go func() {
+				<-start
+				req, _ := http.NewRequest(http.MethodDelete, s.URL()+"/api/v1"+membersPath+"/"+id, nil)
+				req.Header.Set("Authorization", "Bearer "+s.Token())
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					codes <- -1
+					return
+				}
+				resp.Body.Close()
+				codes <- resp.StatusCode
+			}()
+		}
+		close(start)
+		got := map[int]int{}
+		for g := 0; g < racers; g++ {
+			got[<-codes]++
+		}
+		if got[http.StatusNoContent] != 1 || got[http.StatusNotFound] != racers-1 {
+			t.Fatalf("round %d: %d concurrent DELETEs of one member gave %v, want exactly one 204 and %d 404", round, racers, got, racers-1)
+		}
+	}
+}
+
+// Fails if SetMemberRole does not change what GET and the list report, or
+// if it claims success for a missing member.
+func TestSetMemberRoleChangesTheStoredRoleOutOfBand(t *testing.T) {
+	s := newClusterFake(t)
+	id := s.SeedMember(testOrg, "a@x.io", "member")
+	if !s.SetMemberRole(testOrg, id, "owner") {
+		t.Fatal("SetMemberRole reported a missing member")
+	}
+	if _, b := call(t, s, http.MethodGet, membersPath+"/"+id, ""); decode(t, b)["role"] != "owner" {
+		t.Fatalf("GET after SetMemberRole = %s", b)
+	}
+	if s.SetMemberRole(testOrg, "00000000-0000-4000-8000-000000000000", "owner") {
+		t.Fatal("SetMemberRole claimed success for a missing member")
+	}
+	if n := len(s.Requests()); n != 1 {
+		t.Fatalf("SetMemberRole recorded requests: %d total, want only the one GET", n)
+	}
+}

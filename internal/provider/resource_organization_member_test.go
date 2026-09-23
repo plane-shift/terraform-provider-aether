@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -583,4 +584,318 @@ func TestMemberResource_Read403IsAnErrorAndKeepsState(t *testing.T) {
 			},
 		},
 	})
+}
+
+// ---------------------------------------------------------------- review r1 (M-3, I-1, M-4)
+
+// destroyStepRefreshGets is how many GETs of a member the harness itself makes
+// during ONE destroy/apply step BEFORE the provider's Delete runs: the plan's
+// refresh and the apply's refresh. Measured against plugin-testing v1.16.0
+// (request log of a create-then-destroy run: two GET /members/{id} between the
+// PreConfig hook and the DELETE). A GET beyond this count therefore comes from
+// Delete itself - the guard's own live re-read - which is what the scripted
+// handlers below exploit to tell the two apart. If a plugin-testing upgrade
+// changes the count these tests fail loudly (the refresh would see the
+// guard-only answer), they do not pass vacuously.
+const destroyStepRefreshGets = 2
+
+// scriptedMemberGet answers successive GETs of one member from roles: a role
+// name serves that role, "404" serves a 404. The last entry repeats. It
+// replaces the fake's own answer, so the script can differ from what the
+// fake (and the seeded list) really holds.
+func scriptedMemberGet(api *fakeapi.Server, id, email string, roles ...string) {
+	var mu sync.Mutex
+	n := 0
+	api.Handlers["GET /organizations/"+testOrg+"/members/"+id] = func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		i := min(n, len(roles)-1)
+		n++
+		mu.Unlock()
+		if roles[i] == "404" {
+			fakeapi.WriteJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "Member not found"}})
+			return
+		}
+		fakeapi.WriteJSON(w, http.StatusOK, map[string]any{"id": id, "org_id": testOrg, "email": email, "role": roles[i], "created_at": "2026-09-23T00:00:01Z"})
+	}
+}
+
+const (
+	memberListRoute = "GET /organizations/" + testOrg + "/members"
+	otherMemberID   = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+)
+
+func listPage(cursor string) map[string]any {
+	page := map[string]any{"items": []map[string]any{{"id": otherMemberID, "org_id": testOrg, "email": "viewer@example.com", "role": "viewer", "created_at": "2026-09-23T00:00:02Z"}}}
+	if cursor != "" {
+		page["next_cursor"] = cursor
+	}
+	return page
+}
+
+// createSoleOwner is step 1 of the guard-path tests: one owner, the only one.
+func createSoleOwner(api *fakeapi.Server, idOut *string) resource.TestStep {
+	return resource.TestStep{
+		Config: memberHCL("solo@example.com", "owner"),
+		Check: func(s *terraform.State) error {
+			*idOut = s.RootModule().Resources[memberResource].Primary.Attributes["id"]
+			return nil
+		},
+	}
+}
+
+// recoverStep clears the overrides, adds a second owner so the harness'
+// teardown destroy passes the guard, and asserts the refused destroy sent no DELETE
+// and left the member in the fake.
+func recoverStep(t *testing.T, api *fakeapi.Server, id string) resource.TestStep {
+	return resource.TestStep{
+		PreConfig: func() {
+			delete(api.Handlers, memberListRoute)
+			delete(api.Handlers, "GET /organizations/"+testOrg+"/members/"+id)
+			if d := requestsMatching(api, http.MethodDelete, `.*`); len(d) != 0 {
+				t.Errorf("a DELETE was sent although the guard refused/failed: %v", d)
+			}
+			api.SeedMember(testOrg, "second-owner@example.com", "owner")
+		},
+		Config: memberHCL("solo@example.com", "owner"), PlanOnly: true, ExpectNonEmptyPlan: false,
+	}
+}
+
+// M-3(a). Fails if a 404 on the guard's own live re-read is turned into a
+// refusal or into a DELETE: the member is already gone, so destroy must
+// succeed and send no DELETE. The refresh sees the owner (so Delete runs);
+// only the guard's re-read sees the 404.
+func TestMemberResource_GuardTreatsALiveReReadOf404AsAlreadyGone(t *testing.T) {
+	api := setupFake(t)
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			createSoleOwner(api, &id),
+			{
+				PreConfig: func() {
+					roles := make([]string, 0, destroyStepRefreshGets+1)
+					for i := 0; i < destroyStepRefreshGets; i++ {
+						roles = append(roles, "owner")
+					}
+					scriptedMemberGet(api, id, "solo@example.com", append(roles, "404")...)
+				},
+				Config: providerOnlyHCL,
+				Check: resource.ComposeTestCheckFunc(
+					checkAbsentFromState(memberResource),
+					func(*terraform.State) error {
+						if d := requestsMatching(api, http.MethodDelete, `.*`); len(d) != 0 {
+							return fmt.Errorf("DELETE sent for an already-gone member: %v", d)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// M-3(b). Fails if a member that is missing from the COMPLETE list (yet was
+// readable a moment ago) is refused or DELETEd: it is already gone.
+func TestMemberResource_GuardTreatsAMemberMissingFromTheListAsAlreadyGone(t *testing.T) {
+	api := setupFake(t)
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			createSoleOwner(api, &id),
+			{
+				PreConfig: func() {
+					api.Handlers[memberListRoute] = func(w http.ResponseWriter, r *http.Request) {
+						fakeapi.WriteJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{}})
+					}
+				},
+				Config: providerOnlyHCL,
+				Check: resource.ComposeTestCheckFunc(
+					checkAbsentFromState(memberResource),
+					func(*terraform.State) error {
+						if d := requestsMatching(api, http.MethodDelete, `.*`); len(d) != 0 {
+							return fmt.Errorf("DELETE sent for a member absent from the list: %v", d)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// M-3(c). Fails if a failing member list is swallowed (DELETE anyway, or
+// reported as success): the guard cannot prove another owner exists, so it must
+// error and send no DELETE.
+func TestMemberResource_GuardListFailureIsAnErrorWithNoDelete(t *testing.T) {
+	api := setupFake(t)
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			createSoleOwner(api, &id),
+			{
+				PreConfig: func() {
+					api.Handlers[memberListRoute] = func(w http.ResponseWriter, r *http.Request) {
+						fakeapi.WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "internal_error", "message": "list exploded"}})
+					}
+				},
+				Config:      providerOnlyHCL,
+				ExpectError: loose("list exploded"),
+			},
+			recoverStep(t, api, id),
+		},
+	})
+}
+
+// M-3(d1). Fails if a next_cursor that is not a UUID is followed blindly or
+// ignored (a DELETE would follow): the guard must error, after one list call.
+func TestMemberResource_GuardUnparseableCursorIsAnErrorWithNoDelete(t *testing.T) {
+	api := setupFake(t)
+	var id string
+	calls := 0
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			createSoleOwner(api, &id),
+			{
+				PreConfig: func() {
+					api.Handlers[memberListRoute] = func(w http.ResponseWriter, r *http.Request) {
+						calls++
+						fakeapi.WriteJSON(w, http.StatusOK, listPage("not-a-uuid"))
+					}
+				},
+				Config:      providerOnlyHCL,
+				ExpectError: regexp.MustCompile(`(?is)cursor`),
+			},
+			recoverStep(t, api, id),
+		},
+	})
+	if calls != 1 {
+		t.Fatalf("list called %d times, want 1 (an unusable cursor ends the guard)", calls)
+	}
+}
+
+// M-3(d2). Fails if a cursor that never advances (the same next_cursor forever)
+// makes the guard loop: it must stop (error) within a few calls. The fake
+// answers 500 from the 4th call on, so a runaway loop ends the test with a
+// failure instead of hanging it.
+func TestMemberResource_GuardNonAdvancingCursorDoesNotLoop(t *testing.T) {
+	api := setupFake(t)
+	var id string
+	var mu sync.Mutex
+	calls := 0
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			createSoleOwner(api, &id),
+			{
+				PreConfig: func() {
+					api.Handlers[memberListRoute] = func(w http.ResponseWriter, r *http.Request) {
+						mu.Lock()
+						calls++
+						n := calls
+						mu.Unlock()
+						if n > 3 {
+							fakeapi.WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "internal_error", "message": "runaway list"}})
+							return
+						}
+						fakeapi.WriteJSON(w, http.StatusOK, listPage("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"))
+					}
+				},
+				Config:      providerOnlyHCL,
+				ExpectError: regexp.MustCompile(`(?s).`),
+			},
+			recoverStep(t, api, id),
+		},
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if calls > 3 {
+		t.Fatalf("list called %d times for a cursor that never advances, want <= 3 (a bounded guard)", calls)
+	}
+}
+
+// I-1. Fails if the guard trusts the ROLE IN STATE instead of re-reading the
+// member: the refresh (the harness' two GETs) is scripted to report `member`
+// while the fake - and every later GET - says `owner` (the only owner). Only
+// a Delete that re-reads the live member sees the owner and refuses. Mechanism:
+// GETs 1..destroyStepRefreshGets come from the harness' refresh and are the
+// only ones that can reach state; the (n+1)th GET can only be Delete's own.
+// The refusal must come with zero DELETEs.
+func TestMemberResource_GuardReadsTheLiveRoleNotTheRoleInState(t *testing.T) {
+	api := setupFake(t)
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				Config: memberHCL("solo@example.com", "member"),
+				Check: func(s *terraform.State) error {
+					id = s.RootModule().Resources[memberResource].Primary.Attributes["id"]
+					return nil
+				},
+			},
+			{
+				PreConfig: func() {
+					if !api.SetMemberRole(testOrg, id, "owner") { // out of band: now the only owner
+						t.Errorf("member %s missing from the fake", id)
+					}
+					roles := make([]string, 0, destroyStepRefreshGets+1)
+					for i := 0; i < destroyStepRefreshGets; i++ {
+						roles = append(roles, "member") // what the refresh writes into state
+					}
+					scriptedMemberGet(api, id, "solo@example.com", append(roles, "owner")...)
+				},
+				Config:      providerOnlyHCL,
+				ExpectError: loose("refusing to remove the last owner"),
+			},
+			{
+				PreConfig: func() {
+					delete(api.Handlers, "GET /organizations/"+testOrg+"/members/"+id)
+					if d := requestsMatching(api, http.MethodDelete, `.*`); len(d) != 0 {
+						t.Errorf("a DELETE was sent for the live last owner: %v", d)
+					}
+					api.SeedMember(testOrg, "second-owner@example.com", "owner")
+				},
+				Config: memberHCL("solo@example.com", "owner"), PlanOnly: true, ExpectNonEmptyPlan: false,
+			},
+		},
+	})
+}
+
+// M-4. Fails if a malformed or non-canonical membership id is accepted by
+// import (the API would then be asked about it) or refused with another text.
+func TestMemberResource_ImportWithAMalformedIDIsRefusedWithZeroMemberCalls(t *testing.T) {
+	for name, mk := range map[string]func(realID string) string{
+		"not a uuid":   func(string) string { return "not-a-uuid" },
+		"upper case":   strings.ToUpper,
+		"braced":       func(id string) string { return "{" + id + "}" },
+		"missing dash": func(id string) string { return strings.ReplaceAll(id, "-", "") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := setupFake(t)
+			bad := mk(api.SeedMember(testOrg, "imp@example.com", "viewer"))
+			resource.UnitTest(t, resource.TestCase{
+				IsUnitTest:               true,
+				ProtoV6ProviderFactories: factories(),
+				Steps: []resource.TestStep{{
+					ResourceName: memberResource, ImportState: true,
+					Config: memberHCL("imp@example.com", "viewer"), ImportStateId: bad,
+					ExpectError: loose("Invalid import id"),
+				}},
+			})
+			for _, r := range api.Requests() {
+				if strings.Contains(r.Path, "/members") {
+					t.Fatalf("import id %q reached the members API: %s %s", bad, r.Method, r.Path)
+				}
+			}
+		})
+	}
 }

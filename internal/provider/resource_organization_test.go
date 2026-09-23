@@ -448,6 +448,11 @@ func TestOrganizationResource_Read403IsAnErrorAndKeepsState(t *testing.T) {
 
 // ---------------------------------------------------------------- 10
 
+// NOTE (review r1 M-7): this exercises a FAKE-ONLY path. The real API answers
+// 403 - never 404 - to GET /organizations/{id} for any id other than the
+// token's own, foreign or unknown alike (contract §1). The 404 branch of Read
+// is defensive code the plan asks for (T9-8); do not cite this test as
+// evidence about API behaviour.
 // Fails if a 404 on Read leaves the resource in state (the plan would be
 // empty) or is turned into an error (the step would fail outright). A
 // permanent 404 route is safe here because the step is PlanOnly and the
