@@ -589,15 +589,18 @@ func TestMemberResource_Read403IsAnErrorAndKeepsState(t *testing.T) {
 // ---------------------------------------------------------------- review r1 (M-3, I-1, M-4)
 
 // destroyStepRefreshGets is how many GETs of a member the harness itself makes
-// during ONE destroy/apply step BEFORE the provider's Delete runs: the plan's
-// refresh and the apply's refresh. Measured against plugin-testing v1.16.0
-// (request log of a create-then-destroy run: two GET /members/{id} between the
-// PreConfig hook and the DELETE). A GET beyond this count therefore comes from
+// during ONE destroy/apply step BEFORE the provider's Delete runs: only the
+// plan process' refresh - the saved plan is applied WITHOUT another refresh.
+// Re-measured (review r1b) on terraform 1.5.7 AND tofu 1.12.6 with
+// plugin-testing v1.16.0, request log after the PreConfig hook: GET org list,
+// GET /members/{id} (refresh), GET org list (apply's Configure), GET
+// /members/{id} (Delete's own re-read), GET /members (guard list), DELETE. (An
+// earlier reading of two refresh GETs mistook Delete's re-read for a refresh.) A GET beyond this count therefore comes from
 // Delete itself - the guard's own live re-read - which is what the scripted
 // handlers below exploit to tell the two apart. If a plugin-testing upgrade
 // changes the count these tests fail loudly (the refresh would see the
 // guard-only answer), they do not pass vacuously.
-const destroyStepRefreshGets = 2
+const destroyStepRefreshGets = 1
 
 // scriptedMemberGet answers successive GETs of one member from roles: a role
 // name serves that role, "404" serves a 404. The last entry repeats. It
@@ -857,6 +860,11 @@ func TestMemberResource_GuardReadsTheLiveRoleNotTheRoleInState(t *testing.T) {
 				ExpectError: loose("refusing to remove the last owner"),
 			},
 			{
+				// An APPLY step, not PlanOnly: step 2's refresh wrote the
+				// scripted role=member into state, so a PlanOnly check (which also
+				// plans with -refresh=false) would always see a replace against
+				// role=owner. The apply refreshes first (the real fake says owner),
+				// finds no diff, and leaves state matching for the teardown.
 				PreConfig: func() {
 					delete(api.Handlers, "GET /organizations/"+testOrg+"/members/"+id)
 					if d := requestsMatching(api, http.MethodDelete, `.*`); len(d) != 0 {
@@ -864,7 +872,10 @@ func TestMemberResource_GuardReadsTheLiveRoleNotTheRoleInState(t *testing.T) {
 					}
 					api.SeedMember(testOrg, "second-owner@example.com", "owner")
 				},
-				Config: memberHCL("solo@example.com", "owner"), PlanOnly: true, ExpectNonEmptyPlan: false,
+				Config: memberHCL("solo@example.com", "owner"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectEmptyPlan(),
+				}},
 			},
 		},
 	})
