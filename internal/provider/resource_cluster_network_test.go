@@ -21,9 +21,10 @@ import (
 // These tests drive aether_cluster_network through a real terraform (or tofu)
 // binary against the in-process fake, which reproduces what aether-api DOES
 // (see fakeapi/networks.go and the SDD task-8 measured contract).
-// internal/provider/resource_cluster_network.go landed in 333f06e; most tests
-// here are GREEN. Two are deliberately RED, pending the coder's round-1 fix
-// (task-8-review-r1.md M-1/M-2) - marked at their definition.
+// internal/provider/resource_cluster_network.go landed in 333f06e, and the
+// r1 fixes (task-8-review-r1.md M-1/M-2) landed in a256239: every test in
+// this file is GREEN except one, deliberately RED pending the coder's round-3
+// fix (task-8-review-r2.md NEW-1) - marked at its definition.
 //
 // There is no wait/convergence signal anywhere in this API (contract §7), so
 // every test here runs at plan/apply speed with no polling and needs no
@@ -665,21 +666,20 @@ func TestClusterNetworkResource_CreateSurfacesAPUTErrorAndLeavesNoState(t *testi
 	})
 }
 
-// ---------------------------------------------------------------- r1 RED (task-8-review-r1.md M-1, M-2)
+// ---------------------------------------------------------------- r1 fixes (task-8-review-r1.md M-1, M-2) - GREEN since a256239
 //
-// Both tests below are EXPECTED RED until the coder lands the corresponding
-// fix. Message substrings are coordinated with the coder via
-// task-8-tests-report.md: M-1's fix must produce an error containing
-// "must be a canonical lower-case UUID" (exact substring); M-2's message is
-// left to the coder's choice among the concepts already in use on this
-// validator (canonical / network address / host bits).
+// Message substrings were coordinated with the coder via
+// task-8-tests-report.md: M-1's fix produces an error containing
+// "must be a canonical lower-case UUID" (exact substring, matched below);
+// M-2's message was left to the coder's choice among the concepts already in
+// use on this validator (canonical / network address / host bits).
 
-// M-1: a non-canonical cluster_id (upper case) must be refused at PLAN time,
-// with zero network-route HTTP calls. Today parseID accepts it and flatten
-// silently overwrites ClusterID with the canonical form AFTER a real PUT has
-// already happened ("Provider produced inconsistent result after apply",
-// task-8-review-r1.md M-1) - this test is RED until a plan-time
-// canonical-UUID validator is added to cluster_id.
+// M-1: a non-canonical cluster_id (upper case) is refused at PLAN time, with
+// zero network-route HTTP calls. Before a256239, parseID accepted it and
+// flatten silently overwrote ClusterID with the canonical form AFTER a real
+// PUT had already happened ("Provider produced inconsistent result after
+// apply", task-8-review-r1.md M-1); a256239 added canonicalUUIDValidator on
+// cluster_id, which this test now confirms fires before any request.
 func TestClusterNetworkResource_UpperCaseClusterIDIsRefusedAtPlanWithZeroCalls(t *testing.T) {
 	api := setupFake(t)
 	cid := seedCluster(t, api, "c")
@@ -701,12 +701,13 @@ func TestClusterNetworkResource_UpperCaseClusterIDIsRefusedAtPlanWithZeroCalls(t
 }
 
 // M-2: `10.0.0.0/08` parses successfully (go1.26.5 net.ParseCIDR accepts a
-// leading-zero prefix length) and has no host bits set, so today's validator
-// accepts it - but the platform CRD's prefix-length pattern
-// `([0-9]|[12][0-9]|3[0-2])$` does not match "08", so the merge patch is
-// refused and the CP-proxy silently keeps enforcing the OLD policy (contract
-// §7.3): exactly the divergence this validator exists to prevent. RED until
-// the coder requires the canonical string form (`ipnet.String() == entry`).
+// leading-zero prefix length) and has no host bits set, so the validator
+// would otherwise accept it - but the platform's cluster schema prefix-length
+// pattern `([0-9]|[12][0-9]|3[0-2])$` does not match "08", so the merge patch
+// is expected to be refused there and the CP-proxy would keep enforcing the
+// OLD policy (contract §7.3): exactly the divergence this validator exists to
+// prevent. a256239 added the canonical-string-form check (`ipnet.String() ==
+// entry`) this test confirms.
 func TestClusterNetworkResource_NonCanonicalPrefixLengthIsRefusedAtPlanWithZeroCalls(t *testing.T) {
 	const neverSeededCluster = "11111111-1111-4111-8111-111111111111"
 	api := setupFake(t)
@@ -723,5 +724,52 @@ func TestClusterNetworkResource_NonCanonicalPrefixLengthIsRefusedAtPlanWithZeroC
 	}
 	if reqs := requestsMatching(api, http.MethodPut, networkRE); len(reqs) != 0 {
 		t.Fatalf("a non-canonical prefix length reached the API with a PUT: %v", reqs)
+	}
+}
+
+// ---------------------------------------------------------------- r3 (task-8-review-r2.md M-3)
+
+// M-3. `${substr(timestamp(), 0, 0)}10.0.0.0/08` plans as `(known after apply)` - timestamp() is a
+// built-in Terraform marks unknown at plan on both engines regardless of its arguments, and
+// substr(...) of an unknown value is itself unknown - while the LIST stays known (only the one
+// element is unknown), so the plan-time cidrListValidator skips this entry at the INITIAL plan (it
+// only checks entries already known, resource_cluster_network.go:227-231). At apply the expression
+// resolves to the literal "10.0.0.0/08" - the same non-canonical-prefix-length defect as M-2 - so
+// this asserts the SAME "canonical form" error is still refused, with zero requests reaching the API.
+//
+// What this test actually proves (measured, not assumed - see task-8-tests-report.md for the full
+// record): it is Terraform CORE's own apply-time behaviour that catches this, not put()'s manual
+// apply-time re-check (resource_cluster_network.go:386-397). Terraform re-invokes the provider's
+// ValidateResourceConfig (and PlanResourceChange) against the now-resolved config as part of its own
+// "plan for apply" step, for ANY attribute that was unknown at the initial plan and becomes known
+// before apply - this is standard core behaviour for cross-resource and function-derived unknowns
+// alike, not something specific to this provider or to timestamp(). Confirmed two ways: (1) the
+// failure surfaces as "Error running apply", never "Error running pre-apply plan" - proving the
+// value was genuinely unknown through the initial plan and only re-checked once resolved; (2)
+// deleting put()'s entire apply-time CIDR-recheck block (the `if !diags.HasError() { ... checkCIDRs
+// ... } ` at :389-397) and rebuilding left this test GREEN, unchanged - cidrListValidator alone,
+// re-invoked by core, still refuses the value before any request. put()'s own recheck is real
+// defense-in-depth (it also protects a hypothetical direct API-client caller of this Go package, and
+// costs nothing), but this test cannot and does not isolate it - no test can, since core's
+// re-validation is unconditional for this HCL shape. This is why NEW-1 (an equivalent apply-time
+// bounds recheck proposed for the rate limit) was rejected rather than written: the identical
+// mechanism already re-invokes int64validator.Between on the resolved value, so no HCL scenario
+// reaches put() with a bad rate limit either, and a test for a fix that cannot fail is forbidden.
+func TestClusterNetworkResource_ApplyTimeCIDRRecheckRefusesAnEntryUnknownAtPlan(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      networkHCL(cid, []string{`${substr(timestamp(), 0, 0)}10.0.0.0/08`}),
+			ExpectError: regexp.MustCompile(`(?is)canonical form`),
+		}},
+	})
+	if reqs := requestsMatching(api, http.MethodGet, networkRE); len(reqs) != 0 {
+		t.Fatalf("an initially-unknown CIDR defect reached the API with a GET: %v", reqs)
+	}
+	if reqs := requestsMatching(api, http.MethodPut, networkRE); len(reqs) != 0 {
+		t.Fatalf("an initially-unknown CIDR defect reached the API with a PUT: %v", reqs)
 	}
 }
