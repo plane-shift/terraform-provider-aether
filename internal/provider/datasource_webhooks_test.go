@@ -1,10 +1,7 @@
 package provider_test
 
-// Tests for the aether_webhooks data source (not yet implemented -
-// datasource_webhooks.go, T14-2). Until NewWebhooksDataSource is registered
-// in provider.go's DataSources(), every test here fails at plan time with
-// "Invalid Data Source Type" (see datasource_organization_members_test.go's
-// header comment for the full explanation).
+// Tests for the aether_webhooks data source (datasource_webhooks.go, T14-2),
+// registered as NewWebhooksDataSource in provider.go's DataSources().
 
 import (
 	"fmt"

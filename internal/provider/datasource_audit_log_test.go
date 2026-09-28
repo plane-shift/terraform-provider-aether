@@ -1,10 +1,7 @@
 package provider_test
 
-// Tests for the aether_audit_log data source (not yet implemented -
-// datasource_audit_log.go, T14-8). Until NewAuditLogDataSource is registered
-// in provider.go's DataSources(), every test here fails at plan time with
-// "Invalid Data Source Type" (see datasource_organization_members_test.go's
-// header comment).
+// Tests for the aether_audit_log data source (datasource_audit_log.go, T14-8),
+// registered as NewAuditLogDataSource in provider.go's DataSources().
 
 import (
 	"fmt"
@@ -51,6 +48,7 @@ func TestAuditLogDataSource_OnePageNewestFirstCompactMetadata(t *testing.T) {
 		Steps: []resource.TestStep{{
 			Config: auditLogHCL("limit = 7"),
 			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr(auditLogDataSource, "limit", "7"),
 				resource.TestCheckResourceAttr(auditLogDataSource, "events.#", "7"),
 				resource.TestCheckResourceAttr(auditLogDataSource, "events.0.id", lastID),
 				resource.TestCheckResourceAttr(auditLogDataSource, "events.0.action", "action-09"),
@@ -129,7 +127,12 @@ func TestAuditLogDataSource_LimitZeroIsPlanError(t *testing.T) {
 	})
 }
 
-// Fails if `limit` omitted does not default to 50 (T14-8).
+// Fails if `limit` omitted does not default to 50 (T14-8), if the effective
+// value 50 is not written into state (review r1 M-3: an Optional+Computed
+// attribute must echo what it actually used, not just leave the config null),
+// or if the request itself did not carry limit=50 (M-3's remaining gap - this
+// test would also pass if the provider sent no limit at all and the fake's
+// own default happened to be 50, unless the query is checked directly).
 func TestAuditLogDataSource_LimitDefaultsToFifty(t *testing.T) {
 	api := setupFake(t)
 	for i := 0; i < 60; i++ {
@@ -141,7 +144,18 @@ func TestAuditLogDataSource_LimitDefaultsToFifty(t *testing.T) {
 		Steps: []resource.TestStep{{
 			Config: auditLogHCL(),
 			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr(auditLogDataSource, "limit", "50"),
 				resource.TestCheckResourceAttr(auditLogDataSource, "events.#", "50"),
+				func(*terraform.State) error {
+					gets := requestsMatching(api, http.MethodGet, `/audit-log$`)
+					if len(gets) != 1 {
+						return fmt.Errorf("GET /audit-log calls = %d, want exactly 1", len(gets))
+					}
+					if !hasQueryPair(gets[0].Query, "limit", "50") {
+						return fmt.Errorf("GET query = %q, want limit=50", gets[0].Query)
+					}
+					return nil
+				},
 			),
 		}},
 	})

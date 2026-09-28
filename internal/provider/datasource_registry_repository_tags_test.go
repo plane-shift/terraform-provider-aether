@@ -10,6 +10,7 @@ package provider_test
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,16 +36,24 @@ const tagsDataSource = "data.aether_registry_repository_tags.t"
 // vulnerabilities object when the artifact was never scanned (distinct from
 // an all-zero one), null pushed_at/pulled_at when absent, an untagged item's
 // empty name, or the final ORDER (digest, then name - T14-5).
+//
+// The scanned tag at digest "ccc" carries five DISTINCT non-zero counts
+// (review r1 I-1: an all-zero seed cannot catch low/unknown being dropped or
+// hard-coded to 0, nor a field swap such as low<-medium - each of the five
+// is asserted individually against its own value).
 func TestRegistryRepositoryTagsDataSource_ReadAllAttributesSorted(t *testing.T) {
 	api := setupFake(t)
 	pushed := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	pulled := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
 	// digest "aaa" untagged (name "", not scanned) sorts before digest "bbb"
-	// v2 (scanned, zero findings) which sorts before digest "bbb" v1 - proves
-	// the sort is (digest, name), not insertion order or name alone.
+	// v2 (scanned, zero findings) which sorts before digest "bbb" v1, which
+	// sorts before digest "ccc" (scanned, distinct non-zero findings) -
+	// proves the sort is (digest, name), not insertion order or name alone.
 	api.SeedTag(testOrg, "app", "", "sha256:aaa", 10, nil, nil, true, nil)
 	api.SeedTag(testOrg, "app", "v1", "sha256:bbb", 20, &pushed, &pulled, false, &fakeapi.Vulnerabilities{})
 	api.SeedTag(testOrg, "app", "a-earlier", "sha256:bbb", 20, &pushed, &pulled, false, nil)
+	api.SeedTag(testOrg, "app", "v2", "sha256:ccc", 30, &pushed, &pulled, false,
+		&fakeapi.Vulnerabilities{Critical: 1, High: 2, Medium: 3, Low: 4, Unknown: 5})
 
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
@@ -52,7 +61,7 @@ func TestRegistryRepositoryTagsDataSource_ReadAllAttributesSorted(t *testing.T) 
 		Steps: []resource.TestStep{{
 			Config: tagsHCL("app"),
 			Check: resource.ComposeTestCheckFunc(
-				resource.TestCheckResourceAttr(tagsDataSource, "tags.#", "3"),
+				resource.TestCheckResourceAttr(tagsDataSource, "tags.#", "4"),
 				resource.TestCheckResourceAttr(tagsDataSource, "tags.0.digest", "sha256:aaa"),
 				resource.TestCheckResourceAttr(tagsDataSource, "tags.0.name", ""),
 				resource.TestCheckResourceAttr(tagsDataSource, "tags.0.untagged", "true"),
@@ -71,6 +80,13 @@ func TestRegistryRepositoryTagsDataSource_ReadAllAttributesSorted(t *testing.T) 
 				resource.TestCheckResourceAttr(tagsDataSource, "tags.2.vulnerabilities.medium", "0"),
 				resource.TestCheckResourceAttr(tagsDataSource, "tags.2.vulnerabilities.low", "0"),
 				resource.TestCheckResourceAttr(tagsDataSource, "tags.2.vulnerabilities.unknown", "0"),
+				resource.TestCheckResourceAttr(tagsDataSource, "tags.3.digest", "sha256:ccc"),
+				resource.TestCheckResourceAttr(tagsDataSource, "tags.3.name", "v2"),
+				resource.TestCheckResourceAttr(tagsDataSource, "tags.3.vulnerabilities.critical", "1"),
+				resource.TestCheckResourceAttr(tagsDataSource, "tags.3.vulnerabilities.high", "2"),
+				resource.TestCheckResourceAttr(tagsDataSource, "tags.3.vulnerabilities.medium", "3"),
+				resource.TestCheckResourceAttr(tagsDataSource, "tags.3.vulnerabilities.low", "4"),
+				resource.TestCheckResourceAttr(tagsDataSource, "tags.3.vulnerabilities.unknown", "5"),
 			),
 		}},
 	})
@@ -118,16 +134,27 @@ func TestRegistryRepositoryTagsDataSource_NestedNameEscapedOnce(t *testing.T) {
 // wantEscapedNestedSegment reports whether raw contains the single-escaped
 // segment "team%2Fapp" and NOT the double-escaped "team%252Fapp".
 func wantEscapedNestedSegment(raw string) bool {
-	return containsSubstr(raw, "team%2Fapp") && !containsSubstr(raw, "team%252Fapp")
+	return strings.Contains(raw, "team%2Fapp") && !strings.Contains(raw, "team%252Fapp")
 }
 
-func containsSubstr(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
+// T14-15 (RED until Task 13's collectAll fix lands here at rebase - see
+// task-14-tests-report.md "Fix round 1"): the tags route shares the same
+// Harbor-page collectAll pager as repositories (TestRegistryRepositories
+// DataSource_RepeatedCursorErrors); a server that repeats next_cursor must
+// be an error here too, not a silently truncated list (ruling T14-15, review
+// r1 M-1).
+func TestRegistryRepositoryTagsDataSource_RepeatedCursorErrors(t *testing.T) {
+	api := setupFake(t)
+	api.SeedTag(testOrg, "app", "v1", "sha256:aaa", 10, nil, nil, false, nil)
+	api.SetRepeatingHarborCursor(testOrg, "2")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      tagsHCL("app"),
+			ExpectError: loose("repeated"),
+		}},
+	})
 }
 
 // TG3. A missing repository (or a never-enabled registry, indistinguishable

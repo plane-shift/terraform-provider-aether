@@ -1,10 +1,7 @@
 package provider_test
 
-// Tests for the aether_invoices data source (not yet implemented -
-// datasource_invoices.go, T14-11). Until NewInvoicesDataSource is registered
-// in provider.go's DataSources(), every test here fails at plan time with
-// "Invalid Data Source Type" (see datasource_organization_members_test.go's
-// header comment).
+// Tests for the aether_invoices data source (datasource_invoices.go, T14-11),
+// registered as NewInvoicesDataSource in provider.go's DataSources().
 
 import (
 	"fmt"

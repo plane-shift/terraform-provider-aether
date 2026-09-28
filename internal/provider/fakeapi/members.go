@@ -58,6 +58,12 @@ type fakeMember struct {
 type memberStore struct {
 	byOrg map[string][]*fakeMember
 	seq   int
+
+	// forceCursor, keyed by org, when present makes the member list report
+	// this value as next_cursor on EVERY page, even an incomplete one,
+	// overriding the normal "full page only" rule - see
+	// SetRepeatingMemberCursor.
+	forceCursor map[string]string
 }
 
 func (ms *memberStore) add(org, email, role string) *fakeMember {
@@ -125,6 +131,23 @@ func (s *Server) RemoveMember(org, id string) {
 		l := s.orgStore.members.byOrg[org]
 		s.orgStore.members.byOrg[org] = append(l[:i:i], l[i+1:]...)
 	}
+}
+
+// SetRepeatingMemberCursor forces the aether_organization_members list to
+// report cursor as next_cursor on EVERY page for org, regardless of whether
+// the page is full - a fake server contract violation used to prove the
+// data source's collectAll pager (a consumer distinct from the Harbor-page
+// pager in repositories.go) fails loud on a repeated cursor instead of
+// silently truncating the list (ruling T14-15, review r1 M-1). cursor must
+// be a UUID the caller controls (e.g. a SeedMemberWithID id), since
+// nextUUIDCursor parses next_cursor as one.
+func (s *Server) SetRepeatingMemberCursor(org, cursor string) {
+	s.orgStore.mu.Lock()
+	defer s.orgStore.mu.Unlock()
+	if s.orgStore.members.forceCursor == nil {
+		s.orgStore.members.forceCursor = map[string]string{}
+	}
+	s.orgStore.members.forceCursor[org] = cursor
 }
 
 // MemberRoles returns email -> role for the org, for assertions on what the
@@ -245,6 +268,7 @@ func (s *Server) listMembers(w http.ResponseWriter, r *http.Request, org string)
 	cursor := r.URL.Query().Get("cursor")
 	s.orgStore.mu.Lock()
 	all := append([]*fakeMember(nil), s.orgStore.members.byOrg[org]...)
+	forced, forcedOK := s.orgStore.members.forceCursor[org]
 	s.orgStore.mu.Unlock()
 	sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
 	items := []map[string]any{}
@@ -260,7 +284,9 @@ func (s *Server) listMembers(w http.ResponseWriter, r *http.Request, org string)
 		last = m.id
 	}
 	out := map[string]any{"items": items}
-	if len(items) == limit {
+	if forcedOK {
+		out["next_cursor"] = forced
+	} else if len(items) == limit {
 		out["next_cursor"] = last
 	}
 	writeJSON(w, http.StatusOK, out)

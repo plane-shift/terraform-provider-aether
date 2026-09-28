@@ -105,6 +105,26 @@ func TestRegistryRepositoriesDataSource_NeverEnabledErrors(t *testing.T) {
 	})
 }
 
+// T14-15 (RED until Task 13's collectAll fix lands here at rebase - see
+// task-14-tests-report.md "Fix round 1"): a Harbor page pager that answers
+// the SAME next_cursor on every page is a broken server contract. Today
+// collectAll stops SILENTLY on an unchanged cursor (paging.go:15), so this
+// read succeeds with a truncated list; ruling T14-15 (review r1 M-1) says it
+// must error instead.
+func TestRegistryRepositoriesDataSource_RepeatedCursorErrors(t *testing.T) {
+	api := setupFake(t)
+	api.SeedRepository(testOrg, "app", 1, 10, nil)
+	api.SetRepeatingHarborCursor(testOrg, "2")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      repositoriesDSHCL,
+			ExpectError: loose("repeated"),
+		}},
+	})
+}
+
 // RP3. A registry disabled without purge still serves its retained images -
 // no error, the list is exactly what was seeded before the disable.
 func TestRegistryRepositoriesDataSource_DisabledWithoutPurgeStillLists(t *testing.T) {

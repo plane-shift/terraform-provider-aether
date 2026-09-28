@@ -108,6 +108,12 @@ type repositoryStore struct {
 	// multi-page pagination with a small seed. 0/absent = no cap beyond the
 	// caller's own limit (the contract's "no upper cap" default, §1).
 	pageCap map[string]int
+
+	// forceCursor, keyed by org, when present makes BOTH the repositories
+	// list and the tags list report this value as next_cursor on EVERY page,
+	// overriding whatever the normal Harbor-page arithmetic would compute -
+	// a fake server contract violation (see SetRepeatingHarborCursor).
+	forceCursor map[string]string
 }
 
 func (rp *repositoryStore) init() {
@@ -122,6 +128,9 @@ func (rp *repositoryStore) init() {
 	}
 	if rp.pageCap == nil {
 		rp.pageCap = map[string]int{}
+	}
+	if rp.forceCursor == nil {
+		rp.forceCursor = map[string]string{}
 	}
 }
 
@@ -185,6 +194,24 @@ func (s *Server) SetHarborPageCap(org string, n int) {
 		return
 	}
 	rp.pageCap[org] = n
+}
+
+// SetRepeatingHarborCursor forces every registry repositories/tags page
+// org's routes serve to report cursor as next_cursor forever - INCLUDING
+// past the point where the seeded list is exhausted - regardless of what the
+// normal Harbor-page arithmetic would compute. This models a broken Harbor
+// page contract (the exact fake behaviour SDD task-14-review-r1.md's M-1
+// names: "a fake or server that always answers next_cursor:\"2\"") so a
+// provider-level test can prove the collectAll pager used by
+// aether_registry_repositories and aether_registry_repository_tags (ruling
+// T14-15) fails loud on a repeated cursor instead of silently truncating the
+// list.
+func (s *Server) SetRepeatingHarborCursor(org, cursor string) {
+	rp := &s.repositories
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	rp.init()
+	rp.forceCursor[org] = cursor
 }
 
 // ---------------------------------------------------------------- rendering + paging
@@ -302,6 +329,7 @@ func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request, org st
 	exists := rp.everExisted[org]
 	all := append([]*fakeRepository(nil), rp.repos[org]...)
 	pageCap := rp.pageCap[org]
+	forced, forcedOK := rp.forceCursor[org]
 	rp.mu.Unlock()
 	if !exists {
 		apiError(w, http.StatusBadGateway, "harbor_error", "list repos")
@@ -309,6 +337,9 @@ func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request, org st
 	}
 	limit := harborLimit(r.URL.Query().Get("limit"))
 	items, next := harborPage(all, repositoryJSON, r.URL.Query().Get("cursor"), limit, pageCap)
+	if forcedOK {
+		next = forced
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": next})
 }
 
@@ -323,6 +354,7 @@ func (s *Server) listRepositoryTags(w http.ResponseWriter, r *http.Request, org,
 	all, ok := rp.tags[org][repoName]
 	allCopy := append([]*fakeTag(nil), all...)
 	pageCap := rp.pageCap[org]
+	forced, forcedOK := rp.forceCursor[org]
 	rp.mu.Unlock()
 	if !ok {
 		apiError(w, http.StatusNotFound, "not_found", "Resource not found")
@@ -330,5 +362,8 @@ func (s *Server) listRepositoryTags(w http.ResponseWriter, r *http.Request, org,
 	}
 	limit := harborLimit(r.URL.Query().Get("limit"))
 	items, next := harborPage(allCopy, tagJSON, r.URL.Query().Get("cursor"), limit, pageCap)
+	if forcedOK {
+		next = forced
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": next})
 }

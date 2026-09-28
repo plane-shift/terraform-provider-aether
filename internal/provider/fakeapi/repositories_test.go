@@ -155,6 +155,29 @@ func TestRepositoriesListPagesByCursorAndStopsOnEmptyNextCursor(t *testing.T) {
 	}
 }
 
+// SetRepeatingHarborCursor (ruling T14-15 support): the forced cursor is
+// served as next_cursor even PAST the point where the 1-item seeded list
+// would naturally end ("" ), and again identically on the following page -
+// the "always answers next_cursor:\"2\"" fake behaviour a provider-level
+// test uses to prove the pager fails loud on a repeated cursor.
+func TestRepositoriesListRepeatingCursorIsForcedPastNaturalEnd(t *testing.T) {
+	s := newClusterFake(t)
+	s.SeedRepository(testOrg, "app", 1, 10, nil)
+	s.SetRepeatingHarborCursor(testOrg, "2")
+
+	_, b1 := call(t, s, http.MethodGet, repositoriesPath, "")
+	m1 := decode(t, b1)
+	if m1["next_cursor"] != "2" {
+		t.Fatalf("page1 next_cursor = %v, want the forced \"2\" even though a 1-item list would naturally end here", m1["next_cursor"])
+	}
+
+	_, b2 := call(t, s, http.MethodGet, repositoriesPath+"?cursor=2", "")
+	m2 := decode(t, b2)
+	if m2["next_cursor"] != "2" {
+		t.Fatalf("page2 next_cursor = %v, want the forced \"2\" again (repeating, not \"\")", m2["next_cursor"])
+	}
+}
+
 // D5: tags_count is honestly the ARTIFACT count (whatever the seed says),
 // distinct from an item count - not re-derived from anything else.
 func TestRepositoriesListTagsCountIsArtifactCountVerbatim(t *testing.T) {

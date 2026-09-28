@@ -51,6 +51,28 @@ func TestOrganizationMembersDataSource_ReadAllAttributes(t *testing.T) {
 	})
 }
 
+// T14-15 (RED until Task 13's collectAll fix lands here at rebase - see
+// task-14-tests-report.md "Fix round 1"): the members data source is a
+// collectAll consumer distinct from the Harbor-page pager (compare
+// TestRegistryRepositoriesDataSource_RepeatedCursorErrors). Today collectAll
+// stops SILENTLY on an unchanged cursor (paging.go:15), so this read
+// succeeds with a truncated list; ruling T14-15 (review r1 M-1) says it must
+// error instead.
+func TestOrganizationMembersDataSource_RepeatedCursorErrors(t *testing.T) {
+	api := setupFake(t)
+	const cursor = "11111111-1111-4111-8111-111111111111"
+	api.SeedMemberWithID(testOrg, cursor, "member@example.com", "viewer")
+	api.SetRepeatingMemberCursor(testOrg, cursor)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      membersDSHCL,
+			ExpectError: loose("repeated"),
+		}},
+	})
+}
+
 // MB1. Fails if the data source does not walk every page of a >100-member
 // organization (collectAll with limit=100, T14-1): asserts exactly 2 GET
 // requests were made, the first with limit=100 and no cursor, and that all

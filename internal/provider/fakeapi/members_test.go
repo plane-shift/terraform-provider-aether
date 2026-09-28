@@ -247,6 +247,24 @@ func TestSeedMemberWithIDControlsListPosition(t *testing.T) {
 	}
 }
 
+// SetRepeatingMemberCursor (ruling T14-15 support): the forced cursor is
+// served as next_cursor even on an INCOMPLETE page (one member, limit=100),
+// where the normal rule would omit next_cursor entirely - the "always
+// answers the same next_cursor" fake behaviour a provider-level test uses to
+// prove the members data source's collectAll pager fails loud on a repeated
+// cursor.
+func TestMemberListRepeatingCursorOverridesFullPageRule(t *testing.T) {
+	s := newClusterFake(t)
+	const forced = "11111111-1111-4111-8111-111111111111"
+	s.SeedMember(testOrg, "solo@x.io", "viewer")
+	s.SetRepeatingMemberCursor(testOrg, forced)
+	_, b := call(t, s, http.MethodGet, membersPath+"?limit=100", "")
+	m := decode(t, b)
+	if m["next_cursor"] != forced {
+		t.Fatalf("next_cursor = %v, want the forced %q even though the one-member page is far from full", m["next_cursor"], forced)
+	}
+}
+
 // Fails if DELETE looks the member up and removes it under separate lock
 // sections: two concurrent DELETEs of one member must give exactly one 204
 // and one 404 (the real API removes with a single statement). Run repeatedly

@@ -1,10 +1,7 @@
 package provider_test
 
-// Tests for the aether_usage data source (not yet implemented -
-// datasource_usage.go, T14-9). Until NewUsageDataSource is registered in
-// provider.go's DataSources(), every test here fails at plan time with
-// "Invalid Data Source Type" (see datasource_organization_members_test.go's
-// header comment).
+// Tests for the aether_usage data source (datasource_usage.go, T14-9),
+// registered as NewUsageDataSource in provider.go's DataSources().
 
 import (
 	"testing"

@@ -1,10 +1,8 @@
 package provider_test
 
-// Tests for the aether_cost_breakdown data source (not yet implemented -
-// datasource_cost_breakdown.go, T14-10). Until NewCostBreakdownDataSource is
-// registered in provider.go's DataSources(), every test here fails at plan
-// time with "Invalid Data Source Type" (see
-// datasource_organization_members_test.go's header comment).
+// Tests for the aether_cost_breakdown data source
+// (datasource_cost_breakdown.go, T14-10), registered as
+// NewCostBreakdownDataSource in provider.go's DataSources().
 
 import (
 	"testing"

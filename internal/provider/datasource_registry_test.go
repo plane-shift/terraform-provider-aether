@@ -1,10 +1,7 @@
 package provider_test
 
-// Tests for the aether_registry data source (not yet implemented -
-// datasource_registry.go, T14-3). Until NewRegistryDataSource is registered
-// in provider.go's DataSources(), every test here fails at plan time with
-// "Invalid Data Source Type" (see datasource_organization_members_test.go's
-// header comment).
+// Tests for the aether_registry data source (datasource_registry.go, T14-3),
+// registered as NewRegistryDataSource in provider.go's DataSources().
 
 import (
 	"testing"
@@ -47,7 +44,14 @@ func TestRegistryDataSource_DisabledIsFalseAndNullsNoError(t *testing.T) {
 func TestRegistryDataSource_EnabledReadsAllFields(t *testing.T) {
 	api := setupFake(t)
 	enabled := rawEnableRegistry(t, api, testOrg)
-	regID := enabled["registry"].(map[string]any)["id"].(string)
+	regMap, ok := enabled["registry"].(map[string]any)
+	if !ok {
+		t.Fatalf("enable response has no \"registry\" object: %v", enabled)
+	}
+	regID, ok := regMap["id"].(string)
+	if !ok {
+		t.Fatalf("registry.id is not a string: %v", regMap)
+	}
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
