@@ -50,6 +50,7 @@ type Server struct {
 	orgStore    orgStore      // see organizations.go + members.go; own lock
 	webhooks    webhookStore  // see webhooks.go; own lock
 	registries  registryStore // see registry.go; own lock
+	budgets     budgetStore   // see budgets.go; own lock
 	// Handlers lets a test override a route: key "METHOD /path" (path after /api/v1).
 	Handlers map[string]http.HandlerFunc
 }
@@ -162,6 +163,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		// served by webhooks.go
 	case s.routeRegistry(w, r, path, body):
 		// served by registry.go
+	case s.routeBudget(w, r, path, body):
+		// served by budgets.go
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "no route " + r.Method + " " + path}})
 	}
