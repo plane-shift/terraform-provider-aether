@@ -78,10 +78,10 @@ func (r *registryResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				MarkdownDescription: "Storage quota in GB; informational; not enforced by the platform today.",
 				PlanModifiers:       []planmodifier.Int64{int64planmodifier.UseStateForUnknown()}},
 			"robot_username": schema.StringAttribute{Computed: true,
-				MarkdownDescription: "The default robot's `docker login` username. Known only from the enable call; import/adopt leaves them null (`robot_username` and `robot_secret`).",
+				MarkdownDescription: "The default robot's `docker login` username. Known only from the enable call; import/adopt leaves them null (`robot_username` and `robot_secret`), and a refresh nulls them (with a warning) when the registry was disabled and re-enabled outside Terraform.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
 			"robot_secret": schema.StringAttribute{Computed: true, Sensitive: true,
-				MarkdownDescription: "The default robot's secret. Known only from the enable call; import/adopt leaves them null (`robot_username` and `robot_secret`). Credentials rotate in the portal, not through this resource.",
+				MarkdownDescription: "The default robot's secret. Known only from the enable call; import/adopt leaves them null (`robot_username` and `robot_secret`), and a refresh nulls them (with a warning) when the registry was disabled and re-enabled outside Terraform. Credentials rotate in the portal, not through this resource.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
 			// State-only: read by Delete, never sent anywhere else, so an
 			// in-place change makes zero API calls (T11-3).
@@ -119,8 +119,12 @@ func (r *registryResource) Create(ctx context.Context, req resource.CreateReques
 	switch res.StatusCode() {
 	case http.StatusCreated:
 		if res.JSON201 == nil || res.JSON201.Registry.Id == "" {
+			what := describeNonJSON(res.HTTPResponse, res.Status())
+			if res.JSON201 != nil {
+				what = describeJSONWithout(res.HTTPResponse, res.Status(), "registry id")
+			}
 			resp.Diagnostics.AddError("Aether API enabled the registry but returned no usable body",
-				describeNonJSON(res.HTTPResponse, res.Status())+". The registry was probably enabled, but its credentials are lost: import it (`robot_username`/`robot_secret` stay null) and rotate the credentials in the portal.")
+				what+". The registry was probably enabled, but its credentials are lost: import it (`robot_username`/`robot_secret` stay null) and rotate the credentials in the portal.")
 			return
 		}
 		flattenRegistry(&res.JSON201.Registry, &plan)
@@ -158,7 +162,10 @@ func (r *registryResource) Create(ctx context.Context, req resource.CreateReques
 // Read refreshes the registry. A disabled registry (the API answers 200
 // {"enabled":false}, never 404) is removed from state. robot_username,
 // robot_secret and purge_on_destroy are never returned by GET and are carried
-// from prior state.
+// from prior state - EXCEPT when the registry id changed (T11-18, amends
+// T11-2): a disable + re-enable outside Terraform deleted the default robot
+// and minted a new one under a new registry row, so the carried credentials
+// are revoked. They are nulled (the import/adopt shape) with a warning.
 func (r *registryResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state registryModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -173,6 +180,14 @@ func (r *registryResource) Read(ctx context.Context, req resource.ReadRequest, r
 	if !enabled {
 		resp.State.RemoveResource(ctx)
 		return
+	}
+	if !state.ID.IsNull() && state.ID.ValueString() != reg.Id {
+		state.RobotUsername = types.StringNull()
+		state.RobotSecret = types.StringNull()
+		resp.Diagnostics.AddWarning("Registry was re-enabled outside Terraform",
+			fmt.Sprintf("The registry id changed from %q to %q: the registry was disabled and re-enabled outside Terraform, which deleted the default robot and minted a new one. "+
+				"The enable-time credentials are no longer known, so `robot_username` and `robot_secret` are now null — re-import or re-enable through Terraform to obtain new ones, or rotate them in the portal.",
+				state.ID.ValueString(), reg.Id))
 	}
 	flattenRegistry(reg, &state)
 	if state.PurgeOnDestroy.IsNull() {
@@ -271,7 +286,9 @@ func (r *registryResource) get(ctx context.Context) (*client.Registry, bool, dia
 		return nil, false, diags
 	}
 	if reg.Id == "" {
-		// enabled=true without an id is neither shape the API sends.
+		// enabled=true without an id is neither shape the API sends. An
+		// error, not a removal (T11-20): a removal would plan a POST that
+		// 409s, and failing loudly on an unknown shape is the contract.
 		diags.AddError("Aether API returned an unreadable registry",
 			fmt.Sprintf("GET %s answered enabled=true without a registry id.", g.HTTPResponse.Request.URL))
 		return nil, false, diags
@@ -280,7 +297,8 @@ func (r *registryResource) get(ctx context.Context) (*client.Registry, bool, dia
 }
 
 // flattenRegistry copies an API registry into the model. The credentials and
-// purge_on_destroy are never touched: GET does not return them.
+// purge_on_destroy are not touched here: GET does not return them (Read nulls
+// the credentials itself when the registry id changed, T11-18).
 func flattenRegistry(reg *client.Registry, m *registryModel) {
 	m.ID = types.StringValue(reg.Id)
 	m.HarborProject = types.StringValue(reg.HarborProject)
@@ -289,4 +307,23 @@ func flattenRegistry(reg *client.Registry, m *registryModel) {
 	m.QuotaGB = types.Int64Value(int64(reg.QuotaGb))
 	m.CreatedAt = types.StringValue(reg.CreatedAt.Format(time.RFC3339))
 	m.UpdatedAt = types.StringValue(reg.UpdatedAt.Format(time.RFC3339))
+}
+
+// describeJSONWithout describes a success answer that WAS decoded as JSON but
+// lacks the field that makes it usable (m-5). describeNonJSON is for bodies
+// that are not JSON at all; using it here would say "not JSON" about a JSON
+// body.
+func describeJSONWithout(hr *http.Response, status, missing string) string {
+	return fmt.Sprintf("%s %s returned %s with content type %q: JSON without a usable %s",
+		hr.Request.Method, hr.Request.URL, status, hr.Header.Get("Content-Type"), missing)
+}
+
+// describeUndecodable picks the message for a body the provider decoded
+// itself with json.Unmarshal: decodeErr != nil → the body is not (valid)
+// JSON; otherwise it was JSON but lacked missing.
+func describeUndecodable(hr *http.Response, status string, decodeErr error, missing string) string {
+	if decodeErr != nil {
+		return fmt.Sprintf("%s (%s)", describeNonJSON(hr, status), decodeErr)
+	}
+	return describeJSONWithout(hr, status, missing)
 }

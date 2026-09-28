@@ -307,7 +307,7 @@ func (r *cleanupPolicyResource) Create(ctx context.Context, req resource.CreateR
 	var created cleanupPolicyWire
 	if err := json.Unmarshal(res.Body, &created); err != nil || created.ID == "" {
 		resp.Diagnostics.AddError("Aether API created the cleanup policy but returned no usable body",
-			describeNonJSON(res.HTTPResponse, res.Status())+" (or no id). The policy was probably created but is not recorded in state: delete it through the API or the portal, or import it by its id.")
+			describeUndecodable(res.HTTPResponse, res.Status(), err, "id")+". The policy was probably created but is not recorded in state: delete it through the API or the portal, or import it by its id.")
 		return
 	}
 	resp.Diagnostics.Append(flattenCleanupPolicy(ctx, &created, &plan)...)
@@ -373,7 +373,7 @@ func (r *cleanupPolicyResource) Update(ctx context.Context, req resource.UpdateR
 	var updated cleanupPolicyWire
 	if err := json.Unmarshal(res.Body, &updated); err != nil || updated.ID == "" {
 		resp.Diagnostics.AddError("Aether API accepted the cleanup policy update but returned no usable body",
-			describeNonJSON(res.HTTPResponse, res.Status())+" (or no id). The update was probably applied, but state still holds the previous values: apply again (the update is idempotent).")
+			describeUndecodable(res.HTTPResponse, res.Status(), err, "id")+". The update was probably applied, but state still holds the previous values: apply again (the update is idempotent).")
 		return
 	}
 	resp.Diagnostics.Append(flattenCleanupPolicy(ctx, &updated, &plan)...)
@@ -443,7 +443,7 @@ func (r *cleanupPolicyResource) find(ctx context.Context, id string) (*cleanupPo
 		Items *[]cleanupPolicyWire `json:"items"`
 	}
 	if err := json.Unmarshal(res.Body, &list); err != nil || list.Items == nil {
-		diags.AddError("Aether API returned no usable cleanup policy list", describeNonJSON(res.HTTPResponse, res.Status()))
+		diags.AddError("Aether API returned no usable cleanup policy list", describeUndecodable(res.HTTPResponse, res.Status(), err, "items"))
 		return nil, diags
 	}
 	for i := range *list.Items {

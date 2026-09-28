@@ -30,10 +30,6 @@ var (
 	_ resource.ResourceWithImportState = &robotAccountResource{}
 )
 
-// robotPageSize is the API's fixed robot-list page size (contract §6): a
-// page shorter than this is the last one. `?limit` is ignored by the API.
-const robotPageSize = 50
-
 // robotPermissions is the create path's whole vocabulary (contract §6).
 var robotPermissions = []string{"push", "pull", "delete"}
 
@@ -145,7 +141,7 @@ func (r *robotAccountResource) Create(ctx context.Context, req resource.CreateRe
 	var created robotAccountWire
 	if err := json.Unmarshal(res.Body, &created); err != nil || created.ID == "" || created.Token == nil {
 		resp.Diagnostics.AddError("Aether API created the robot account but returned no usable body",
-			describeNonJSON(res.HTTPResponse, res.Status())+" (or no id or secret). The robot account was probably created, but it is not recorded in state and its secret is lost: delete it through the API or the portal and apply again.")
+			describeUndecodable(res.HTTPResponse, res.Status(), err, "id or secret")+". The robot account was probably created, but it is not recorded in state and its secret is lost: delete it through the API or the portal and apply again.")
 		return
 	}
 	resp.Diagnostics.Append(flattenRobot(ctx, &created, &plan)...)
@@ -153,7 +149,7 @@ func (r *robotAccountResource) Create(ctx context.Context, req resource.CreateRe
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
-// Read pages the robot list for the id (T11-7). Absent → removed from state.
+// Read pages the robot list for the id (T11-7, T11-19). Absent → removed from state.
 // The secret is never listed and is carried from prior state.
 func (r *robotAccountResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state robotAccountModel
@@ -243,10 +239,13 @@ func (r *robotAccountResource) ImportState(ctx context.Context, req resource.Imp
 }
 
 // find pages GET /robot-accounts (the only read path, contract §6) until it
-// finds id or reaches a short page. The API returns no next_cursor; its
-// undocumented `?cursor=<last id>` is added through a RequestEditorFn because
-// the generated call takes no parameters. A nil result with no diagnostics
-// means the robot does not exist.
+// finds id or reaches an EMPTY page (T11-19). The page size (50 today,
+// `?limit` ignored) is deliberately not assumed: a short page is not treated
+// as the last one, so a smaller page size can never make Read drop a live
+// robot from state - the cost is one extra GET when the robot is absent. The
+// API returns no next_cursor; its undocumented `?cursor=<last id>` is added
+// through a RequestEditorFn because the generated call takes no parameters.
+// A nil result with no diagnostics means the robot does not exist.
 func (r *robotAccountResource) find(ctx context.Context, id string) (*robotAccountWire, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	cursor := ""
@@ -274,7 +273,7 @@ func (r *robotAccountResource) find(ctx context.Context, id string) (*robotAccou
 			Items *[]robotAccountWire `json:"items"`
 		}
 		if err := json.Unmarshal(res.Body, &page); err != nil || page.Items == nil {
-			diags.AddError("Aether API returned no usable robot account list", describeNonJSON(res.HTTPResponse, res.Status()))
+			diags.AddError("Aether API returned no usable robot account list", describeUndecodable(res.HTTPResponse, res.Status(), err, "items"))
 			return nil, diags
 		}
 		items := *page.Items
@@ -283,14 +282,16 @@ func (r *robotAccountResource) find(ctx context.Context, id string) (*robotAccou
 				return &items[i], diags
 			}
 		}
-		if len(items) < robotPageSize {
+		if len(items) == 0 {
 			return nil, diags
 		}
 		next := items[len(items)-1].ID
-		if next == cursor {
-			// A full page that does not advance would loop forever.
+		if next <= cursor {
+			// The list is ORDER BY id over canonical lower-case UUIDs, so the
+			// cursor must strictly advance; a page that repeats or goes back
+			// would loop forever (T11-19).
 			diags.AddError("Aether API returned an unusable robot account list",
-				fmt.Sprintf("Paging with cursor %q returned the same page again.", cursor))
+				fmt.Sprintf("Paging with cursor %q returned a page ending at %q, which does not advance past the cursor.", cursor, next))
 			return nil, diags
 		}
 		cursor = next
