@@ -278,10 +278,25 @@ func (p *aetherProvider) Resources(context.Context) []func() resource.Resource {
 }
 
 func (p *aetherProvider) DataSources(context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{NewOrganizationDataSource, NewRegionsDataSource, NewK8sVersionsDataSource,
+	return []func() datasource.DataSource{
+		// Task 13 — cluster-scoped
+		NewOrganizationDataSource, NewRegionsDataSource, NewK8sVersionsDataSource,
 		NewClusterDataSource, NewClustersDataSource, NewNodePoolDataSource, NewNodePoolsDataSource,
 		NewNodePoolMachinesDataSource, NewClusterNetworkDataSource, NewKubeconfigDataSource,
-		NewLoadBalancersDataSource, NewClusterVolumesDataSource}
+		NewLoadBalancersDataSource, NewClusterVolumesDataSource,
+		// Task 14 — organization / registry / billing
+		NewOrganizationMembersDataSource,
+		NewWebhooksDataSource,
+		NewRegistryDataSource,
+		NewRegistryRepositoriesDataSource,
+		NewRegistryRepositoryTagsDataSource,
+		NewRegistryRobotAccountsDataSource,
+		NewRegistryCleanupPoliciesDataSource,
+		NewAuditLogDataSource,
+		NewUsageDataSource,
+		NewCostBreakdownDataSource,
+		NewInvoicesDataSource,
+	}
 }
 
 // endpointIsSafe reports whether the token may be sent to this endpoint.
