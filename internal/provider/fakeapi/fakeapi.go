@@ -26,6 +26,13 @@ type Org struct {
 type Request struct {
 	Method, Path string
 	Body         []byte
+	// Query is the request's raw query string (no leading "?", "" when there
+	// is none). Routing itself never looks at this field - only r.URL.Path
+	// (CutPrefix above) - so it exists purely for a test to assert on a
+	// PROVIDER-sent query parameter (registry robot-account paging's
+	// `?cursor=`, the registry disable's `?purge=`) that the recorded Path
+	// alone cannot show.
+	Query string
 }
 
 type Server struct {
@@ -37,11 +44,12 @@ type Server struct {
 	orgs        []Org
 	requests    []Request
 	bodyReadErr error
-	clusters    clusterStore // see clusters.go; own lock
-	pools       poolStore    // see nodepools.go; own lock
-	networks    networkStore // see networks.go; own lock
-	orgStore    orgStore     // see organizations.go + members.go; own lock
-	webhooks    webhookStore // see webhooks.go; own lock
+	clusters    clusterStore  // see clusters.go; own lock
+	pools       poolStore     // see nodepools.go; own lock
+	networks    networkStore  // see networks.go; own lock
+	orgStore    orgStore      // see organizations.go + members.go; own lock
+	webhooks    webhookStore  // see webhooks.go; own lock
+	registries  registryStore // see registry.go; own lock
 	// Handlers lets a test override a route: key "METHOD /path" (path after /api/v1).
 	Handlers map[string]http.HandlerFunc
 }
@@ -118,7 +126,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		body = b
 	}
 	s.mu.Lock()
-	s.requests = append(s.requests, Request{Method: r.Method, Path: path, Body: body})
+	s.requests = append(s.requests, Request{Method: r.Method, Path: path, Body: body, Query: r.URL.RawQuery})
 	h := s.Handlers[r.Method+" "+path]
 	s.mu.Unlock()
 	if h != nil {
@@ -152,6 +160,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		// served by clusters.go
 	case s.routeWebhooks(w, r, path, body):
 		// served by webhooks.go
+	case s.routeRegistry(w, r, path, body):
+		// served by registry.go
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "no route " + r.Method + " " + path}})
 	}
