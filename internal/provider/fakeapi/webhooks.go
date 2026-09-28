@@ -112,6 +112,17 @@ type webhookFailure struct {
 	code, message string
 }
 
+// webhookFailureKind selects which one-shot override map consumeFailure reads
+// - passed instead of the map itself (review r1 M-3), so the map field is
+// only ever dereferenced AFTER ws.mu is held, matching how FailNextWebhookPUT/
+// Rotate write it.
+type webhookFailureKind int
+
+const (
+	failNextPUTKind webhookFailureKind = iota
+	failNextRotateKind
+)
+
 // webhookStore is embedded by value in Server; its zero value is usable.
 type webhookStore struct {
 	mu    sync.Mutex
@@ -259,10 +270,17 @@ func (s *Server) FailNextWebhookRotate(org string, status int, code, message str
 }
 
 // consumeFailure pops (and clears) an armed override for org, or reports none
-// armed. Reading from a nil map is safe in Go, so no init is needed here.
-func (ws *webhookStore) consumeFailure(m map[string]*webhookFailure, org string) *webhookFailure {
+// armed. kind picks the map AFTER ws.mu is taken (review r1 M-3): reading
+// from a nil map is safe in Go, so no init is needed, but the map FIELD
+// itself must not be read outside the lock that FailNextWebhookPUT/Rotate
+// write it under.
+func (ws *webhookStore) consumeFailure(kind webhookFailureKind, org string) *webhookFailure {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+	m := ws.failNextPUT
+	if kind == failNextRotateKind {
+		m = ws.failNextRotate
+	}
 	f, ok := m[org]
 	if !ok {
 		return nil
@@ -382,7 +400,7 @@ func validateWebhookURL(raw string) map[string]any {
 	if u.Scheme != "https" {
 		return detail("url", "invalid", "url must use https")
 	}
-	if u.Host == "" {
+	if u.Hostname() == "" { // matches the API's ssrf.go check (review r1 N-2a), not u.Host: "https://:8443/" has a Host but no Hostname
 		return detail("url", "invalid", "url must have a host")
 	}
 	if u.User != nil {
@@ -432,7 +450,7 @@ func (s *Server) createWebhook(w http.ResponseWriter, org string, body []byte) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	ws.init()
-	if len(ws.byOrg[org]) >= webhookCap { // disabled webhooks count too (§2) - none can exist yet, every create yields enabled:true
+	if len(ws.byOrg[org]) >= webhookCap { // disabled webhooks count too (§2) - a webhook is created enabled, but a later PUT can disable it, and it still counts against the cap (review r1 N-3)
 		apiError(w, http.StatusConflict, "webhook_limit", "Webhook limit reached for this organization")
 		return
 	}
@@ -466,7 +484,7 @@ func (s *Server) getWebhook(w http.ResponseWriter, org, id string) {
 // putWebhook is PUT /organizations/{org}/webhooks/{id}, a COALESCE partial
 // merge (§5).
 func (s *Server) putWebhook(w http.ResponseWriter, org, id string, body []byte) {
-	if f := s.webhooks.consumeFailure(s.webhooks.failNextPUT, org); f != nil {
+	if f := s.webhooks.consumeFailure(failNextPUTKind, org); f != nil {
 		apiError(w, f.status, f.code, f.message)
 		return
 	}
@@ -482,24 +500,26 @@ func (s *Server) putWebhook(w http.ResponseWriter, org, id string, body []byte) 
 		apiError(w, http.StatusBadRequest, "bad_request", "Invalid JSON body")
 		return
 	}
-	var details []map[string]any
-	if req.URL != nil {
-		if d := validateWebhookURL(*req.URL); d != nil {
-			details = append(details, d)
-		}
-	}
+	// Events validated BEFORE url, and only ONE detail is ever returned - the
+	// first failing step (review r1 N-2b, matching aether-api webhook.go's
+	// real order, contract §5), not both accumulated.
 	if req.Events != nil {
 		if len(*req.Events) == 0 {
 			// A DIFFERENT message from create's "At least one event is
 			// required" (§5) - deliberately not shared with the create path.
-			details = append(details, detail("events", "invalid", "at least one event type is required"))
-		} else if d := validateWebhookEvents(*req.Events); d != nil {
-			details = append(details, d)
+			validationError(w, []map[string]any{detail("events", "invalid", "at least one event type is required")})
+			return
+		}
+		if d := validateWebhookEvents(*req.Events); d != nil {
+			validationError(w, []map[string]any{d})
+			return
 		}
 	}
-	if details != nil {
-		validationError(w, details)
-		return
+	if req.URL != nil {
+		if d := validateWebhookURL(*req.URL); d != nil {
+			validationError(w, []map[string]any{d})
+			return
+		}
 	}
 
 	ws := &s.webhooks
@@ -530,7 +550,7 @@ func (s *Server) putWebhook(w http.ResponseWriter, org, id string, body []byte) 
 // rotateWebhookSecret is POST /organizations/{org}/webhooks/{id}/rotate-secret
 // (§6): no body, always a brand new secret, allowed on a disabled webhook.
 func (s *Server) rotateWebhookSecret(w http.ResponseWriter, org, id string) {
-	if f := s.webhooks.consumeFailure(s.webhooks.failNextRotate, org); f != nil {
+	if f := s.webhooks.consumeFailure(failNextRotateKind, org); f != nil {
 		apiError(w, f.status, f.code, f.message)
 		return
 	}

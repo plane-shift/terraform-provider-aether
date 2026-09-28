@@ -8,22 +8,23 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/fakeapi"
 )
 
-// These tests drive aether_webhook through a real terraform (or tofu) binary
-// against the in-process fake (fakeapi/webhooks.go), under the controller
-// rulings T10-0..T10-11 of task-10-brief-amended.md. The resource
-// (internal/provider/resource_webhook.go) does not exist yet: every test here
-// is expected to fail with "Invalid resource type" until the coder adds it
-// and registers it in provider.go's Resources(). That is the RED of this
-// task's TDD cycle - see task-10-tests-report.md for how each test can also
-// fail against a WRONG implementation, once one exists.
-//
-// Symbols the coder provides: NewWebhookResource (type name aether_webhook),
-// registered in provider.go.
+// These tests drive aether_webhook (internal/provider/resource_webhook.go,
+// registered in provider.go's Resources() as NewWebhookResource) through a
+// real terraform (or tofu) binary against the in-process fake
+// (fakeapi/webhooks.go), under the controller rulings T10-0..T10-14 of
+// task-10-brief-amended.md. Tests 1-18 are the amended brief's numbered
+// list (see the numbered section markers below); the two after them fix
+// review r1 findings I-1 and M-2 - see task-10-tests-report.md for the
+// per-test rationale and the review fix-round sections for what each one
+// added and why.
 
 const (
 	webhookResource = "aether_webhook.w"
@@ -192,9 +193,11 @@ func TestWebhookResource_CreateDisabledPostsThenPutsExactBody(t *testing.T) {
 // Fails if a failed disabling PUT is rolled back with a DELETE (T10-3
 // forbids "delete-and-fail": the secret would be lost with no way to import
 // the orphaned webhook back), if the created webhook's id is not saved into
-// state (proven here by the id surviving into the NEXT apply's replace,
-// which needs a real id to send a DELETE for), or if Terraform does not
-// taint the resource so the next apply replaces it.
+// state (proven twice: directly, by a RefreshState step reading the SAVED
+// state right after the error - review r1 M-1 - and again by the id
+// surviving into the NEXT apply's replace, which needs a real id to send a
+// DELETE for), or if Terraform does not taint the resource so the next apply
+// replaces it.
 func TestWebhookResource_CreateDisabledWhenThePUTFailsSavesStateAndTaints(t *testing.T) {
 	api := setupFake(t)
 	// T10-12: NOT a 5xx. PUT is idempotent (internal/provider/transport/retry.go
@@ -209,6 +212,25 @@ func TestWebhookResource_CreateDisabledWhenThePUTFailsSavesStateAndTaints(t *tes
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{
 			{Config: cfg, ExpectError: loose("disable failed")},
+			{
+				// M-1: RefreshState just re-reads the SAVED state (Read, no PUT/
+				// rotate) - the only way to see what the errored Create actually
+				// wrote, before the recovering apply below can overwrite it. The
+				// config still asks for enabled=false while the real (and saved)
+				// state is enabled=true, so the post-refresh plan is non-empty.
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check: func(s *terraform.State) error {
+					a := attrs(s, webhookResource)
+					if a["enabled"] != "true" {
+						return fmt.Errorf("saved enabled = %q, want %q (the 201's value, T10-3 - the disable never applied)", a["enabled"], "true")
+					}
+					if !webhookSecretRE.MatchString(a["secret"]) {
+						return fmt.Errorf("saved secret = %q, want the 201's whsec_-shaped value", a["secret"])
+					}
+					return nil
+				},
+			},
 			{
 				PreConfig: func() {
 					if d := requestsMatching(api, http.MethodDelete, webhookOneRE); len(d) != 0 {
@@ -271,7 +293,9 @@ func TestWebhookResource_CreateWithRotateSecretSetCallsNoRotate(t *testing.T) {
 // field changed), if it fails to rotate at all, or if the new secret/
 // updated_at do not reach state (which would also surface as Terraform's
 // "provider produced inconsistent result after apply", failing the step even
-// without an explicit assertion for it).
+// without an explicit assertion for it). Review r1 I-1: the PreApply plan
+// check pins that `secret` is really planned UNKNOWN here (the positive half
+// of the rotate trigger), not merely that it ends up different after apply.
 func TestWebhookResource_ChangingRotateSecretRotatesOnlyNoPUT(t *testing.T) {
 	api := setupFake(t)
 	var firstSecret, firstUpdated string
@@ -291,6 +315,9 @@ func TestWebhookResource_ChangingRotateSecretRotatesOnlyNoPUT(t *testing.T) {
 			{
 				PreConfig: func() { seen = len(api.Requests()) },
 				Config:    webhookHCL("https://example.com/hook", []string{"cluster.ready"}, `rotate_secret = "2"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectUnknownValue(webhookResource, tfjsonpath.New("secret")),
+				}},
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestMatchResourceAttr(webhookResource, "secret", webhookSecretRE),
 					func(s *terraform.State) error {
@@ -346,7 +373,10 @@ func TestWebhookResource_RemovingRotateSecretFromConfigIsANoop(t *testing.T) {
 
 // Fails if a description-only change sends anything but {"description":"…"},
 // or if REMOVING description sends anything but {"description":""} - the
-// API's only clear (T10-4/T10-8).
+// API's only clear (T10-4/T10-8). Review r1 I-1: the PreApply plan check on
+// the second step pins the "only then" half directly - an update that does
+// NOT trigger a rotation must plan `secret` as KNOWN (the prior value, not
+// unknown) while `updated_at` (which moves on every PUT) IS unknown.
 func TestWebhookResource_DescriptionOnlyChangeSendsExactPUT(t *testing.T) {
 	api := setupFake(t)
 	var seen int
@@ -358,6 +388,10 @@ func TestWebhookResource_DescriptionOnlyChangeSendsExactPUT(t *testing.T) {
 			{
 				PreConfig: func() { seen = len(api.Requests()) },
 				Config:    webhookHCL("https://example.com/hook", []string{"cluster.ready"}, `description = "second"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectKnownValue(webhookResource, tfjsonpath.New("secret"), knownvalue.NotNull()),
+					plancheck.ExpectUnknownValue(webhookResource, tfjsonpath.New("updated_at")),
+				}},
 				Check: func(*terraform.State) error {
 					puts := webhookPUTsSince(api, seen)
 					if len(puts) != 1 {
@@ -456,7 +490,10 @@ func TestWebhookResource_URLChangeAndRotateInOneApplyPUTsThenRotates(t *testing.
 // url change is already applied and saved), loses the url change, or fails
 // to re-trigger the rotation on the next apply (T10-8: rotate_secret reverts
 // to the PRIOR state value on a failed rotate, so the diff against the still
-// -newer config value re-fires).
+// -newer config value re-fires). A RefreshState step (review r1 M-1) reads
+// the SAVED state directly right after the error, so an implementation that
+// nulled `secret` on this path (the recovery rotate would silently overwrite
+// that) is caught here rather than only downstream.
 func TestWebhookResource_UpdatePUTSucceedsRotateFailsKeepsPUTFieldsAndRetriesNextApply(t *testing.T) {
 	api := setupFake(t)
 	var firstSecret string
@@ -478,6 +515,26 @@ func TestWebhookResource_UpdatePUTSucceedsRotateFailsKeepsPUTFieldsAndRetriesNex
 				},
 				Config:      webhookHCL("https://b.example.com/hook", []string{"cluster.ready"}, `rotate_secret = "2"`),
 				ExpectError: loose("rotate boom"),
+			},
+			{
+				// M-1: rotate_secret in config ("2") still differs from the
+				// reverted saved value ("1"), so the post-refresh plan is
+				// non-empty (the rotate trigger fires again).
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check: func(s *terraform.State) error {
+					a := attrs(s, webhookResource)
+					if a["url"] != "https://b.example.com/hook" {
+						return fmt.Errorf("saved url = %q, want the PUT's value (T10-8: already applied and saved before the rotate ran)", a["url"])
+					}
+					if a["rotate_secret"] != "1" {
+						return fmt.Errorf("saved rotate_secret = %q, want the PRIOR value %q (a failed rotate must revert it, so the next plan re-triggers)", a["rotate_secret"], "1")
+					}
+					if a["secret"] != firstSecret {
+						return fmt.Errorf("saved secret = %q, want unchanged from before the failed rotate (%q, T10-8)", a["secret"], firstSecret)
+					}
+					return nil
+				},
 			},
 			{
 				// Recovery: same config, nothing armed. If state had kept url=b
@@ -699,8 +756,27 @@ func TestWebhookResource_ImportByIDThenRotateObtainsASecret(t *testing.T) {
 				},
 			},
 			{
+				// Review r1 I-1, negative half after an import: an update that
+				// does NOT trigger a rotation (description-only) must plan
+				// `secret` as KNOWN NULL - the post-import value - never unknown.
 				PreConfig: func() { seen = len(api.Requests()) },
-				Config:    webhookHCL("https://x.io/h", []string{"cluster.ready"}, `rotate_secret = "1"`),
+				Config:    webhookHCL("https://x.io/h", []string{"cluster.ready"}, `description = "d2"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectKnownValue(webhookResource, tfjsonpath.New("secret"), knownvalue.Null()),
+				}},
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(webhookResource, "description", "d2"),
+					func(*terraform.State) error {
+						if w := webhookWrites(api, seen); strings.Join(w, ",") != "PUT" {
+							return fmt.Errorf("description-only change post-import: writes = %v, want exactly one PUT and zero ROTATE", w)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() { seen = len(api.Requests()) },
+				Config:    webhookHCL("https://x.io/h", []string{"cluster.ready"}, `description = "d2"`, `rotate_secret = "1"`),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestMatchResourceAttr(webhookResource, "secret", webhookSecretRE),
 					func(*terraform.State) error {
@@ -836,6 +912,62 @@ func TestWebhookResource_DeleteOfAnAlreadyRemovedWebhookIsSuccess(t *testing.T) 
 				},
 				Config: providerOnlyHCL,
 				Check:  checkAbsentFromState(webhookResource),
+			},
+		},
+	})
+}
+
+// ---------------------------------------------------------------- review r1 M-2
+
+// Fails on the CURRENT resource: a 201 with JSON201 != nil but Secret == nil
+// (unreachable against the measured API, contract §2 - every real 201 carries
+// the secret - but possible from a proxy/mock in front of it) makes Create
+// return an error WITHOUT ever calling resp.State.Set (R:243-247 as reviewed).
+// The webhook the fake really created (a real, GETable/DELETE-able row - this
+// override seeds it for real via SeedWebhook, then echoes its JSON with the
+// `secret` key stripped) is then ORPHANED: nothing is recorded in state, so
+// the id is lost, and the next apply just tries to create a SECOND webhook
+// instead of replacing the first (which needs a DELETE that only a saved id
+// could send) - exactly the failure mode T10-3's own reasoning exists to
+// prevent ("the webhook must not be lost").
+//
+// It stays RED until the coder's M-2 fix: on JSON201 != nil (secret or not),
+// flatten and save state with a null secret, then add the error - tainting
+// the resource so the next apply replaces it, mirroring test 3's shape.
+func TestWebhookResource_Create201WithoutASecretStillSavesStateSoRecoveryReplaces(t *testing.T) {
+	api := setupFake(t)
+	var seededID string
+	route := "POST /organizations/" + testOrg + "/webhooks"
+	api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+		seededID = api.SeedWebhook(testOrg, "https://example.com/hook", []string{"cluster.ready"}, true)
+		fakeapi.WriteJSON(w, http.StatusCreated, map[string]any{
+			"id": seededID, "org_id": testOrg, "url": "https://example.com/hook",
+			"description": "", "events": []string{"cluster.ready"}, "enabled": true,
+			"created_at": "2026-09-28T00:00:00Z", "updated_at": "2026-09-28T00:00:00Z",
+			// no "secret" key: the M-2 shape.
+		})
+	}
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				Config:      webhookHCL("https://example.com/hook", []string{"cluster.ready"}),
+				ExpectError: regexp.MustCompile(`(?is)secret`),
+			},
+			{
+				PreConfig: func() { delete(api.Handlers, route) },
+				Config:    webhookHCL("https://example.com/hook", []string{"cluster.ready"}),
+				Check: func(*terraform.State) error {
+					deletes := requestsMatching(api, http.MethodDelete, webhookOneRE)
+					if len(deletes) != 1 || !strings.HasSuffix(deletes[0].Path, "/"+seededID) {
+						return fmt.Errorf("recovery apply's DELETEs = %v, want exactly one targeting %s - proof state was saved with the id despite the missing secret (M-2)", deletes, seededID)
+					}
+					if posts := requestsMatching(api, http.MethodPost, webhooksListRE); len(posts) != 2 {
+						return fmt.Errorf("want 2 POSTs total (the M-2 create plus the replacement), got %d: %v", len(posts), posts)
+					}
+					return nil
+				},
 			},
 		},
 	})
