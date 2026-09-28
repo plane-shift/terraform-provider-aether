@@ -97,9 +97,13 @@ func (d *invoicesDataSource) Configure(_ context.Context, req datasource.Configu
 }
 
 func (d *invoicesDataSource) Read(ctx context.Context, _ datasource.ReadRequest, resp *datasource.ReadResponse) {
-	// limit=100 keeps the API's broken `id <` cursor latent (one invoice per
-	// month → reached only past 100 invoices); collectAll's next == cursor
-	// guard stops a repeating cursor (T14-11).
+	// KNOWN DEFECT (aether-api #318): the API's invoice cursor is broken
+	// (`id < cursor` on random UUIDs while the list is ordered by
+	// period_start DESC), so every page after the first
+	// may SKIP or DUPLICATE invoices, and nothing here detects it. limit=100
+	// only makes a second page rare (one invoice per month → past 100
+	// invoices). collectAll's repeated-cursor error (T14-15) prevents an
+	// endless loop; it does NOT make a multi-page result correct.
 	invoices, err := collectAll(ctx, func(ctx context.Context, cursor string) ([]invoiceWire, string, error) {
 		c, err := uuidCursorParam(cursor)
 		if err != nil {

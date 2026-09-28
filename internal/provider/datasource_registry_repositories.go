@@ -39,7 +39,8 @@ type registryRepositoriesModel struct {
 // harborListWire is the registry list envelope as the API sends it: NOT the
 // common ListResponse. next_cursor is ALWAYS present, a Harbor page NUMBER,
 // "" on the last page (contract §1/§2). The generated RepositoryList/TagList
-// drop it, so the body is decoded here.
+// drop it, so the body is decoded here. Paging goes through collectAll, so a
+// page number the API has already sent is an ERROR, not a stop (T14-15).
 type harborListWire[T any] struct {
 	Items      *[]T    `json:"items"`
 	NextCursor *string `json:"next_cursor"`

@@ -117,7 +117,8 @@ func (d *usageDataSource) Read(ctx context.Context, _ datasource.ReadRequest, re
 		resp.Diagnostics.AddError("Cannot read usage", err.Error())
 		return
 	}
-	defer hr.Body.Close()
+	// A read-side Close error cannot change what was read; discarded on purpose.
+	defer func() { _ = hr.Body.Close() }()
 	body, err := io.ReadAll(hr.Body)
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot read usage", err.Error())
