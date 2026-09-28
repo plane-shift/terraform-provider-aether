@@ -262,7 +262,7 @@ func (r *webhookResource) Create(ctx context.Context, req resource.CreateRequest
 		plan.Secret = types.StringNull()
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		resp.Diagnostics.AddError("Aether API returned the webhook without a signing secret",
-			"The webhook was created, but the API's answer carried no signing secret. It is saved in state and marked tainted: the next apply replaces it.")
+			"The webhook was created, but the API's answer carried no signing secret. It is saved in state and marked tainted: the next apply replaces it. If the configuration sets `enabled = false`, the disable call was skipped: the webhook was created ENABLED, so it may be receiving events until the next apply replaces it.")
 		return
 	}
 	plan.Secret = types.StringValue(*res.JSON201.Secret)
