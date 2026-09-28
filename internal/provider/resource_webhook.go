@@ -178,10 +178,9 @@ func (r *webhookResource) Configure(_ context.Context, req resource.ConfigureReq
 // ModifyPlan handles the two attributes the framework cannot plan on its own
 // for an update. When the rotate_secret trigger fires (config non-null and
 // different from state, a null state counting as different) the secret will
-// change, so it is planned unknown. Otherwise the secret is planned as the
-// prior value - including null after an import, which UseStateForUnknown
-// leaves unknown. updated_at moves on every PUT and every rotate, so any
-// update plans it unknown.
+// change, so it is planned unknown (otherwise UseStateForUnknown carries the
+// prior value, null included). updated_at moves on every PUT and every
+// rotate, so any update plans it unknown.
 func (r *webhookResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
 		return // create or destroy: Create never rotates
@@ -193,11 +192,13 @@ func (r *webhookResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		return
 	}
 	if rotateTriggered(plan.RotateSecret, state.RotateSecret) {
+		// The attribute-level UseStateForUnknown already keeps `secret` known
+		// (null included) on every non-rotating update; only a rotation
+		// overrides it with unknown.
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("secret"), types.StringUnknown())...)
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("updated_at"), types.StringUnknown())...)
 		return
 	}
-	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("secret"), state.Secret)...)
 	if !req.Plan.Raw.Equal(req.State.Raw) {
 		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("updated_at"), types.StringUnknown())...)
 	}
@@ -240,18 +241,31 @@ func (r *webhookResource) Create(ctx context.Context, req resource.CreateRequest
 		addAPIError(&resp.Diagnostics, res.StatusCode(), res.HTTPResponse.Header, res.Body, path.Empty())
 		return
 	}
-	if res.JSON201 == nil || res.JSON201.Secret == nil {
+	if res.JSON201 == nil {
 		resp.Diagnostics.AddError("Aether API accepted the webhook but returned no usable body",
-			describeNonJSON(res.HTTPResponse, res.Status())+" (or no secret). The webhook was probably created, but it is not recorded in state and its secret is lost: delete it through the API, or import it by its id and set `rotate_secret` to obtain a secret.")
+			describeNonJSON(res.HTTPResponse, res.Status())+". The webhook was probably created, but it is not recorded in state and its secret is lost: delete it through the API, or import it by its id and set `rotate_secret` to obtain a secret.")
 		return
 	}
 	// Read before flattening: the 201 always says enabled=true.
 	wantDisabled := !plan.Enabled.ValueBool()
 	resp.Diagnostics.Append(flattenWebhook(ctx, res.JSON201, &plan)...)
-	plan.Secret = types.StringValue(*res.JSON201.Secret)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	if res.JSON201.Secret == nil {
+		// Unreachable against the measured API (every 201 carries the
+		// secret), but the id is in hand: SAVE the webhook with a null secret
+		// and fail, so Terraform taints it and the next apply replaces it
+		// instead of orphaning it against the per-organization cap (review
+		// r1 M-2, same shape as the failed-disable path below). The disable
+		// call is not attempted: the replacement makes it moot.
+		plan.Secret = types.StringNull()
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		resp.Diagnostics.AddError("Aether API returned the webhook without a signing secret",
+			"The webhook was created, but the API's answer carried no signing secret. It is saved in state and marked tainted: the next apply replaces it.")
+		return
+	}
+	plan.Secret = types.StringValue(*res.JSON201.Secret)
 	if wantDisabled {
 		// The planned value was false and the 201 says true. If the disable
 		// fails, state from the 201 is SAVED with the error (T10-3): the secret
