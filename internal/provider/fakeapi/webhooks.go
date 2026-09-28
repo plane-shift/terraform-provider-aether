@@ -269,14 +269,17 @@ func (s *Server) FailNextWebhookRotate(org string, status int, code, message str
 	ws.failNextRotate[org] = &webhookFailure{status: status, code: code, message: message}
 }
 
-// consumeFailure pops (and clears) an armed override for org, or reports none
-// armed. kind picks the map AFTER ws.mu is taken (review r1 M-3): reading
-// from a nil map is safe in Go, so no init is needed, but the map FIELD
-// itself must not be read outside the lock that FailNextWebhookPUT/Rotate
-// write it under.
-func (ws *webhookStore) consumeFailure(kind webhookFailureKind, org string) *webhookFailure {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
+// consumeFailureLocked pops (and clears) an armed override for org, or
+// reports none armed. kind picks the map AFTER ws.mu is taken (review r1
+// M-3): reading from a nil map is safe in Go, so no init is needed, but the
+// map FIELD itself must not be read outside the lock that
+// FailNextWebhookPUT/Rotate write it under. The caller must already hold
+// ws.mu - putWebhook/rotateWebhookSecret call this only AFTER find succeeds,
+// in the SAME locked section, so a call against an unknown id 404s without
+// touching the override (CodeRabbit PR #15 CR-2: previously the override was
+// consumed before the id lookup, so a PUT/rotate to an unknown id answered
+// the injected status instead of 404 and silently disarmed the override).
+func (ws *webhookStore) consumeFailureLocked(kind webhookFailureKind, org string) *webhookFailure {
 	m := ws.failNextPUT
 	if kind == failNextRotateKind {
 		m = ws.failNextRotate
@@ -484,10 +487,6 @@ func (s *Server) getWebhook(w http.ResponseWriter, org, id string) {
 // putWebhook is PUT /organizations/{org}/webhooks/{id}, a COALESCE partial
 // merge (§5).
 func (s *Server) putWebhook(w http.ResponseWriter, org, id string, body []byte) {
-	if f := s.webhooks.consumeFailure(failNextPUTKind, org); f != nil {
-		apiError(w, f.status, f.code, f.message)
-		return
-	}
 	var req struct {
 		URL         *string   `json:"url"`
 		Description *string   `json:"description"`
@@ -530,6 +529,10 @@ func (s *Server) putWebhook(w http.ResponseWriter, org, id string, body []byte) 
 		apiError(w, http.StatusNotFound, "not_found", "Resource not found")
 		return
 	}
+	if f := ws.consumeFailureLocked(failNextPUTKind, org); f != nil {
+		apiError(w, f.status, f.code, f.message)
+		return
+	}
 	if req.URL != nil {
 		wh.url = *req.URL
 	}
@@ -550,16 +553,16 @@ func (s *Server) putWebhook(w http.ResponseWriter, org, id string, body []byte) 
 // rotateWebhookSecret is POST /organizations/{org}/webhooks/{id}/rotate-secret
 // (§6): no body, always a brand new secret, allowed on a disabled webhook.
 func (s *Server) rotateWebhookSecret(w http.ResponseWriter, org, id string) {
-	if f := s.webhooks.consumeFailure(failNextRotateKind, org); f != nil {
-		apiError(w, f.status, f.code, f.message)
-		return
-	}
 	ws := &s.webhooks
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	wh, _ := ws.find(org, id)
 	if wh == nil {
 		apiError(w, http.StatusNotFound, "not_found", "Resource not found")
+		return
+	}
+	if f := ws.consumeFailureLocked(failNextRotateKind, org); f != nil {
+		apiError(w, f.status, f.code, f.message)
 		return
 	}
 	wh.secret = newWebhookSecret()

@@ -383,6 +383,46 @@ func TestFailNextWebhookPUTIsOneShotAndPerOrg(t *testing.T) {
 	}
 }
 
+// Fails if a PUT to an unknown id consumes an armed FailNextWebhookPUT
+// override before the id lookup runs - it must 404 (the id lookup precedes
+// the failure check) AND leave the override armed for the next PUT, since a
+// real webhook's id is never known to the override (CodeRabbit PR #15 CR-2).
+func TestFailNextWebhookPUTUnknownIDDoesNotConsumeOverride(t *testing.T) {
+	s := newClusterFake(t)
+	_, created := postWebhook(t, s, validWebhookBody)
+	id := created["id"].(string)
+	s.FailNextWebhookPUT(testOrg, http.StatusInternalServerError, "internal_error", "boom")
+
+	resp, b := call(t, s, http.MethodPut, webhooksPath+"/nonexistent-id", `{"description":"x"}`)
+	if resp.StatusCode != http.StatusNotFound || errCode(decode(t, b)) != "not_found" {
+		t.Fatalf("PUT unknown id with an armed override = %d %s, want 404 not_found", resp.StatusCode, b)
+	}
+
+	// The override must still be armed - it targets the real webhook now.
+	resp, b = call(t, s, http.MethodPut, webhooksPath+"/"+id, `{"description":"y"}`)
+	if resp.StatusCode != http.StatusInternalServerError || errCode(decode(t, b)) != "internal_error" {
+		t.Fatalf("PUT to the real id after the 404 = %d %s, want 500 internal_error (override should still be armed)", resp.StatusCode, b)
+	}
+}
+
+// Rotate's sibling of TestFailNextWebhookPUTUnknownIDDoesNotConsumeOverride.
+func TestFailNextWebhookRotateUnknownIDDoesNotConsumeOverride(t *testing.T) {
+	s := newClusterFake(t)
+	_, created := postWebhook(t, s, validWebhookBody)
+	id := created["id"].(string)
+	s.FailNextWebhookRotate(testOrg, http.StatusInternalServerError, "internal_error", "boom")
+
+	resp, b := call(t, s, http.MethodPost, webhooksPath+"/nonexistent-id/rotate-secret", "")
+	if resp.StatusCode != http.StatusNotFound || errCode(decode(t, b)) != "not_found" {
+		t.Fatalf("rotate unknown id with an armed override = %d %s, want 404 not_found", resp.StatusCode, b)
+	}
+
+	resp, b = call(t, s, http.MethodPost, webhooksPath+"/"+id+"/rotate-secret", "")
+	if resp.StatusCode != http.StatusInternalServerError || errCode(decode(t, b)) != "internal_error" {
+		t.Fatalf("rotate the real id after the 404 = %d %s, want 500 internal_error (override should still be armed)", resp.StatusCode, b)
+	}
+}
+
 // Fails if FailNextWebhookRotate does not intercept rotate specifically
 // (leaving PUT untouched), or is not one-shot.
 func TestFailNextWebhookRotateIsOneShot(t *testing.T) {
@@ -407,8 +447,9 @@ func TestFailNextWebhookRotateIsOneShot(t *testing.T) {
 }
 
 // Fails if the list clamps limit incorrectly, omits next_cursor on a full
-// page, or double-serves a webhook across pages (§10 - minimal coverage,
-// since the provider itself never calls this route).
+// page, a webhook appears on two pages, or a full-then-partial page sequence
+// doesn't terminate with an unset next_cursor (§10 - minimal coverage, since
+// the provider itself never calls this route).
 func TestWebhookListPaginatesByID(t *testing.T) {
 	s := newClusterFake(t)
 	for i := 0; i < 3; i++ {
@@ -420,7 +461,26 @@ func TestWebhookListPaginatesByID(t *testing.T) {
 	if len(items) != 2 {
 		t.Fatalf("page 1 = %d items, want 2", len(items))
 	}
-	if _, has := m["next_cursor"]; !has {
+	cursor, has := m["next_cursor"]
+	if !has {
 		t.Fatalf("full page lacks next_cursor: %s", b)
+	}
+	page1IDs := map[string]bool{}
+	for _, it := range items {
+		page1IDs[it.(map[string]any)["id"].(string)] = true
+	}
+
+	_, b2 := call(t, s, http.MethodGet, webhooksPath+"?limit=2&cursor="+cursor.(string), "")
+	m2 := decode(t, b2)
+	items2 := m2["items"].([]any)
+	if len(items2) != 1 {
+		t.Fatalf("page 2 = %d items, want 1", len(items2))
+	}
+	id2 := items2[0].(map[string]any)["id"].(string)
+	if page1IDs[id2] {
+		t.Fatalf("page 2 item %s already appeared on page 1 %v", id2, page1IDs)
+	}
+	if _, has := m2["next_cursor"]; has {
+		t.Fatalf("partial page carries next_cursor: %s", b2)
 	}
 }
