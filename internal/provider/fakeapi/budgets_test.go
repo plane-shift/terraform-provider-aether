@@ -8,8 +8,8 @@ import (
 
 // These are the fake's own tests (task-12-brief-amended.md test 11):
 // budgets.go must reproduce the measured aether-api contract exactly (see
-// task-12-measured-contract.md), independent of anything the resource
-// (resource_billing_budget.go, not yet written) does with it.
+// task-12-measured-contract.md), independent of anything the
+// aether_billing_budget resource (resource_billing_budget.go) does with it.
 
 const budgetPath = "/organizations/" + testOrg + "/billing/budget"
 
@@ -77,6 +77,9 @@ func TestBudgetPutIsFullReplaceAndBumpsUpdatedAtOnAnIdenticalRePUT(t *testing.T)
 	updated1, _ := m["updated_at"].(string)
 	if created1 == "" || updated1 == "" {
 		t.Fatalf("created_at/updated_at = %q/%q, want both set on the first PUT", created1, updated1)
+	}
+	if created1 != updated1 {
+		t.Fatalf("created_at = %q, updated_at = %q on the very first PUT; want them equal (one now() default for both, contract §1)", created1, updated1)
 	}
 
 	// A byte-identical re-PUT: created_at stays put, updated_at still moves
@@ -366,6 +369,20 @@ func TestSeedBudgetAndRemoveBudgetAreOutOfBandAndUnvalidated(t *testing.T) {
 	if resp2.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET after RemoveBudget = %d %v, want 404", resp2.StatusCode, m2)
 	}
+}
+
+// Fails if SeedBudget silently truncates an out-of-int32-range threshold
+// instead of panicking - a caller passing such a value would otherwise get a
+// stored row that could never come from a real PUT (whose wire type is
+// int32).
+func TestSeedBudgetPanicsOnOutOfRangeThreshold(t *testing.T) {
+	s := newBudgetFake(t)
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("SeedBudget with an out-of-int32-range threshold did not panic")
+		}
+	}()
+	s.SeedBudget(testOrg, 100, []int{2147483648}) // math.MaxInt32 + 1
 }
 
 // ---------------------------------------------------------------- helpers

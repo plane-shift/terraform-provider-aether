@@ -17,18 +17,13 @@ import (
 )
 
 // These tests drive aether_billing_budget (internal/provider/resource_billing_budget.go,
-// to be registered in provider.go as NewBillingBudgetResource - NOT YET
-// WRITTEN) through a real terraform (or tofu) binary against the in-process
-// fake (fakeapi/budgets.go), under the controller rulings T12-1..T12-7 of
-// task-12-brief-amended.md. Tests 1-10 are the amended brief's numbered
-// list (see the numbered section markers below); task-12-tests-report.md
-// records, per test, exactly how it is expected to fail against both no
-// implementation and a plausible wrong one.
-//
-// The resource type does not exist yet, so EVERY test in this file is
-// expected to fail right now with "Invalid resource type" (provider.go's
-// Resources() has no NewBillingBudgetResource entry) - that is the RED this
-// file is written to produce, not a defect in the tests themselves.
+// registered in provider.go as NewBillingBudgetResource) through a real
+// terraform (or tofu) binary against the in-process fake (fakeapi/budgets.go),
+// under the controller rulings T12-1..T12-7 of task-12-brief-amended.md.
+// Tests 1-10 are the amended brief's numbered list (see the numbered section
+// markers below); task-12-tests-report.md records, per test, exactly how it
+// is expected to fail against both no implementation and a plausible wrong
+// one.
 
 const (
 	budgetResource = "aether_billing_budget.b"
@@ -208,27 +203,35 @@ func TestBillingBudgetResource_SecondApplyWithIdenticalConfigSendsZeroPUTs(t *te
 		Steps: []resource.TestStep{
 			{Config: cfg},
 			{
+				// A real second apply (not PlanOnly): otherwise no PUT could ever
+				// be sent by this step regardless of the resource's behaviour, and
+				// the zero-PUT assertion below could never fail.
 				PreConfig: func() { seen = len(api.Requests()) },
 				Config:    cfg,
-				PlanOnly:  true, ExpectNonEmptyPlan: false,
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectEmptyPlan(),
+				}},
+				Check: func(*terraform.State) error {
+					var gets, puts int
+					for _, r := range requestsSince(api, seen) {
+						switch r.Method {
+						case http.MethodGet:
+							gets++
+						case http.MethodPut:
+							puts++
+						}
+					}
+					if puts != 0 {
+						return fmt.Errorf("second apply with identical config sent %d PUT(s), want 0", puts)
+					}
+					if gets == 0 {
+						return fmt.Errorf("second apply with identical config sent zero GETs; want the refresh's own GET (otherwise this test cannot tell 'correctly did nothing' from 'never ran at all')")
+					}
+					return nil
+				},
 			},
 		},
 	})
-	var gets, puts int
-	for _, r := range requestsSince(api, seen) {
-		switch r.Method {
-		case http.MethodGet:
-			gets++
-		case http.MethodPut:
-			puts++
-		}
-	}
-	if puts != 0 {
-		t.Fatalf("second apply with identical config sent %d PUT(s), want 0", puts)
-	}
-	if gets == 0 {
-		t.Fatalf("second apply with identical config sent zero GETs; want the refresh's own GET (otherwise this test cannot tell 'correctly did nothing' from 'never ran at all')")
-	}
 }
 
 // ---------------------------------------------------------------- 5
@@ -242,13 +245,13 @@ func TestBillingBudgetResource_PlanTimeValidationRefusesWithZeroRequests(t *test
 		thresholds []int64
 		expect     *regexp.Regexp
 	}{
-		{"limit zero", "0", []int64{50}, regexp.MustCompile(`(?is)0\.01|must be`)},
-		{"limit below the one-cent floor", "0.001", []int64{50}, regexp.MustCompile(`(?is)0\.01|decimal`)},
-		{"limit three decimal places", "12.345", []int64{50}, regexp.MustCompile(`(?is)decimal`)},
-		{"limit at the 1e10 ceiling", "1e10", []int64{50}, regexp.MustCompile(`(?is)10,?000,?000,?000|1e\+?10|10000000000|less than|below`)},
-		{"thresholds empty", "100", nil, regexp.MustCompile(`(?is)at least 1|at least one|threshold`)},
-		{"threshold zero", "100", []int64{0}, regexp.MustCompile(`(?is)between 1 and 100|between\s+1\s+and\s+100`)},
-		{"threshold above 100", "100", []int64{101}, regexp.MustCompile(`(?is)between 1 and 100|between\s+1\s+and\s+100`)},
+		{"limit zero", "0", []int64{50}, loose("must be at least 0.01")},
+		{"limit below the one-cent floor", "0.001", []int64{50}, loose("must be at least 0.01")},
+		{"limit three decimal places", "12.345", []int64{50}, loose("more than two decimal places")},
+		{"limit at the 1e10 ceiling", "1e10", []int64{50}, loose("must be less than 10000000000")},
+		{"thresholds empty", "100", nil, loose("list must contain at least 1 elements")},
+		{"threshold zero", "100", []int64{0}, loose("value must be between 1 and 100")},
+		{"threshold above 100", "100", []int64{101}, loose("value must be between 1 and 100")},
 		{"thresholds not ascending", "100", []int64{80, 50}, loose("thresholds must be strictly ascending")},
 		{"thresholds duplicate", "100", []int64{50, 50}, loose("thresholds must be strictly ascending")},
 	}
@@ -363,9 +366,10 @@ func TestBillingBudgetResource_ImportWhenNoBudgetIsSetErrors(t *testing.T) {
 // Fails if a 404 on Read (the fake's RemoveBudget, applied out of band in
 // the NEXT step's PreConfig - removing it any earlier would just make the
 // CREATE step itself never happen) does not remove the resource from state,
-// or if the next apply's recreate does not GET (and see 404) before PUTting
-// again (T12-4 applies identically to a recreate, since Create always GETs
-// first).
+// if the next apply does not plan a Create (not an Update), or if it does
+// not send exactly the original create PUT plus one PUT for the recreate.
+// Create's GET-before-PUT ordering (T12-4) applies identically to a
+// recreate, but is pinned by tests 1 and 2, not asserted here.
 func TestBillingBudgetResource_Read404RemovesFromStateAndNextApplyRecreates(t *testing.T) {
 	api := setupFake(t)
 	cfg := budgetHCL("100", []int64{50})
@@ -427,8 +431,9 @@ func TestBillingBudgetResource_DestroySendsExactlyOneDelete(t *testing.T) {
 }
 
 // Fails if Delete treats the API's 404 (already removed out of band, on the
-// DELETE request itself) as an error: the destroy must succeed and leave
-// state empty.
+// DELETE request itself) as an error: the destroy must succeed, leave state
+// empty, and still have sent the DELETE (a Delete that sends nothing would
+// otherwise also leave state empty and pass).
 func TestBillingBudgetResource_DeleteOfAnAlreadyRemovedBudgetIsSuccess(t *testing.T) {
 	api := setupFake(t)
 	route := "DELETE /organizations/" + testOrg + "/billing/budget"
@@ -448,15 +453,25 @@ func TestBillingBudgetResource_DeleteOfAnAlreadyRemovedBudgetIsSuccess(t *testin
 					}
 				},
 				Config: providerOnlyHCL,
-				Check:  checkAbsentFromState(budgetResource),
+				Check: resource.ComposeTestCheckFunc(
+					checkAbsentFromState(budgetResource),
+					func(*terraform.State) error {
+						// The override runs after the request is recorded
+						// (fakeapi.go's serve dispatch), so this count includes it.
+						if reqs := requestsMatching(api, http.MethodDelete, budgetRE); len(reqs) == 0 {
+							return fmt.Errorf("delete-of-an-already-removed-budget sent zero DELETEs")
+						}
+						return nil
+					},
+				),
 			},
 		},
 	})
 }
 
-// Fails if a persistent DELETE failure (403, never retried by the transport
-// - see the file doc comment for why 403 and not a 5xx) is swallowed
-// instead of surfacing the API's message, or if any state is lost despite
+// Fails if a persistent DELETE failure (403, not a 5xx - transport/retry.go
+// retries a DELETE 5xx, which a 403 avoids) is swallowed instead of
+// surfacing the API's message, or if any state is lost despite
 // the failure (checked by reapplying the ORIGINAL config afterwards and
 // requiring an empty plan - if Delete had cleared state anyway, that would
 // plan a create instead).

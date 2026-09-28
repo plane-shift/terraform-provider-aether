@@ -56,6 +56,7 @@ package fakeapi
 //     organizations.go/webhooks.go/registry.go (§6).
 
 import (
+	"fmt"
 	"math"
 	"net/http"
 	"regexp"
@@ -113,7 +114,9 @@ func budgetJSON(org string, b *fakeBudget) map[string]any {
 // SeedBudget adds a budget out of band (no request is recorded, no
 // validation applied - it can store what the real API would refuse, such as
 // a non-ascending thresholds list) and returns the org id it was seeded
-// under, for symmetry with the other fakes' Seed* knobs.
+// under, for symmetry with the other fakes' Seed* knobs. thresholds values
+// must fit in int32 (the wire type, matching a real PUT/echo) - a value
+// outside that range panics rather than being silently truncated.
 func (s *Server) SeedBudget(org string, limit float64, thresholds []int) string {
 	bs := &s.budgets
 	bs.mu.Lock()
@@ -122,6 +125,9 @@ func (s *Server) SeedBudget(org string, limit float64, thresholds []int) string 
 	bs.seq++
 	t := make([]int32, len(thresholds))
 	for i, v := range thresholds {
+		if v < math.MinInt32 || v > math.MaxInt32 {
+			panic(fmt.Sprintf("SeedBudget: threshold %d at index %d is out of int32 range", v, i))
+		}
 		t[i] = int32(v)
 	}
 	bs.byOrg[org] = &fakeBudget{limit: roundToCents(limit), thresholds: t, createdSeq: bs.seq, updatedSeq: bs.seq}
@@ -222,16 +228,18 @@ func (bs *budgetStore) put(w http.ResponseWriter, org string, body []byte) {
 		return
 	}
 
+	// One seq increment per PUT: on create it stamps BOTH createdSeq and
+	// updatedSeq with the same value (one now() default for both, contract
+	// §1) - never two separate increments, which would make them differ from
+	// the very first PUT.
 	row, ok := bs.byOrg[org]
+	bs.seq++
 	if !ok {
-		row = &fakeBudget{}
+		row = &fakeBudget{createdSeq: bs.seq} // set once; never touched again (survives every re-PUT)
 		bs.byOrg[org] = row
-		bs.seq++
-		row.createdSeq = bs.seq // set once; never touched again (survives every re-PUT)
 	}
 	row.limit = roundToCents(req.MonthlyLimitEur)
 	row.thresholds = append([]int32(nil), req.ThresholdsPct...)
-	bs.seq++
 	row.updatedSeq = bs.seq // moves on EVERY successful PUT, identical body included (§3)
 	writeJSON(w, http.StatusOK, budgetJSON(org, row))
 }
