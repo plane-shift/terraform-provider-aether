@@ -33,13 +33,17 @@ type LoadBalancer struct {
 
 // lbStore is embedded by value in Server; its zero value is usable.
 type lbStore struct {
-	mu    sync.Mutex
-	items map[string][]LoadBalancer // clusterID -> items
+	mu      sync.Mutex
+	items   map[string][]LoadBalancer // clusterID -> items
+	rawBody map[string]string         // clusterID -> verbatim 200 body override; see SetLoadBalancersRawBody
 }
 
 func (ls *lbStore) init() {
 	if ls.items == nil {
 		ls.items = map[string][]LoadBalancer{}
+	}
+	if ls.rawBody == nil {
+		ls.rawBody = map[string]string{}
 	}
 }
 
@@ -50,6 +54,23 @@ func (s *Server) SeedLoadBalancers(clusterID string, items ...LoadBalancer) {
 	defer s.lbs.mu.Unlock()
 	s.lbs.init()
 	s.lbs.items[clusterID] = append([]LoadBalancer(nil), items...)
+}
+
+// SetLoadBalancersRawBody forces GET …/loadbalancers to answer 200 with body
+// written verbatim, bypassing the normal {"items":[...]} encoding entirely -
+// the fake's knob for review finding m5's "body without an items list"
+// error-path coverage (a shape the real API's own OpenAPI-drift warning
+// makes plausible, even though SeedLoadBalancers alone can never produce
+// it). body="" clears the knob and restores normal encoding.
+func (s *Server) SetLoadBalancersRawBody(clusterID, body string) {
+	s.lbs.mu.Lock()
+	defer s.lbs.mu.Unlock()
+	s.lbs.init()
+	if body == "" {
+		delete(s.lbs.rawBody, clusterID)
+		return
+	}
+	s.lbs.rawBody[clusterID] = body
 }
 
 // routeLoadBalancers serves GET …/loadbalancers; it reports false when path
@@ -70,8 +91,15 @@ func (s *Server) routeLoadBalancers(w http.ResponseWriter, r *http.Request, path
 	}
 	s.lbs.mu.Lock()
 	s.lbs.init()
+	raw, hasRaw := s.lbs.rawBody[cid]
 	all := append([]LoadBalancer(nil), s.lbs.items[cid]...)
 	s.lbs.mu.Unlock()
+	if hasRaw {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(raw))
+		return true
+	}
 	sort.SliceStable(all, func(i, j int) bool {
 		ai, aj := all[i].AllocatedAt, all[j].AllocatedAt
 		switch {

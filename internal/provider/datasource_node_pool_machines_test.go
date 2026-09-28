@@ -85,7 +85,33 @@ func TestDataSourceNodePoolMachines_KubeListFailedIsAnError(t *testing.T) {
 	})
 }
 
+// m4 (review round 1): an upper-case UUID on node_pool_id must be rejected
+// with the canonical-UUID wording, with zero API requests. Same measured
+// GREEN-today status as the cluster/node_pool m4 tests (see their doc
+// comments): parseInputID already runs before any request inside Read.
+func TestDataSourceNodePoolMachines_UpperCaseNodePoolIDIsRejectedWithZeroRequests(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	before := len(requestsMatching(api, http.MethodGet, `/machines$`))
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      machinesDataSourceHCL(cid, upperCaseUUID),
+			ExpectError: loose("canonical"),
+		}},
+	})
+	if reqs := requestsMatching(api, http.MethodGet, `/machines$`); len(reqs) != before {
+		t.Fatalf("an invalid node_pool_id reached the API with a machines GET: %v", reqs)
+	}
+}
+
 // A 404 on an unknown node pool id is an error, not an empty list.
+//
+// n2 (review round 1): asserts on "404" (the status), not on the fake's
+// "not found" message text (loose("not found") tolerates a wrong error
+// path too, and cannot be phrased against the "not_found" error CODE at
+// all - \W+ never matches an underscore).
 func TestDataSourceNodePoolMachines_UnknownPoolIsAnError(t *testing.T) {
 	api := setupFake(t)
 	cid := seedCluster(t, api, "c")
@@ -94,7 +120,7 @@ func TestDataSourceNodePoolMachines_UnknownPoolIsAnError(t *testing.T) {
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{{
 			Config:      machinesDataSourceHCL(cid, zeroUUID),
-			ExpectError: loose("not found"),
+			ExpectError: loose("404"),
 		}},
 	})
 	if reqs := requestsMatching(api, http.MethodGet, `/machines$`); len(reqs) == 0 {

@@ -48,6 +48,13 @@ func TestDataSourceCluster_ByIDReadsEveryClusterAttribute(t *testing.T) {
 }
 
 // A 404 by id must be an ERROR, never an empty result (spec §6 / T13-14).
+//
+// n2 (review round 1): asserts on "404" (the status), not on the fake's
+// "not found" message text - loose("not found") would also accept a wrong
+// code path that happens to emit the by-name branch's "Cluster not found"
+// wording, and the fake's error CODE is "not_found" (underscore, which
+// \W+ never matches), so a code-based assertion could not be phrased this
+// way at all.
 func TestDataSourceCluster_ByIDNotFoundIsAnError(t *testing.T) {
 	api := setupFake(t)
 	_ = api
@@ -56,7 +63,7 @@ func TestDataSourceCluster_ByIDNotFoundIsAnError(t *testing.T) {
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{{
 			Config:      clusterDataSourceHCL(zeroUUID, ""),
-			ExpectError: loose("not found"),
+			ExpectError: loose("404"),
 		}},
 	})
 }
@@ -206,4 +213,61 @@ func TestDataSourceClusters_WalksTwoFullPagesPlusTrailingEmptyPage(t *testing.T)
 // purpose (parameter order is not part of the contract).
 func containsQueryParam(rawQuery, wantSubstring string) bool {
 	return strings.Contains(rawQuery, wantSubstring)
+}
+
+// m4 (review round 1, GREEN today - fills a coverage gap, code unchanged):
+// parseInputID's rejection happens INSIDE Read today, not in a plan-time
+// attribute validator; measured (not assumed) that this test is GREEN
+// against current HEAD, contrary to the brief's expectation that it be RED.
+// Reason: parseInputID runs before any request is built, and
+// resource.UnitTest's harness invokes ReadDataSource during `terraform
+// plan` for a fully-known literal config - so "checked by a validator" and
+// "checked inside Read" produce an IDENTICAL black-box outcome here (same
+// error text, same zero requests). A validator would only diverge from
+// this if the config value were unknown at plan time (deferred to apply),
+// but attribute validators conventionally skip unknown values too, so no
+// black-box test through this harness can pin that distinction. It still
+// fills the coverage gap m4 names ("no test pins the rejection") and pins
+// both the wording and the zero-requests property as regressions.
+func TestDataSourceCluster_UpperCaseIDIsRejectedWithZeroRequests(t *testing.T) {
+	api := setupFake(t)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      clusterDataSourceHCL(upperCaseUUID, ""),
+			ExpectError: loose("canonical"),
+		}},
+	})
+	// requestsMatching, not a total-request-count comparison: Configure's own
+	// org auto-resolution (AETHER_ORGANIZATION_ID left empty by setupFake)
+	// legitimately issues a request of its own, which a total-count check
+	// would misattribute to this test's id.
+	if reqs := requestsMatching(api, "GET", oneClusterRE); len(reqs) != 0 {
+		t.Fatalf("an invalid id reached the API with a single-cluster GET: %v", reqs)
+	}
+}
+
+// m3 (review round 1, RED until the coder lands ruling T13-18): a server
+// that ignores the cursor and repeats the same next_cursor forever must be a
+// PAGING ERROR, never a silently-doubled list. paging.go's collectAll today
+// only stops on next == cursor and returns success with whatever it
+// collected - here that is page 1 twice - so this fails against the CURRENT
+// code (an unexpected apply success where ExpectError wanted a failure),
+// not just against a hypothetical wrong implementation. Once T13-18 lands
+// (collectAll keeps a `seen` set and errors on any repeated cursor), this
+// passes on the "the API repeated a pagination cursor" wording the ruling
+// specifies.
+func TestDataSourceClusters_RepeatedCursorErrorsInsteadOfDoublingTheList(t *testing.T) {
+	api := setupFake(t)
+	api.SeedManyClusters(testOrg, 150) // > limit=100, so a first next_cursor is produced
+	api.RepeatListCursor(true)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      dsProviderBlock + `data "aether_clusters" "all" {}`,
+			ExpectError: loose("pagination cursor"),
+		}},
+	})
 }

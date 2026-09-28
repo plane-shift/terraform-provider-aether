@@ -78,6 +78,18 @@ func isPublicRoute(method, path string) bool {
 	return method == http.MethodGet && (path == "/regions" || path == "/k8s-versions")
 }
 
+// SetRegionsEmpty forces GET /regions to answer 200 {"items":[]} instead of
+// the normal single eu-fi region. Review finding m1: an empty result must
+// round-trip through the provider as an EMPTY list, never a null one - this
+// is the fake's knob to exercise that (the contract says the list always
+// holds one region, so the real API never actually produces this; it is
+// reachable only through this knob).
+func (s *Server) SetRegionsEmpty(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.regionsEmpty = on
+}
+
 // routeRegions serves GET /regions; it reports false when path is not that
 // route.
 func (s *Server) routeRegions(w http.ResponseWriter, r *http.Request, path string, _ []byte) bool {
@@ -86,6 +98,13 @@ func (s *Server) routeRegions(w http.ResponseWriter, r *http.Request, path strin
 	}
 	if r.Method != http.MethodGet {
 		apiError(w, http.StatusMethodNotAllowed, "method_not_allowed", "no route "+r.Method+" "+path)
+		return true
+	}
+	s.mu.Lock()
+	empty := s.regionsEmpty
+	s.mu.Unlock()
+	if empty {
+		writeJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{}})
 		return true
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{

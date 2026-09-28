@@ -73,6 +73,24 @@ func TestDataSourceClusterVolumes_SortedByIDRegardlessOfFakeOrder(t *testing.T) 
 	})
 }
 
+// m5 (review round 1, GREEN today - fills a coverage gap, code unchanged):
+// used_percent (a Float64Attribute) round-trips an exactly-representable
+// seeded value without spurious floating-point formatting (e.g. "40" not
+// "40.000000" or "39.99999999999999").
+func TestDataSourceClusterVolumes_UsedPercentRoundTripsAnExactValue(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	api.SeedVolumes(cid, 0, 0, fakeapi.Volume{ID: "vol-1", Name: "data", UsedPercent: 40})
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config: volumesDataSourceHCL(cid),
+			Check:  resource.TestCheckResourceAttr("data.aether_cluster_volumes.v", "volumes.0.used_percent", "40"),
+		}},
+	})
+}
+
 // Fails if a normal (available) read drops any of the 11 per-volume fields
 // or the two org-wide byte figures.
 func TestDataSourceClusterVolumes_AvailableReadsAllFields(t *testing.T) {

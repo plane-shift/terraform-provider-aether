@@ -54,6 +54,25 @@ func TestDataSourceLoadBalancers_DecodesTheRealShape(t *testing.T) {
 	})
 }
 
+// m5 (review round 1, GREEN today - fills a coverage gap, code unchanged): a
+// 200 whose body is valid JSON but carries no "items" key at all must be an
+// error, not a silently-empty list. Asserts on the stable summary
+// ("Aether API answered 200 without a JSON body"), not the detail wording
+// n1 flags as self-contradictory and the coder is about to change.
+func TestDataSourceLoadBalancers_BodyWithoutItemsKeyIsAnError(t *testing.T) {
+	api := setupFake(t)
+	cid := seedCluster(t, api, "c")
+	api.SetLoadBalancersRawBody(cid, `{"foo":"bar"}`)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      loadBalancersDataSourceHCL(cid),
+			ExpectError: loose("Aether API answered 200 without a JSON body"),
+		}},
+	})
+}
+
 // Fails if an unseeded cluster's loadbalancers is anything but an empty list
 // (never an error - the API returns 200 {"items":[]} for "no addresses
 // allocated").

@@ -4,6 +4,9 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/statecheck"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 )
 
 // R1. The plan's reference implementation is verbatim (T13-3), so this test
@@ -27,6 +30,29 @@ func TestDataSourceRegions_ReadsTheFakesOneRegion(t *testing.T) {
 				resource.TestCheckResourceAttr("data.aether_regions.r", "regions.0.location", "Helsinki"),
 				resource.TestCheckResourceAttr("data.aether_regions.r", "regions.0.available", "true"),
 			),
+		}},
+	})
+}
+
+// m1 (review round 1, RED until the coder lands ruling T13-17): an empty
+// result must round-trip as an EMPTY list, never a null one -
+// `datasource_regions.go`'s `var out regionsModel` leaves Regions nil today,
+// so this fails against the CURRENT code with a "expected []any value for
+// ListSizeExact check, got: <nil>" mismatch, not just against a hypothetical
+// wrong implementation. Once T13-17 lands (`out := regionsModel{Regions:
+// []regionModel{}}`), both checks below pass.
+func TestDataSourceRegions_EmptyResultIsAnEmptyListNotNull(t *testing.T) {
+	api := setupFake(t)
+	api.SetRegionsEmpty(true)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config: dsProviderBlock + `data "aether_regions" "r" {}`,
+			ConfigStateChecks: []statecheck.StateCheck{
+				statecheck.ExpectKnownValue("data.aether_regions.r", tfjsonpath.New("regions"), knownvalue.ListSizeExact(0)),
+			},
+			Check: resource.TestCheckResourceAttr("data.aether_regions.r", "regions.#", "0"),
 		}},
 	})
 }

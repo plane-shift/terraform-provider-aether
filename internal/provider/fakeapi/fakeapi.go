@@ -40,22 +40,23 @@ type Server struct {
 	srv   *httptest.Server
 	token string
 
-	mu          sync.Mutex
-	orgs        []Org
-	requests    []Request
-	bodyReadErr error
-	clusters    clusterStore     // see clusters.go; own lock
-	pools       poolStore        // see nodepools.go; own lock
-	networks    networkStore     // see networks.go; own lock
-	orgStore    orgStore         // see organizations.go + members.go; own lock
-	webhooks    webhookStore     // see webhooks.go; own lock
-	registries  registryStore    // see registry.go; own lock
-	budgets     budgetStore      // see budgets.go; own lock
-	k8sVersions k8sVersionsStore // see regions.go; own lock
-	kubeconfigs kubeconfigStore  // see kubeconfig.go; own lock
-	lbs         lbStore          // see loadbalancers.go; own lock
-	volumes     volumeStore      // see volumes.go; own lock
-	machines    machineStore     // see machines.go; own lock
+	mu           sync.Mutex
+	orgs         []Org
+	requests     []Request
+	bodyReadErr  error
+	clusters     clusterStore     // see clusters.go; own lock
+	pools        poolStore        // see nodepools.go; own lock
+	networks     networkStore     // see networks.go; own lock
+	orgStore     orgStore         // see organizations.go + members.go; own lock
+	webhooks     webhookStore     // see webhooks.go; own lock
+	registries   registryStore    // see registry.go; own lock
+	budgets      budgetStore      // see budgets.go; own lock
+	k8sVersions  k8sVersionsStore // see regions.go; own lock
+	regionsEmpty bool             // see regions.go SetRegionsEmpty; protected by mu
+	kubeconfigs  kubeconfigStore  // see kubeconfig.go; own lock
+	lbs          lbStore          // see loadbalancers.go; own lock
+	volumes      volumeStore      // see volumes.go; own lock
+	machines     machineStore     // see machines.go; own lock
 	// Handlers lets a test override a route: key "METHOD /path" (path after /api/v1).
 	Handlers map[string]http.HandlerFunc
 }

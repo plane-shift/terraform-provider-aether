@@ -25,13 +25,17 @@ var kubeconfigPathRE = regexp.MustCompile(`^/organizations/([^/]+)/clusters/([^/
 
 // kubeconfigStore is embedded by value in Server; its zero value is usable.
 type kubeconfigStore struct {
-	mu      sync.Mutex
-	content map[string]string // clusterID -> raw YAML; absent = defaultKubeconfigYAML(id)
+	mu       sync.Mutex
+	content  map[string]string // clusterID -> raw YAML; absent = defaultKubeconfigYAML(id)
+	conflict map[string]string // clusterID -> forced 409 message; see SetKubeconfigConflict
 }
 
 func (ks *kubeconfigStore) init() {
 	if ks.content == nil {
 		ks.content = map[string]string{}
+	}
+	if ks.conflict == nil {
+		ks.conflict = map[string]string{}
 	}
 }
 
@@ -50,6 +54,23 @@ func (s *Server) SetKubeconfig(clusterID, yaml string) {
 	defer s.kubeconfigs.mu.Unlock()
 	s.kubeconfigs.init()
 	s.kubeconfigs.content[clusterID] = yaml
+}
+
+// SetKubeconfigConflict forces GET …/kubeconfig to answer 409 not_ready with
+// message, regardless of the cluster's own status - reproducing the real
+// API's SECOND 409 cause (review m5/m2): the control plane has not
+// published a kubeconfig yet even though the cluster already reads
+// "running". Checked before the status-derived 409, so it fires even on a
+// running cluster. message="" clears the knob.
+func (s *Server) SetKubeconfigConflict(clusterID, message string) {
+	s.kubeconfigs.mu.Lock()
+	defer s.kubeconfigs.mu.Unlock()
+	s.kubeconfigs.init()
+	if message == "" {
+		delete(s.kubeconfigs.conflict, clusterID)
+		return
+	}
+	s.kubeconfigs.conflict[clusterID] = message
 }
 
 // routeKubeconfig serves GET …/kubeconfig; it reports false when path is not
@@ -77,6 +98,14 @@ func (s *Server) routeKubeconfig(w http.ResponseWriter, r *http.Request, path st
 	}
 	status := s.clusters.statusOf(c, false) // peek: must not advance the cluster's own StatusSequence walk
 	s.clusters.mu.Unlock()
+	s.kubeconfigs.mu.Lock()
+	s.kubeconfigs.init()
+	conflictMsg, forced := s.kubeconfigs.conflict[cid]
+	s.kubeconfigs.mu.Unlock()
+	if forced {
+		apiError(w, http.StatusConflict, "not_ready", conflictMsg)
+		return true
+	}
 	if status != "running" {
 		apiError(w, http.StatusConflict, "not_ready", "Cluster is not yet ready. Current status: "+status)
 		return true

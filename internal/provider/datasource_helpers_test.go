@@ -37,6 +37,12 @@ var exactlyOneOfErrorRE = regexp.MustCompile(`(?is)exactly one of|one\s*\(and on
 // registered org (testOrg).
 const dsProviderBlock = `provider "aether" {}` + "\n"
 
+// upperCaseUUID is a syntactically valid UUID (v4, variant 10xx) spelled in
+// upper case - the shape parseInputID/the m4 canonical-UUID validator must
+// reject, since the API only ever answers with lower-case canonical text
+// (review m4).
+const upperCaseUUID = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"
+
 // clusterDataSourceHCL renders `data "aether_cluster" "c"` with whichever of
 // id/name (or neither/both) the test wants to exercise.
 func clusterDataSourceHCL(id, name string) string {

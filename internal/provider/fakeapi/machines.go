@@ -21,6 +21,10 @@ import (
 
 var machinesPathRE = regexp.MustCompile(`^/organizations/([^/]+)/clusters/([^/]+)/nodepools/([^/]+)/machines$`)
 
+// zeroMachineCreatedAt is what an unseeded/zero-value Machine.CreatedAt
+// renders as (review m6, the same fallback as volumes.go's D2 fix).
+const zeroMachineCreatedAt = "0001-01-01T00:00:00Z"
+
 // Machine is one item SeedMachines seeds.
 type Machine struct {
 	Name, Status, K8sVersion, InternalIP, CreatedAt string
@@ -119,9 +123,17 @@ func (s *Server) routeMachines(w http.ResponseWriter, r *http.Request, path stri
 	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
 	items := make([]map[string]any, 0, len(all))
 	for _, mc := range all {
+		createdAt := mc.CreatedAt
+		if createdAt == "" {
+			// Same latent defect as D2 in the volumes fake (review m6): the
+			// real API always emits an RFC3339 time, and an unseeded/zero-value
+			// CreatedAt must still round-trip through the generated client's
+			// time.Time field instead of failing to parse the empty string.
+			createdAt = zeroMachineCreatedAt
+		}
 		items = append(items, map[string]any{
 			"name": mc.Name, "status": mc.Status, "k8s_version": mc.K8sVersion,
-			"internal_ip": mc.InternalIP, "age_seconds": mc.AgeSeconds, "created_at": mc.CreatedAt,
+			"internal_ip": mc.InternalIP, "age_seconds": mc.AgeSeconds, "created_at": createdAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})

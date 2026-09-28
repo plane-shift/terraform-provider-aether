@@ -575,3 +575,92 @@ func TestClusterListBadLimitFallsBackToDefault50(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------- review round 1 fix knobs
+
+// Fails if SetRegionsEmpty does not force EXACTLY {"items":[]} (review m1).
+func TestRegionsEmptyKnobForces200WithEmptyItems(t *testing.T) {
+	s := newClusterFake(t)
+	s.SetRegionsEmpty(true)
+	resp := callNoAuth(t, s, http.MethodGet, "/regions")
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d %s, want 200", resp.StatusCode, b)
+	}
+	items, ok := decode(t, b)["items"].([]any)
+	if !ok || len(items) != 0 {
+		t.Fatalf("items = %s, want an explicit empty list", b)
+	}
+}
+
+// Fails if RepeatListCursor does not make every page request ignore the
+// incoming cursor and serve page 1 again, with the SAME next_cursor as
+// before (review m3's reproduction of a server that never advances).
+func TestClusterListRepeatCursorServesPage1ForeverWithTheSameNextCursor(t *testing.T) {
+	s := newClusterFake(t)
+	s.SeedManyClusters(testOrg, 3)
+	s.RepeatListCursor(true)
+	_, b1 := call(t, s, http.MethodGet, clustersPath+"?limit=2", "")
+	m1 := decode(t, b1)
+	_, b2 := call(t, s, http.MethodGet, clustersPath+"?limit=2&cursor="+m1["next_cursor"].(string), "")
+	m2 := decode(t, b2)
+	if m2["next_cursor"] != m1["next_cursor"] {
+		t.Fatalf("next_cursor changed from %v to %v, want identical (the cursor is ignored)", m1["next_cursor"], m2["next_cursor"])
+	}
+	items1, items2 := m1["items"].([]any), m2["items"].([]any)
+	if len(items1) != 2 || len(items2) != 2 || items1[0].(map[string]any)["id"] != items2[0].(map[string]any)["id"] {
+		t.Fatalf("page 2 = %v, want the SAME items as page 1 = %v (the cursor is ignored)", items2, items1)
+	}
+}
+
+// Fails if SetKubeconfigConflict does not force EXACTLY the given message on
+// a 409, or if it does not fire on a RUNNING cluster (review m5's second 409
+// cause: the control plane has not published a kubeconfig yet even though
+// the cluster already reads "running").
+func TestKubeconfigConflictKnobForcesCustomMessageEvenWhenRunning(t *testing.T) {
+	s := newClusterFake(t)
+	cid := create(t, s, `{"name":"c","region":"r","k8s_version":"1.37"}`)["id"].(string)
+	getStatus(t, s, cid) // -> "running" (no sequence set)
+	s.SetKubeconfigConflict(cid, "Control plane is still provisioning the kubeconfig")
+	resp, b := call(t, s, http.MethodGet, kubeconfigPath(cid), "")
+	if resp.StatusCode != 409 {
+		t.Fatalf("status = %d %s, want 409 even though the cluster is running", resp.StatusCode, b)
+	}
+	m := decode(t, b)["error"].(map[string]any)
+	if m["message"] != "Control plane is still provisioning the kubeconfig" {
+		t.Fatalf("message = %v, want the forced message verbatim", m["message"])
+	}
+}
+
+// Fails if SetLoadBalancersRawBody does not serve the given body verbatim
+// (still 200), bypassing the normal {"items":[...]} encoding (review m5).
+func TestLoadBalancersRawBodyKnobOverridesNormalEncoding(t *testing.T) {
+	s := newClusterFake(t)
+	cid := create(t, s, `{"name":"c","region":"r","k8s_version":"1.37"}`)["id"].(string)
+	s.SeedLoadBalancers(cid, LoadBalancer{IP: "10.0.0.1", Purpose: "cp_lb"})
+	s.SetLoadBalancersRawBody(cid, `{"foo":"bar"}`)
+	resp, b := call(t, s, http.MethodGet, loadbalancersPath(cid), "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d %s, want 200", resp.StatusCode, b)
+	}
+	if string(b) != `{"foo":"bar"}` {
+		t.Fatalf("body = %s, want the raw override verbatim (not the normal items encoding)", b)
+	}
+}
+
+// Fails if an unseeded/zero-value CreatedAt is served as "" instead of the Go
+// zero time - the same latent decode defect as D2 in the volumes fake
+// (review m6).
+func TestMachinesEmptyCreatedAtDefaultsToZeroTime(t *testing.T) {
+	s, cid := newPoolFake(t)
+	pid := createPool(t, s, cid, fixedPool)["id"].(string)
+	s.SeedMachines(pid, Machine{Name: "worker-1", Status: "Provisioning"}) // CreatedAt left at its zero value ""
+	_, b := call(t, s, http.MethodGet, machinesPath(cid, pid), "")
+	items := decode(t, b)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items = %v", items)
+	}
+	if got := items[0].(map[string]any)["created_at"]; got != "0001-01-01T00:00:00Z" {
+		t.Fatalf("created_at = %v, want the Go zero time (never an empty string)", got)
+	}
+}

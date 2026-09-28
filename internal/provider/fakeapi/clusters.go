@@ -56,6 +56,7 @@ type clusterKnobs struct {
 	patches        map[string]int // minor ("1.37") -> latest resolved patch
 	lagGets        int            // GETs after an upgrade POST that still read the old status/observed
 	lagUpgrading   int            // then this many GETs read "upgrading"
+	repeatCursor   bool           // see RepeatListCursor
 }
 
 type getFail struct {
@@ -163,6 +164,22 @@ func (s *Server) CreateRespondsWithNonJSON(on bool) {
 	defer s.clusters.mu.Unlock()
 	s.clusters.init()
 	s.clusters.knobs.nonJSONCreate = on
+}
+
+// RepeatListCursor makes GET /clusters ignore the incoming cursor query
+// parameter entirely: every page request (whatever cursor it carries) is
+// answered as if it were page 1, so next_cursor is the SAME value on every
+// call. This reproduces review finding m3's "server that ignores the
+// cursor" - collectAll's own stop rule (paging.go) only detects an
+// IMMEDIATE repeat (next == the cursor just used), which this knob
+// triggers on the second call; the current gap is that this is treated as
+// a normal end-of-list rather than an error, so the caller receives page 1
+// twice instead of a paging failure.
+func (s *Server) RepeatListCursor(on bool) {
+	s.clusters.mu.Lock()
+	defer s.clusters.mu.Unlock()
+	s.clusters.init()
+	s.clusters.knobs.repeatCursor = on
 }
 
 // ClusterIDs returns the ids of the clusters currently held, oldest first.
@@ -431,7 +448,7 @@ func (cs *clusterStore) list(w http.ResponseWriter, r *http.Request, org string)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].seq < all[j].seq })
 	start := 0
-	if c := r.URL.Query().Get("cursor"); c != "" {
+	if c := r.URL.Query().Get("cursor"); c != "" && !cs.knobs.repeatCursor {
 		for i, cl := range all {
 			if cl.id == c {
 				start = i + 1
