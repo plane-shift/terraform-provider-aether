@@ -86,9 +86,10 @@ func TestDataSourceNodePoolMachines_KubeListFailedIsAnError(t *testing.T) {
 }
 
 // m4 (review round 1): an upper-case UUID on node_pool_id must be rejected
-// with the canonical-UUID wording, with zero API requests. Same measured
-// GREEN-today status as the cluster/node_pool m4 tests (see their doc
-// comments): parseInputID already runs before any request inside Read.
+// with the canonical-UUID wording, with zero API requests.
+// canonicalIDValidator covers node_pool_id at plan time now (see the
+// cluster/node_pool m4 doc comments for the validator/Read-backstop split);
+// this pins the wording and the zero-requests property as regressions.
 func TestDataSourceNodePoolMachines_UpperCaseNodePoolIDIsRejectedWithZeroRequests(t *testing.T) {
 	api := setupFake(t)
 	cid := seedCluster(t, api, "c")

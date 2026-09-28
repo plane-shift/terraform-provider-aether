@@ -215,20 +215,14 @@ func containsQueryParam(rawQuery, wantSubstring string) bool {
 	return strings.Contains(rawQuery, wantSubstring)
 }
 
-// m4 (review round 1, GREEN today - fills a coverage gap, code unchanged):
-// parseInputID's rejection happens INSIDE Read today, not in a plan-time
-// attribute validator; measured (not assumed) that this test is GREEN
-// against current HEAD, contrary to the brief's expectation that it be RED.
-// Reason: parseInputID runs before any request is built, and
-// resource.UnitTest's harness invokes ReadDataSource during `terraform
-// plan` for a fully-known literal config - so "checked by a validator" and
-// "checked inside Read" produce an IDENTICAL black-box outcome here (same
-// error text, same zero requests). A validator would only diverge from
-// this if the config value were unknown at plan time (deferred to apply),
-// but attribute validators conventionally skip unknown values too, so no
-// black-box test through this harness can pin that distinction. It still
-// fills the coverage gap m4 names ("no test pins the rejection") and pins
-// both the wording and the zero-requests property as regressions.
+// m4 (review round 1): canonicalIDValidator (datasource_cluster.go) now
+// rejects a non-canonical id at plan time, on the `id` schema attribute;
+// parseInputID stays as the Read-time backstop for values that were unknown
+// at validate time (canonicalIDValidator skips those). Both paths share the
+// same wording (nonCanonicalIDDetail) and the same zero-requests outcome, so
+// a black-box test through resource.UnitTest's harness cannot tell which one
+// fired for a fully-known literal config - this test pins the wording and
+// the zero-requests property as regressions, not which layer caught it.
 func TestDataSourceCluster_UpperCaseIDIsRejectedWithZeroRequests(t *testing.T) {
 	api := setupFake(t)
 	resource.UnitTest(t, resource.TestCase{
@@ -248,16 +242,13 @@ func TestDataSourceCluster_UpperCaseIDIsRejectedWithZeroRequests(t *testing.T) {
 	}
 }
 
-// m3 (review round 1, RED until the coder lands ruling T13-18): a server
-// that ignores the cursor and repeats the same next_cursor forever must be a
-// PAGING ERROR, never a silently-doubled list. paging.go's collectAll today
-// only stops on next == cursor and returns success with whatever it
-// collected - here that is page 1 twice - so this fails against the CURRENT
-// code (an unexpected apply success where ExpectError wanted a failure),
-// not just against a hypothetical wrong implementation. Once T13-18 lands
-// (collectAll keeps a `seen` set and errors on any repeated cursor), this
-// passes on the "the API repeated a pagination cursor" wording the ruling
-// specifies.
+// m3 (review round 1): a server that ignores the cursor and repeats the same
+// next_cursor forever must be a PAGING ERROR, never a silently-doubled list.
+// paging.go's collectAll keeps a `seen` set of every cursor it has already
+// sent (the initial "" included) and errors on the first repeat, so a server
+// that echoes page 1's cursor back on the second call fails the walk instead
+// of returning page 1 twice. Pins the "the API repeated pagination cursor"
+// wording as a regression.
 func TestDataSourceClusters_RepeatedCursorErrorsInsteadOfDoublingTheList(t *testing.T) {
 	api := setupFake(t)
 	api.SeedManyClusters(testOrg, 150) // > limit=100, so a first next_cursor is produced

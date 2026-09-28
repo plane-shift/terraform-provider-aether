@@ -34,13 +34,11 @@ func TestDataSourceRegions_ReadsTheFakesOneRegion(t *testing.T) {
 	})
 }
 
-// m1 (review round 1, RED until the coder lands ruling T13-17): an empty
-// result must round-trip as an EMPTY list, never a null one -
-// `datasource_regions.go`'s `var out regionsModel` leaves Regions nil today,
-// so this fails against the CURRENT code with a "expected []any value for
-// ListSizeExact check, got: <nil>" mismatch, not just against a hypothetical
-// wrong implementation. Once T13-17 lands (`out := regionsModel{Regions:
-// []regionModel{}}`), both checks below pass.
+// m1 (review round 1): an empty result must round-trip as an EMPTY list,
+// never a null one. datasource_regions.go initialises
+// `out := regionsModel{Regions: []regionModel{}}` before the append loop, so
+// a zero-item API response still produces `regions = []`, not null; both
+// checks below pin that as a regression.
 func TestDataSourceRegions_EmptyResultIsAnEmptyListNotNull(t *testing.T) {
 	api := setupFake(t)
 	api.SetRegionsEmpty(true)

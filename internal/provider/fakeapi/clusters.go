@@ -170,11 +170,10 @@ func (s *Server) CreateRespondsWithNonJSON(on bool) {
 // parameter entirely: every page request (whatever cursor it carries) is
 // answered as if it were page 1, so next_cursor is the SAME value on every
 // call. This reproduces review finding m3's "server that ignores the
-// cursor" - collectAll's own stop rule (paging.go) only detects an
-// IMMEDIATE repeat (next == the cursor just used), which this knob
-// triggers on the second call; the current gap is that this is treated as
-// a normal end-of-list rather than an error, so the caller receives page 1
-// twice instead of a paging failure.
+// cursor" - collectAll (paging.go) tracks every cursor it has already sent
+// in a `seen` set, so this knob's repeat is caught on the second call and
+// the caller gets a paging error ("the API repeated pagination cursor")
+// instead of page 1 twice.
 func (s *Server) RepeatListCursor(on bool) {
 	s.clusters.mu.Lock()
 	defer s.clusters.mu.Unlock()

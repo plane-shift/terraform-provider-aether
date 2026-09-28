@@ -54,11 +54,21 @@ func TestDataSourceLoadBalancers_DecodesTheRealShape(t *testing.T) {
 	})
 }
 
-// m5 (review round 1, GREEN today - fills a coverage gap, code unchanged): a
-// 200 whose body is valid JSON but carries no "items" key at all must be an
-// error, not a silently-empty list. Asserts on the stable summary
-// ("Aether API answered 200 without a JSON body"), not the detail wording
-// n1 flags as self-contradictory and the coder is about to change.
+// m5 (review round 1) / n1 SUMMARY (review round 2, deviation 2, DEFERRED at
+// r2 time): a 200 whose body is valid JSON but carries no "items" key at all
+// must be an error, not a silently-empty list. The shared nonJSONSummary
+// ("Aether API answered 200 without a JSON body") is inaccurate for this
+// branch - the body IS JSON, it just has no "items" list, and the detail
+// already says so - so this is pinned on the accurate summary round 2 asks
+// for instead: wording that names both "JSON" and "no \"items\"" without
+// claiming there is no JSON body at all (e.g. "Aether API answered 200 with
+// JSON that has no \"items\" list"). RED against current HEAD, since the
+// datasource still reports nonJSONSummary for this branch (measured: the
+// looser "no items list" fragment alone is already present in today's
+// DETAIL text and would pass vacuously, which is why the pinned fragment
+// also requires "with JSON" immediately before it - current wording says
+// "with A JSON BODY that has no", which does not match). Goes GREEN once the
+// coder's one-line summary change lands.
 func TestDataSourceLoadBalancers_BodyWithoutItemsKeyIsAnError(t *testing.T) {
 	api := setupFake(t)
 	cid := seedCluster(t, api, "c")
@@ -68,7 +78,7 @@ func TestDataSourceLoadBalancers_BodyWithoutItemsKeyIsAnError(t *testing.T) {
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{{
 			Config:      loadBalancersDataSourceHCL(cid),
-			ExpectError: loose("Aether API answered 200 without a JSON body"),
+			ExpectError: loose(`with JSON that has no "items"`),
 		}},
 	})
 }

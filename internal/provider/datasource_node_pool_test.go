@@ -121,18 +121,12 @@ func TestDataSourceNodePool_NeitherIDNorNameIsAConfigError(t *testing.T) {
 // m4 (review round 1): an upper-case UUID on cluster_id (a Required
 // attribute echoed from config, not one the API resolves) must be rejected
 // with the canonical-UUID wording and without reaching the API at all.
-//
-// Measured against current HEAD: parseInputID already runs inside Read
-// BEFORE any request is built, and resource.UnitTest's plugin-testing
-// harness invokes ReadDataSource during `terraform plan` for a fully known
-// config - so this test is GREEN today, not RED. It still fills the
-// coverage gap m4 names ("no test pins the rejection") and pins both the
-// wording and the zero-requests property as regressions; it would only go
-// RED if a future change moved the id/cluster_id check to run AFTER a
-// request is dispatched, or dropped the canonical-form check entirely. See
-// the test-writer report for why a black-box test cannot additionally pin
-// "checked by a plan-time validator vs. checked inside Read" - both read as
-// identical outcomes through this harness.
+// canonicalIDValidator now sits on cluster_id at plan time; parseInputID
+// stays as the Read-time backstop for values unknown at validate time. Both
+// share nonCanonicalIDDetail's wording, so this test pins the wording and
+// the zero-requests property as regressions without needing to (and, through
+// this black-box harness, being unable to) distinguish which layer caught
+// it - see the test-writer report for why.
 func TestDataSourceNodePool_UpperCaseClusterIDIsRejectedWithZeroRequests(t *testing.T) {
 	api := setupFake(t)
 	resource.UnitTest(t, resource.TestCase{

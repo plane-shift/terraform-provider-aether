@@ -1,6 +1,7 @@
 package provider_test
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -71,9 +72,11 @@ func TestDataSourceKubeconfig_NonRunningStatusIsAnErrorNamingRunning(t *testing.
 }
 
 // m4 (review round 1): an upper-case UUID on cluster_id must be rejected
-// with the canonical-UUID wording, with zero API requests. Same measured
-// GREEN-today status as the other m4 tests (see datasource_cluster_test.go's
-// doc comment): parseInputID already runs before any request inside Read.
+// with the canonical-UUID wording, with zero API requests.
+// canonicalIDValidator covers cluster_id at plan time now (see
+// datasource_cluster_test.go's doc comment for the validator/Read-backstop
+// split); this pins the wording and the zero-requests property as
+// regressions.
 func TestDataSourceKubeconfig_UpperCaseClusterIDIsRejectedWithZeroRequests(t *testing.T) {
 	api := setupFake(t)
 	resource.UnitTest(t, resource.TestCase{
@@ -143,9 +146,12 @@ func TestDataSourceKubeconfig_OversizedBodyIsAnError(t *testing.T) {
 // m5 (review round 1, GREEN today): the API's SECOND 409 cause - the control
 // plane has not published a kubeconfig yet even though the cluster already
 // reads "running" - must still surface through the T13-11 wrapped wording,
-// carrying the API's own message in the parenthetical (notReadyDetail's
-// "the API said: ..." branch, since this message has no "Current status:"
-// marker to extract from).
+// carrying the API's own message in the parenthetical
+// (kubeconfigConflictDetail's "the API said: ..." branch, since this message
+// has no "Current status:" marker to extract from). Also pins the n1/m2
+// coverage gap review round 2 named (no test asserted the request id): the
+// fake sets X-Request-ID on every response (fakeapi/clusters.go's
+// apiError), so a real request id must appear in the diagnostic too.
 func TestDataSourceKubeconfig_ProvisioningConflictOnARunningClusterSurfacesTheAPIMessage(t *testing.T) {
 	api := setupFake(t)
 	cid := seedCluster(t, api, "c")
@@ -154,8 +160,10 @@ func TestDataSourceKubeconfig_ProvisioningConflictOnARunningClusterSurfacesTheAP
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{{
-			Config:      kubeconfigDataSourceHCL(cid),
-			ExpectError: loose("Control plane is still provisioning"),
+			Config: kubeconfigDataSourceHCL(cid),
+			ExpectError: regexp.MustCompile(
+				loose("Control plane is still provisioning").String() + `[\s\S]*` + loose("request id").String(),
+			),
 		}},
 	})
 }
