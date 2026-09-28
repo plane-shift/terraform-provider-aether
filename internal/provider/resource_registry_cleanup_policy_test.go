@@ -312,8 +312,13 @@ func TestCleanupPolicyResource_ReadNormalisesNumericValueAndPortalShape(t *testi
 			ResourceName:       cleanupPolicyResource,
 			ImportState:        true,
 			ImportStatePersist: true,
-			Config:             cleanupPolicyHCL("p", []map[string]string{{"type": "tag_count", "op": "gt", "value": "10"}, {"type": "untagged"}}),
-			ImportStateId:      id,
+			// The untagged condition carries an explicit value in Config (the
+			// ruled plan-time validator, T11-10, refuses a valueless untagged
+			// condition) - the seeded policy's own {"type":"untagged"} (no
+			// op/value at all) is what ImportStateCheck below inspects, via
+			// the imported STATE, not this config.
+			Config:        cleanupPolicyHCL("p", []map[string]string{{"type": "tag_count", "op": "gt", "value": "10"}, {"type": "untagged", "value": "true"}}),
+			ImportStateId: id,
 			ImportStateCheck: func(is []*terraform.InstanceState) error {
 				if len(is) != 1 {
 					return fmt.Errorf("want exactly one imported instance, got %d", len(is))
@@ -341,6 +346,7 @@ func TestCleanupPolicyResource_ReadNormalisesNumericValueAndPortalShape(t *testi
 // Fails if Read does not remove a policy deleted out of band.
 func TestCleanupPolicyResource_ReadRemovedOutOfBandRemovesFromState(t *testing.T) {
 	api := setupFake(t)
+	var id string
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
@@ -348,14 +354,21 @@ func TestCleanupPolicyResource_ReadRemovedOutOfBandRemovesFromState(t *testing.T
 			{
 				Config: cleanupPolicyHCL("p", []map[string]string{{"type": "age", "op": "gt", "value": "30d"}}),
 				Check: func(s *terraform.State) error {
-					id := attrs(s, cleanupPolicyResource)["id"]
-					if !api.RemovePolicy(testOrg, id) {
-						t.Fatalf("RemovePolicy(%s) reported the policy missing", id)
-					}
+					id = attrs(s, cleanupPolicyResource)["id"]
 					return nil
 				},
 			},
 			{
+				// The removal must happen between step 1's own post-apply
+				// refresh-plan check (which still sees the policy present)
+				// and step 2's apply - doing it inside step 1's Check would
+				// make that automatic refresh-plan check itself see a
+				// missing policy and fail with a non-empty plan (T11 D2).
+				PreConfig: func() {
+					if !api.RemovePolicy(testOrg, id) {
+						t.Fatalf("RemovePolicy(%s) reported the policy missing", id)
+					}
+				},
 				Config: cleanupPolicyHCL("p", []map[string]string{{"type": "age", "op": "gt", "value": "30d"}}),
 				Check: func(*terraform.State) error {
 					if posts := requestsMatching(api, http.MethodPost, policiesListRE); len(posts) != 2 {
@@ -440,6 +453,7 @@ func TestCleanupPolicyResource_DestroySendsExactlyOneDelete(t *testing.T) {
 // instead of re-listing and finding the id absent: destroy must succeed.
 func TestCleanupPolicyResource_DestroyOfAnAlreadyRemovedPolicyIsSuccess(t *testing.T) {
 	api := setupFake(t)
+	var id string
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
@@ -447,14 +461,23 @@ func TestCleanupPolicyResource_DestroyOfAnAlreadyRemovedPolicyIsSuccess(t *testi
 			{
 				Config: cleanupPolicyHCL("p", []map[string]string{{"type": "age", "op": "gt", "value": "30d"}}),
 				Check: func(s *terraform.State) error {
-					id := attrs(s, cleanupPolicyResource)["id"]
-					if !api.RemovePolicy(testOrg, id) {
-						t.Fatalf("RemovePolicy(%s) reported the policy missing", id)
-					}
+					id = attrs(s, cleanupPolicyResource)["id"]
 					return nil
 				},
 			},
-			{Config: providerOnlyHCL, Check: checkAbsentFromState(cleanupPolicyResource)},
+			{
+				// See TestCleanupPolicyResource_ReadRemovedOutOfBandRemovesFromState:
+				// the removal must wait for step 2's PreConfig, not step 1's
+				// Check, or step 1's own post-apply refresh-plan check sees
+				// the policy missing and fails (T11 D3).
+				PreConfig: func() {
+					if !api.RemovePolicy(testOrg, id) {
+						t.Fatalf("RemovePolicy(%s) reported the policy missing", id)
+					}
+				},
+				Config: providerOnlyHCL,
+				Check:  checkAbsentFromState(cleanupPolicyResource),
+			},
 		},
 	})
 }

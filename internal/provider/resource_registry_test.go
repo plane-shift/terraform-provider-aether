@@ -198,8 +198,16 @@ func TestRegistryResource_SecondApplyIsRefreshOnlyAndKeepsCredentials(t *testing
 				PreConfig: func() { seen = len(api.Requests()) },
 				Config:    registryHCL(),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr(registryResource, "robot_secret", firstSecret),
-					resource.TestCheckResourceAttr(registryResource, "robot_username", firstUser),
+					func(s *terraform.State) error {
+						a := attrs(s, registryResource)
+						if a["robot_secret"] != firstSecret {
+							return fmt.Errorf("robot_secret = %q, want the first apply's %q (write-once, never re-minted)", a["robot_secret"], firstSecret)
+						}
+						if a["robot_username"] != firstUser {
+							return fmt.Errorf("robot_username = %q, want the first apply's %q (write-once, never re-minted)", a["robot_username"], firstUser)
+						}
+						return nil
+					},
 					func(*terraform.State) error {
 						if w := writesSince(api, seen); len(w) != 0 {
 							return fmt.Errorf("an unchanged second apply wrote: %v, want zero writes (refresh GET only)", w)

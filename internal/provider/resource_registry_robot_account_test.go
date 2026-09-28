@@ -475,6 +475,7 @@ func attrsFromLastPlan(t *testing.T, api *fakeapi.Server) string {
 func TestRobotAccountResource_DestroyStickyFailureErrorsAndKeepsState(t *testing.T) {
 	api := setupFake(t)
 	cfg := robotAccountHCL("ci", []string{"push"})
+	var id string
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
@@ -482,7 +483,7 @@ func TestRobotAccountResource_DestroyStickyFailureErrorsAndKeepsState(t *testing
 			{
 				Config: cfg,
 				Check: func(s *terraform.State) error {
-					id := attrs(s, robotAccountResource)["id"]
+					id = attrs(s, robotAccountResource)["id"]
 					api.StickyRobotDeleteFailure(testOrg, id, http.StatusServiceUnavailable, "harbor_unavailable",
 						"could not revoke the credential in the registry; not deleted")
 					return nil
@@ -505,6 +506,15 @@ func TestRobotAccountResource_DestroyStickyFailureErrorsAndKeepsState(t *testing
 					}
 					return nil
 				},
+			},
+			{
+				// Clear the sticky failure and prove the destroy then
+				// succeeds with exactly one more DELETE - this also stands
+				// in for the harness's own post-test cleanup destroy, which
+				// would otherwise hit the same still-armed 503 (T11 D4).
+				PreConfig: func() { api.ClearRobotDeleteFailure(testOrg, id) },
+				Config:    providerOnlyHCL,
+				Check:     checkAbsentFromState(robotAccountResource),
 			},
 		},
 	})

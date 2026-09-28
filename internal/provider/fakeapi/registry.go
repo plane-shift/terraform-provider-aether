@@ -72,8 +72,8 @@ package fakeapi
 //     handler's http.Error(...) calls - never the JSON error envelope.
 //
 // Out-of-band knobs: Disable, SeedRobot/SeedRobotWithID/RemoveRobot,
-// StickyRobotDeleteFailure, SeedPolicy/SetLastRun/RemovePolicy - see each
-// doc comment.
+// StickyRobotDeleteFailure/ClearRobotDeleteFailure,
+// SeedPolicy/SetLastRun/RemovePolicy - see each doc comment.
 
 import (
 	"encoding/json"
@@ -316,6 +316,20 @@ func (s *Server) StickyRobotDeleteFailure(org, id string, status int, code, mess
 		rs.robotDeleteFail = map[string]*registryFailure{}
 	}
 	rs.robotDeleteFail[org+"/"+id] = &registryFailure{status: status, code: code, message: message}
+}
+
+// ClearRobotDeleteFailure removes a sticky DELETE failure previously armed by
+// StickyRobotDeleteFailure for org's robot id, so a subsequent DELETE
+// succeeds normally again. It is a no-op if no failure was armed for that
+// key (never errors) - a test proving recovery after a transient Harbor
+// outage arms the failure, drives the error path, then clears it here before
+// letting a later destroy (including the harness's own post-test cleanup)
+// through.
+func (s *Server) ClearRobotDeleteFailure(org, id string) {
+	rs := &s.registries
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	delete(rs.robotDeleteFail, org+"/"+id)
 }
 
 // SeedPolicy adds a cleanup policy out of band (no request recorded, no

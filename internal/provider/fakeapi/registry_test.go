@@ -417,6 +417,36 @@ func TestStickyRobotDeleteFailureRepeatsAndKeepsRow(t *testing.T) {
 	}
 }
 
+// Fails if ClearRobotDeleteFailure does not let a subsequent DELETE succeed
+// normally, if it removes the WRONG key (a different id), or if it errors
+// when no failure was ever armed for that key (must be a safe no-op).
+func TestClearRobotDeleteFailureAllowsSubsequentDeleteToSucceed(t *testing.T) {
+	s := newClusterFake(t)
+
+	// A no-op clear for a key with nothing armed must not panic or error.
+	s.ClearRobotDeleteFailure(testOrg, uuid.NewString())
+
+	_, b := call(t, s, http.MethodPost, robotsPath, `{"name":"ci","permissions":["push"]}`)
+	id := decode(t, b)["id"].(string)
+	_, b2 := call(t, s, http.MethodPost, robotsPath, `{"name":"other","permissions":["push"]}`)
+	otherID := decode(t, b2)["id"].(string)
+
+	s.StickyRobotDeleteFailure(testOrg, id, http.StatusServiceUnavailable, "harbor_unavailable",
+		"could not revoke the credential in the registry; not deleted")
+	s.StickyRobotDeleteFailure(testOrg, otherID, http.StatusServiceUnavailable, "harbor_unavailable",
+		"could not revoke the credential in the registry; not deleted")
+
+	s.ClearRobotDeleteFailure(testOrg, id)
+
+	if resp, b := call(t, s, http.MethodDelete, robotsPath+"/"+id, ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete after clearing = %d %s, want 204 (the failure must be gone)", resp.StatusCode, b)
+	}
+	// The OTHER id's failure must be untouched by clearing id's.
+	if resp, b := call(t, s, http.MethodDelete, robotsPath+"/"+otherID, ""); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("delete of the un-cleared id = %d %s, want 503 (clearing one key must not clear another)", resp.StatusCode, b)
+	}
+}
+
 // ---------------------------------------------------------------- C11: cleanup policies
 
 const minimalPolicyBody = `{"name":"p","action":"delete","conditions":[{"type":"age","op":"gt","value":"30d"}],"repo_scope":[],"schedule":"nightly"}`
