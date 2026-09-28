@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/apierr"
@@ -40,7 +41,7 @@ func (d *kubeconfigDataSource) Schema(_ context.Context, _ datasource.SchemaRequ
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "The cluster's administrator kubeconfig, the same file the portal downloads. It grants cluster-admin: treat the Terraform state as a secret. It is available only while the cluster is `running`; a plan that reads it fails while the cluster is upgrading or degraded.",
 		Attributes: map[string]schema.Attribute{
-			"cluster_id": schema.StringAttribute{Required: true, MarkdownDescription: "UUID of the cluster."},
+			"cluster_id": schema.StringAttribute{Required: true, Validators: []validator.String{canonicalIDValidator{}}, MarkdownDescription: "UUID of the cluster."},
 			"content": schema.StringAttribute{Computed: true, Sensitive: true,
 				MarkdownDescription: "The kubeconfig YAML, byte for byte as the API serves it."},
 		},
@@ -78,8 +79,7 @@ func (d *kubeconfigDataSource) Read(ctx context.Context, req datasource.ReadRequ
 	switch {
 	case hr.StatusCode == http.StatusConflict:
 		e := apierr.Parse(hr.StatusCode, hr.Header, body)
-		resp.Diagnostics.AddError("Kubeconfig not available",
-			fmt.Sprintf("The cluster's kubeconfig is available only while it is `running` (%s).", notReadyDetail(e.Message)))
+		resp.Diagnostics.AddError("Kubeconfig not available", kubeconfigConflictDetail(e))
 		return
 	case hr.StatusCode != http.StatusOK:
 		apierr.ToDiagnostics(apierr.Parse(hr.StatusCode, hr.Header, body), &resp.Diagnostics, path.Empty())
@@ -100,17 +100,23 @@ func (d *kubeconfigDataSource) Read(ctx context.Context, req datasource.ReadRequ
 	resp.Diagnostics.Append(resp.State.Set(ctx, &out)...)
 }
 
-// notReadyDetail turns the API's 409 message into the parenthetical of the
-// "available only while running" error: the current status when the API
-// names it ("Cluster is not yet ready. Current status: upgrading"), the API's
-// own words otherwise (a running cluster whose control plane has not
-// published a kubeconfig yet).
-func notReadyDetail(msg string) string {
+// kubeconfigConflictDetail renders the API's 409, which has two causes:
+// the cluster is not `running` ("Cluster is not yet ready. Current status:
+// upgrading") - named with the current status - or the cluster IS running but
+// its control plane has not published a kubeconfig yet, which is reported in
+// the API's own words (so it never claims the cluster is not running). The
+// request id is appended exactly as apierr.ToDiagnostics does.
+func kubeconfigConflictDetail(e *apierr.Error) string {
+	reason := " (the API said: " + apierr.Truncate(e.Message, 200) + ")"
 	const marker = "Current status:"
-	if i := strings.Index(msg, marker); i >= 0 {
-		if s := strings.TrimSpace(msg[i+len(marker):]); s != "" {
-			return "current status: " + apierr.Truncate(s, 64)
+	if i := strings.Index(e.Message, marker); i >= 0 {
+		if st := strings.TrimSpace(e.Message[i+len(marker):]); st != "" {
+			reason = ": it is available only while it is `running` (current status: " + apierr.Truncate(st, 64) + ")"
 		}
 	}
-	return "the API said: " + apierr.Truncate(msg, 200)
+	rid := ""
+	if e.RequestID != "" {
+		rid = " (request id " + e.RequestID + ")"
+	}
+	return "The cluster's kubeconfig is not available yet" + reason + rid + "."
 }

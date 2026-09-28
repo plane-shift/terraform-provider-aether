@@ -9,6 +9,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/apierr"
@@ -59,7 +60,7 @@ func (d *clusterVolumesDataSource) Schema(_ context.Context, _ datasource.Schema
 		MarkdownDescription: "The persistent volumes of a cluster from the platform's storage inventory, sorted by `id`. " +
 			"When `inventory_available` is false the platform could not read the storage inventory and `volumes` is empty — not a statement that the cluster has no volumes.",
 		Attributes: map[string]schema.Attribute{
-			"cluster_id": schema.StringAttribute{Required: true, MarkdownDescription: "UUID of the cluster."},
+			"cluster_id": schema.StringAttribute{Required: true, Validators: []validator.String{canonicalIDValidator{}}, MarkdownDescription: "UUID of the cluster."},
 			"volumes": schema.ListNestedAttribute{Computed: true,
 				MarkdownDescription: "The cluster's volumes, sorted by `id`.",
 				NestedObject: schema.NestedAttributeObject{Attributes: map[string]schema.Attribute{

@@ -8,6 +8,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/apierr"
@@ -44,8 +45,8 @@ func (d *nodePoolMachinesDataSource) Schema(_ context.Context, _ datasource.Sche
 		MarkdownDescription: "The machines (nodes) of a node pool, sorted by name, as the platform currently sees them. " +
 			"An empty list is also what the platform returns when it cannot read the cluster's machines; `age_seconds` changes on every read; `k8s_version` is the kubelet's own string (it may carry a leading `v`).",
 		Attributes: map[string]schema.Attribute{
-			"cluster_id":   schema.StringAttribute{Required: true, MarkdownDescription: "UUID of the cluster."},
-			"node_pool_id": schema.StringAttribute{Required: true, MarkdownDescription: "UUID of the node pool."},
+			"cluster_id":   schema.StringAttribute{Required: true, Validators: []validator.String{canonicalIDValidator{}}, MarkdownDescription: "UUID of the cluster."},
+			"node_pool_id": schema.StringAttribute{Required: true, Validators: []validator.String{canonicalIDValidator{}}, MarkdownDescription: "UUID of the node pool."},
 			"machines": schema.ListNestedAttribute{Computed: true,
 				MarkdownDescription: "The pool's machines, sorted by name.",
 				NestedObject: schema.NestedAttributeObject{Attributes: map[string]schema.Attribute{

@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/client"
@@ -95,7 +96,7 @@ func clusterDataAttributes(lookup bool) map[string]schema.Attribute {
 		"updated_at":                  computed("Last update time (RFC 3339)."),
 	}
 	if lookup {
-		attrs["id"] = schema.StringAttribute{Optional: true, Computed: true,
+		attrs["id"] = schema.StringAttribute{Optional: true, Computed: true, Validators: []validator.String{canonicalIDValidator{}},
 			MarkdownDescription: "Cluster UUID to look up. Exactly one of `id` and `name` must be set."}
 		attrs["name"] = schema.StringAttribute{Optional: true, Computed: true,
 			MarkdownDescription: "Cluster name to look up (names are unique within the organization). Exactly one of `id` and `name` must be set."}
@@ -188,14 +189,46 @@ func (d *clusterDataSource) Read(ctx context.Context, req datasource.ReadRequest
 // lower-case UUID text: Terraform rejects a data source that returns a
 // configured value in a different spelling, and the API answers with the
 // canonical form, so anything else is refused here with a clear message.
+// It is the Read-time backstop of canonicalIDValidator (same check, same
+// message), for values that were unknown at validate time.
 func parseInputID(p path.Path, s string, diags *diag.Diagnostics) (client.ClusterID, bool) {
 	id, err := parseID(s)
 	if err != nil || id.String() != s {
-		diags.AddAttributeError(p, "Invalid id",
-			fmt.Sprintf("%q must be a canonical lower-case UUID (36 characters, lower-case hex and hyphens).", s))
+		diags.AddAttributeError(p, "Invalid id", nonCanonicalIDDetail(s))
 		return id, false
 	}
 	return id, true
+}
+
+func nonCanonicalIDDetail(s string) string {
+	return fmt.Sprintf("%q must be a canonical lower-case UUID (36 characters, lower-case hex and hyphens).", s)
+}
+
+// canonicalIDValidator is the schema-level form of parseInputID on every id
+// input of the data sources, so `terraform validate` already refuses a
+// non-canonical id; unknown values are left to the Read-time backstop.
+type canonicalIDValidator struct{}
+
+func (canonicalIDValidator) Description(context.Context) string {
+	return "must be a canonical lower-case UUID"
+}
+
+func (v canonicalIDValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (canonicalIDValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if s := req.ConfigValue.ValueString(); !isCanonicalID(s) {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid id", nonCanonicalIDDetail(s))
+	}
+}
+
+func isCanonicalID(s string) bool {
+	id, err := parseID(s)
+	return err == nil && id.String() == s
 }
 
 // listPageLimit is the page size the list data sources request: the API's

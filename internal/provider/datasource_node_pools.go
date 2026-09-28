@@ -6,6 +6,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/apierr"
@@ -31,7 +32,7 @@ func (d *nodePoolsDataSource) Schema(_ context.Context, _ datasource.SchemaReque
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Every live node pool of a cluster, in the API's order (by id). Pools that are still being deleted are included, with `status = \"deleting\"`.",
 		Attributes: map[string]schema.Attribute{
-			"cluster_id": schema.StringAttribute{Required: true, MarkdownDescription: "UUID of the cluster."},
+			"cluster_id": schema.StringAttribute{Required: true, Validators: []validator.String{canonicalIDValidator{}}, MarkdownDescription: "UUID of the cluster."},
 			"node_pools": schema.ListNestedAttribute{Computed: true,
 				MarkdownDescription: "The pools, with the same attributes as `data.aether_node_pool`.",
 				NestedObject:        schema.NestedAttributeObject{Attributes: nodePoolDataAttributes(false)}},

@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/client"
@@ -124,9 +125,9 @@ func nodePoolDataAttributes(lookup bool) map[string]schema.Attribute {
 		"updated_at":                     str("Last update time (RFC 3339)."),
 	}
 	if lookup {
-		attrs["cluster_id"] = schema.StringAttribute{Required: true,
+		attrs["cluster_id"] = schema.StringAttribute{Required: true, Validators: []validator.String{canonicalIDValidator{}},
 			MarkdownDescription: "UUID of the cluster the pool belongs to."}
-		attrs["id"] = schema.StringAttribute{Optional: true, Computed: true,
+		attrs["id"] = schema.StringAttribute{Optional: true, Computed: true, Validators: []validator.String{canonicalIDValidator{}},
 			MarkdownDescription: "Node pool UUID to look up. Exactly one of `id` and `name` must be set."}
 		attrs["name"] = schema.StringAttribute{Optional: true, Computed: true,
 			MarkdownDescription: "Pool name to look up. Exactly one of `id` and `name` must be set. A pool that is still being deleted (`status = \"deleting\"`) holds its name until the platform removes it, so it can match."}

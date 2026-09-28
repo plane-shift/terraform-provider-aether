@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/apierr"
@@ -54,7 +55,7 @@ func (d *loadBalancersDataSource) Schema(_ context.Context, _ datasource.SchemaR
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Public addresses allocated to the cluster: `cp_lb` is the cluster's own API endpoint, `ccm_lb` a tenant LoadBalancer Service (`service_ref` = its UID); the DNS name is not exposed by the API today (aether-api issue).",
 		Attributes: map[string]schema.Attribute{
-			"cluster_id": schema.StringAttribute{Required: true, MarkdownDescription: "UUID of the cluster."},
+			"cluster_id": schema.StringAttribute{Required: true, Validators: []validator.String{canonicalIDValidator{}}, MarkdownDescription: "UUID of the cluster."},
 			"loadbalancers": schema.ListNestedAttribute{Computed: true,
 				MarkdownDescription: "The addresses, in the API's order (by allocation time, then address).",
 				NestedObject: schema.NestedAttributeObject{Attributes: map[string]schema.Attribute{
@@ -94,11 +95,12 @@ func (d *loadBalancersDataSource) Read(ctx context.Context, req datasource.ReadR
 		Items *[]loadBalancerWire `json:"items"`
 	}
 	if err := json.Unmarshal(res.Body, &wire); err != nil || wire.Items == nil {
-		detail := describeNonJSON(res.HTTPResponse, res.Status())
+		var detail string
 		if err != nil {
-			detail += ": " + err.Error()
+			detail = describeNonJSON(res.HTTPResponse, res.Status()) + ": " + err.Error()
 		} else {
-			detail += fmt.Sprintf(": the body has no %q list", "items")
+			detail = fmt.Sprintf("%s %s returned %s with a JSON body that has no %q list",
+				res.HTTPResponse.Request.Method, res.HTTPResponse.Request.URL, res.Status(), "items")
 		}
 		resp.Diagnostics.AddError(nonJSONSummary, detail)
 		return

@@ -7,6 +7,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/apierr"
@@ -35,7 +36,7 @@ func (d *clusterNetworkDataSource) Schema(_ context.Context, _ datasource.Schema
 		MarkdownDescription: "The API-server network policy of a cluster. An empty `authorized_cidrs` list means the endpoint accepts every source address. " +
 			"A cluster whose policy was never configured reads an empty list, a null `api_server_rate_limit` (the platform default) and the zero time as `updated_at`.",
 		Attributes: map[string]schema.Attribute{
-			"cluster_id": schema.StringAttribute{Required: true, MarkdownDescription: "UUID of the cluster."},
+			"cluster_id": schema.StringAttribute{Required: true, Validators: []validator.String{canonicalIDValidator{}}, MarkdownDescription: "UUID of the cluster."},
 			"authorized_cidrs": schema.ListAttribute{Computed: true, ElementType: types.StringType,
 				MarkdownDescription: "Source CIDRs allowed to reach the API server; empty = every source."},
 			"api_server_rate_limit": schema.SingleNestedAttribute{Computed: true,

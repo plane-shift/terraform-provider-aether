@@ -66,7 +66,7 @@ func (d *regionsDataSource) Read(ctx context.Context, _ datasource.ReadRequest, 
 				res.HTTPResponse.Request.URL, res.Status(), res.HTTPResponse.Header.Get("Content-Type")))
 		return
 	}
-	var out regionsModel
+	out := regionsModel{Regions: []regionModel{}}
 	for _, r := range res.JSON200.Items {
 		out.Regions = append(out.Regions, regionModel{ID: types.StringValue(r.Id), Name: types.StringValue(r.Name), Location: types.StringValue(r.Location), Available: types.BoolValue(r.Available)})
 	}
