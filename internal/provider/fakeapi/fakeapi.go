@@ -41,6 +41,7 @@ type Server struct {
 	pools       poolStore    // see nodepools.go; own lock
 	networks    networkStore // see networks.go; own lock
 	orgStore    orgStore     // see organizations.go + members.go; own lock
+	webhooks    webhookStore // see webhooks.go; own lock
 	// Handlers lets a test override a route: key "METHOD /path" (path after /api/v1).
 	Handlers map[string]http.HandlerFunc
 }
@@ -149,6 +150,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		// served by networks.go
 	case s.routeClusters(w, r, path, body):
 		// served by clusters.go
+	case s.routeWebhooks(w, r, path, body):
+		// served by webhooks.go
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "no route " + r.Method + " " + path}})
 	}
