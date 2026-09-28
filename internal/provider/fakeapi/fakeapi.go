@@ -40,17 +40,23 @@ type Server struct {
 	srv   *httptest.Server
 	token string
 
-	mu          sync.Mutex
-	orgs        []Org
-	requests    []Request
-	bodyReadErr error
-	clusters    clusterStore  // see clusters.go; own lock
-	pools       poolStore     // see nodepools.go; own lock
-	networks    networkStore  // see networks.go; own lock
-	orgStore    orgStore      // see organizations.go + members.go; own lock
-	webhooks    webhookStore  // see webhooks.go; own lock
-	registries  registryStore // see registry.go; own lock
-	budgets     budgetStore   // see budgets.go; own lock
+	mu           sync.Mutex
+	orgs         []Org
+	requests     []Request
+	bodyReadErr  error
+	clusters     clusterStore     // see clusters.go; own lock
+	pools        poolStore        // see nodepools.go; own lock
+	networks     networkStore     // see networks.go; own lock
+	orgStore     orgStore         // see organizations.go + members.go; own lock
+	webhooks     webhookStore     // see webhooks.go; own lock
+	registries   registryStore    // see registry.go; own lock
+	budgets      budgetStore      // see budgets.go; own lock
+	k8sVersions  k8sVersionsStore // see regions.go; own lock
+	regionsEmpty bool             // see regions.go SetRegionsEmpty; protected by mu
+	kubeconfigs  kubeconfigStore  // see kubeconfig.go; own lock
+	lbs          lbStore          // see loadbalancers.go; own lock
+	volumes      volumeStore      // see volumes.go; own lock
+	machines     machineStore     // see machines.go; own lock
 	// Handlers lets a test override a route: key "METHOD /path" (path after /api/v1).
 	Handlers map[string]http.HandlerFunc
 }
@@ -95,13 +101,16 @@ func (s *Server) Requests() []Request {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Authorization") != "Bearer "+s.token {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"code": "unauthorized", "message": "invalid token"}})
-		return
-	}
 	path, ok := strings.CutPrefix(r.URL.Path, "/api/v1")
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "invalid API base path " + r.URL.Path}})
+		return
+	}
+	// /regions and /k8s-versions carry NO auth check at all (measured contract
+	// §1/§2, security: []) - a request with no Authorization header must still
+	// succeed, so the path must be known before the token gate runs.
+	if !isPublicRoute(r.Method, path) && r.Header.Get("Authorization") != "Bearer "+s.token {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"code": "unauthorized", "message": "invalid token"}})
 		return
 	}
 	var body []byte
@@ -135,6 +144,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case s.routeRegions(w, r, path, body):
+		// served by regions.go
+	case s.routeK8sVersions(w, r, path, body):
+		// served by regions.go
 	case s.routeOrganizations(w, r, path, body):
 		// served by organizations.go
 	case s.routeMembers(w, r, path, body):
@@ -155,8 +168,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	case s.routeNodePools(w, r, path, body):
 		// served by nodepools.go
+	case s.routeMachines(w, r, path, body):
+		// served by machines.go
 	case s.routeClusterNetwork(w, r, path, body):
 		// served by networks.go
+	case s.routeKubeconfig(w, r, path, body):
+		// served by kubeconfig.go
+	case s.routeLoadBalancers(w, r, path, body):
+		// served by loadbalancers.go
+	case s.routeVolumes(w, r, path, body):
+		// served by volumes.go
 	case s.routeClusters(w, r, path, body):
 		// served by clusters.go
 	case s.routeWebhooks(w, r, path, body):

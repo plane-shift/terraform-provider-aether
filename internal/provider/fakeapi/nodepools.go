@@ -230,6 +230,28 @@ func (s *Server) NodePoolIDs(clusterID string) []string {
 	return s.pools.sortedIDs(clusterID)
 }
 
+// SeedManyNodePools directly creates n running fixed-size node pools under
+// clusterID, bypassing the HTTP create path - a paging test needs hundreds of
+// rows fast. Returns their ids in creation order (the same order the list
+// route serves).
+func (s *Server) SeedManyNodePools(clusterID string, n int) []string {
+	s.pools.mu.Lock()
+	defer s.pools.mu.Unlock()
+	s.pools.init()
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		s.pools.next++
+		p := &fakePool{
+			id: uuid.NewString(), clusterID: clusterID, name: "bulk-" + strconv.Itoa(i),
+			vcpus: 2, memoryGB: 4, diskGB: 20, minNodes: 1, maxNodes: 1, desired: 1,
+			seq: s.pools.next,
+		}
+		s.pools.pools[p.id] = p
+		ids[i] = p.id
+	}
+	return ids
+}
+
 func (ps *poolStore) sorted(clusterID string) []*fakePool {
 	var out []*fakePool
 	for _, p := range ps.pools {

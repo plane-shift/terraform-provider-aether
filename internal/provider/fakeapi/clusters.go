@@ -56,6 +56,7 @@ type clusterKnobs struct {
 	patches        map[string]int // minor ("1.37") -> latest resolved patch
 	lagGets        int            // GETs after an upgrade POST that still read the old status/observed
 	lagUpgrading   int            // then this many GETs read "upgrading"
+	repeatCursor   bool           // see RepeatListCursor
 }
 
 type getFail struct {
@@ -165,6 +166,21 @@ func (s *Server) CreateRespondsWithNonJSON(on bool) {
 	s.clusters.knobs.nonJSONCreate = on
 }
 
+// RepeatListCursor makes GET /clusters ignore the incoming cursor query
+// parameter entirely: every page request (whatever cursor it carries) is
+// answered as if it were page 1, so next_cursor is the SAME value on every
+// call. This reproduces review finding m3's "server that ignores the
+// cursor" - collectAll (paging.go) tracks every cursor it has already sent
+// in a `seen` set, so this knob's repeat is caught on the second call and
+// the caller gets a paging error ("the API repeated pagination cursor")
+// instead of page 1 twice.
+func (s *Server) RepeatListCursor(on bool) {
+	s.clusters.mu.Lock()
+	defer s.clusters.mu.Unlock()
+	s.clusters.init()
+	s.clusters.knobs.repeatCursor = on
+}
+
 // ClusterIDs returns the ids of the clusters currently held, oldest first.
 func (s *Server) ClusterIDs() []string {
 	s.clusters.mu.Lock()
@@ -191,6 +207,27 @@ func (s *Server) SetLatestPatch(minor string, patch int) {
 	defer s.clusters.mu.Unlock()
 	s.clusters.init()
 	s.clusters.knobs.patches[minor] = patch
+}
+
+// SeedManyClusters directly creates n running clusters in org, bypassing the
+// HTTP create path entirely - a paging test needs hundreds of rows fast, and
+// never cares about CreateClusterRequest validation. Returns their ids in
+// creation order (the same order the list route serves, seq-ascending).
+func (s *Server) SeedManyClusters(org string, n int) []string {
+	s.clusters.mu.Lock()
+	defer s.clusters.mu.Unlock()
+	s.clusters.init()
+	ids := make([]string, n)
+	for i := 0; i < n; i++ {
+		s.clusters.next++
+		c := &fakeCluster{
+			id: uuid.NewString(), orgID: org, name: "bulk-" + strconv.Itoa(i), region: "r",
+			k8sVersion: "1.37.2", seq: s.clusters.next,
+		}
+		s.clusters.clusters[c.id] = c
+		ids[i] = c.id
+	}
+	return ids
 }
 
 // SetStoredVersionAhead puts the cluster in the state a rollout leaves behind
@@ -355,18 +392,7 @@ func (s *Server) routeClusters(w http.ResponseWriter, r *http.Request, path stri
 
 	switch {
 	case id == "" && r.Method == http.MethodGet:
-		items := []map[string]any{}
-		ids := make([]*fakeCluster, 0)
-		for _, c := range cs.clusters {
-			if c.orgID == org {
-				ids = append(ids, c)
-			}
-		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i].seq < ids[j].seq })
-		for _, c := range ids {
-			items = append(items, cs.clusterJSON(c, cs.statusOf(c, false)))
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		cs.list(w, r, org)
 	case id == "" && r.Method == http.MethodPost:
 		cs.create(w, org, body)
 	case id != "" && !upgrade:
@@ -398,6 +424,50 @@ func (s *Server) routeClusters(w http.ResponseWriter, r *http.Request, path stri
 		apiError(w, http.StatusNotFound, "not_found", "no route "+r.Method+" "+path)
 	}
 	return true
+}
+
+// list serves GET /organizations/{org}/clusters: cursor-paginated exactly
+// like poolStore.list (nodepools.go) - limit 1..100 default 50 (bad values
+// silently fall back to 50), next_cursor set IFF the page is FULL, an
+// unrecognised cursor restarts from page 1 (task-13-measured-contract.md
+// §7). Caller holds cs.mu.
+func (cs *clusterStore) list(w http.ResponseWriter, r *http.Request, org string) {
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		var n int
+		if err := json.Unmarshal([]byte(v), &n); err == nil && n >= 1 && n <= 100 {
+			limit = n
+		}
+	}
+	all := make([]*fakeCluster, 0)
+	for _, c := range cs.clusters {
+		if c.orgID == org {
+			all = append(all, c)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].seq < all[j].seq })
+	start := 0
+	if c := r.URL.Query().Get("cursor"); c != "" && !cs.knobs.repeatCursor {
+		for i, cl := range all {
+			if cl.id == c {
+				start = i + 1
+			}
+		}
+	}
+	items := []map[string]any{}
+	var last string
+	for _, c := range all[start:] {
+		if len(items) == limit {
+			break
+		}
+		items = append(items, cs.clusterJSON(c, cs.statusOf(c, false)))
+		last = c.id
+	}
+	out := map[string]any{"items": items}
+	if len(items) == limit {
+		out["next_cursor"] = last
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // statusOf reads the current status; advance=true consumes one step of the

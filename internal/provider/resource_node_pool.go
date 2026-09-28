@@ -450,7 +450,7 @@ func (r *nodePoolResource) Create(ctx context.Context, req resource.CreateReques
 	}
 	// Persist the id immediately, with the create response flattened in, so a
 	// wait failure leaves an importable (tainted) resource in state.
-	resp.Diagnostics.Append(r.flatten(ctx, created, &plan)...)
+	resp.Diagnostics.Append(flattenNodePool(ctx, created, &plan)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -461,7 +461,7 @@ func (r *nodePoolResource) Create(ctx context.Context, req resource.CreateReques
 		resp.Diagnostics.AddError("Node pool did not become running", err.Error())
 		return
 	}
-	resp.Diagnostics.Append(r.flatten(ctx, final, &plan)...)
+	resp.Diagnostics.Append(flattenNodePool(ctx, final, &plan)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -486,7 +486,7 @@ func (r *nodePoolResource) Read(ctx context.Context, req resource.ReadRequest, r
 		apierr.ToDiagnostics(err, &resp.Diagnostics, path.Empty())
 		return
 	}
-	resp.Diagnostics.Append(r.flatten(ctx, p, &state)...)
+	resp.Diagnostics.Append(flattenNodePool(ctx, p, &state)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -605,7 +605,7 @@ func (r *nodePoolResource) Update(ctx context.Context, req resource.UpdateReques
 	if !sent {
 		// Nothing to send (a timeouts-only edit, or labels/taints moving
 		// between null and empty): record the read taken above.
-		resp.Diagnostics.Append(r.flatten(ctx, current, &plan)...)
+		resp.Diagnostics.Append(flattenNodePool(ctx, current, &plan)...)
 		warnIfDegraded(current, &resp.Diagnostics)
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
@@ -639,7 +639,7 @@ func (r *nodePoolResource) Update(ctx context.Context, req resource.UpdateReques
 			resp.Diagnostics.AddError("Node pool did not finish scaling", err.Error())
 			return
 		}
-		resp.Diagnostics.Append(r.flatten(ctx, final, &plan)...)
+		resp.Diagnostics.Append(flattenNodePool(ctx, final, &plan)...)
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
@@ -652,7 +652,7 @@ func (r *nodePoolResource) Update(ctx context.Context, req resource.UpdateReques
 		apierr.ToDiagnostics(err, &resp.Diagnostics, path.Empty())
 		return
 	}
-	resp.Diagnostics.Append(r.flatten(ctx, after, &plan)...)
+	resp.Diagnostics.Append(flattenNodePool(ctx, after, &plan)...)
 	warnIfDegraded(after, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
@@ -778,11 +778,11 @@ func (r *nodePoolResource) waitForPool(ctx context.Context, clusterID client.Clu
 	return last, nil
 }
 
-// flatten copies an API pool into the model. m holds the planned (or prior)
+// flattenNodePool copies an API pool into the model. m holds the planned (or prior)
 // value, which decides how the API's "empty" spellings are recorded: `{}`
 // labels and `[]` taints become null when m has null, and stay empty when the
 // configuration spelled them empty. Timeouts is left untouched.
-func (r *nodePoolResource) flatten(ctx context.Context, p *client.NodePool, m *nodePoolModel) diag.Diagnostics {
+func flattenNodePool(ctx context.Context, p *client.NodePool, m *nodePoolModel) diag.Diagnostics {
 	var diags diag.Diagnostics
 	m.ID = types.StringValue(p.Id.String())
 	m.ClusterID = types.StringValue(p.ClusterId.String())
