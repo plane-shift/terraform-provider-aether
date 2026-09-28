@@ -24,7 +24,6 @@ var (
 	_ resource.Resource                = &billingBudgetResource{}
 	_ resource.ResourceWithConfigure   = &billingBudgetResource{}
 	_ resource.ResourceWithImportState = &billingBudgetResource{}
-	_ resource.ResourceWithModifyPlan  = &billingBudgetResource{}
 )
 
 // Limits of monthly_limit_eur. The platform stores the limit as
@@ -81,8 +80,10 @@ func (r *billingBudgetResource) Schema(_ context.Context, _ resource.SchemaReque
 					ascendingInt64sValidator{},
 				}},
 			"created_at": immutableComputed("Time the budget was first set (RFC 3339)."),
-			// No UseStateForUnknown: the API moves it on EVERY PUT, so an update
-			// must plan it unknown (T12-5).
+			// No UseStateForUnknown: the API moves it on EVERY PUT. The framework
+			// itself marks a plain-Computed attribute unknown whenever the plan
+			// differs from state (fwserver MarkComputedNilsAsUnknown), so no
+			// ModifyPlan is needed here (T12-8/M1).
 			"updated_at": observedComputed("Time the budget was last written (RFC 3339)."),
 		},
 	}
@@ -168,17 +169,6 @@ func (ascendingInt64sValidator) ValidateList(_ context.Context, req validator.Li
 // Configure receives the provider's client and organization.
 func (r *billingBudgetResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
 	r.pd = fromProviderData(req.ProviderData, &resp.Diagnostics)
-}
-
-// ModifyPlan marks updated_at unknown on every update: the API moves it on
-// every PUT, and Update PUTs whenever plan and state differ.
-func (r *billingBudgetResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
-		return // create or destroy
-	}
-	if !req.Plan.Raw.Equal(req.State.Raw) {
-		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("updated_at"), types.StringUnknown())...)
-	}
 }
 
 // Create GETs first and refuses to overwrite a budget that is already set
