@@ -113,17 +113,60 @@ func deleteThenListHappened(api *fakeapi.Server, seen int) (deleted, listAfterDe
 // extra requests happen, or "a list GET after the DELETE" is trivially true
 // regardless of whether the code under test performed it (m-3e).
 func deleteThenListHappenedInWindow(api *fakeapi.Server, seen, end int) (deleted, listAfterDelete bool) {
+	return deleteThenListInRequests(api.Requests()[seen:end])
+}
+
+// deleteThenListInRequests is the pure core of deleteThenListHappenedInWindow
+// (extracted so it can be unit-tested on synthetic requests without a
+// *fakeapi.Server): it reports whether reqs contains at least one
+// cleanup-policy DELETE, and whether a cleanup-policies list GET appears
+// after the LAST such DELETE.
+func deleteThenListInRequests(reqs []fakeapi.Request) (deleted, listAfterDelete bool) {
 	oneRE, listRE := regexp.MustCompile(policyOneRE), regexp.MustCompile(policiesListRE)
 	deleteAt, listAfterDeleteAt := -1, -1
-	for i, r := range api.Requests()[seen:end] {
+	for i, r := range reqs {
 		if r.Method == http.MethodDelete && oneRE.MatchString(r.Path) {
 			deleteAt = i
+			listAfterDeleteAt = -1 // reset: only a GET after THIS (so far the last) DELETE counts
 		}
 		if deleteAt >= 0 && listAfterDeleteAt < 0 && r.Method == http.MethodGet && listRE.MatchString(r.Path) {
 			listAfterDeleteAt = i
 		}
 	}
 	return deleteAt >= 0, listAfterDeleteAt >= 0
+}
+
+// TestDeleteThenListInRequests_ChecksAfterTheLastDeleteOnly pins
+// deleteThenListInRequests's own doc comment ("after the LAST such DELETE"):
+// a list GET sandwiched between two DELETEs must NOT count as having
+// happened after the final DELETE (CodeRabbit PR #16 - the marker must reset
+// on every DELETE, or a DELETE -> list GET -> DELETE window wrongly reports
+// true even though nothing followed the last DELETE).
+func TestDeleteThenListInRequests_ChecksAfterTheLastDeleteOnly(t *testing.T) {
+	del := fakeapi.Request{Method: http.MethodDelete, Path: "/organizations/acme/registry/cleanup-policies/p1"}
+	list := fakeapi.Request{Method: http.MethodGet, Path: "/organizations/acme/registry/cleanup-policies"}
+
+	cases := []struct {
+		name             string
+		reqs             []fakeapi.Request
+		wantDeleted      bool
+		wantListAfterDel bool
+	}{
+		{"delete then list", []fakeapi.Request{del, list}, true, true},
+		{"delete, list, delete", []fakeapi.Request{del, list, del}, true, false},
+		{"list then delete", []fakeapi.Request{list, del}, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			deleted, listAfterDelete := deleteThenListInRequests(c.reqs)
+			if deleted != c.wantDeleted {
+				t.Errorf("deleted = %v, want %v", deleted, c.wantDeleted)
+			}
+			if listAfterDelete != c.wantListAfterDel {
+				t.Errorf("listAfterDelete = %v, want %v", listAfterDelete, c.wantListAfterDel)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------- C1
