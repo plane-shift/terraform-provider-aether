@@ -16,6 +16,10 @@ import (
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/apierr"
 )
 
+// noItemsSummary is the summary of the diagnostic for a 200 whose body is
+// valid JSON but lacks an "items" list, specific to this data source.
+const noItemsSummary = `Aether API answered 200 with JSON that has no "items" list`
+
 var _ datasource.DataSourceWithConfigure = &loadBalancersDataSource{}
 
 // NewLoadBalancersDataSource returns data.aether_loadbalancers.
@@ -94,15 +98,15 @@ func (d *loadBalancersDataSource) Read(ctx context.Context, req datasource.ReadR
 	var wire struct {
 		Items *[]loadBalancerWire `json:"items"`
 	}
-	if err := json.Unmarshal(res.Body, &wire); err != nil || wire.Items == nil {
-		var detail string
-		if err != nil {
-			detail = describeNonJSON(res.HTTPResponse, res.Status()) + ": " + err.Error()
-		} else {
-			detail = fmt.Sprintf("%s %s returned %s with a JSON body that has no %q list",
-				res.HTTPResponse.Request.Method, res.HTTPResponse.Request.URL, res.Status(), "items")
-		}
+	if err := json.Unmarshal(res.Body, &wire); err != nil {
+		detail := describeNonJSON(res.HTTPResponse, res.Status()) + ": " + err.Error()
 		resp.Diagnostics.AddError(nonJSONSummary, detail)
+		return
+	}
+	if wire.Items == nil {
+		detail := fmt.Sprintf("%s %s returned %s with a JSON body that has no %q list",
+			res.HTTPResponse.Request.Method, res.HTTPResponse.Request.URL, res.Status(), "items")
+		resp.Diagnostics.AddError(noItemsSummary, detail)
 		return
 	}
 	out := loadBalancersModel{ClusterID: cfg.ClusterID, LoadBalancers: []loadBalancerModel{}}
