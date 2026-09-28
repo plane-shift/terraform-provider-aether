@@ -39,8 +39,10 @@ type registryRepositoriesModel struct {
 // harborListWire is the registry list envelope as the API sends it: NOT the
 // common ListResponse. next_cursor is ALWAYS present, a Harbor page NUMBER,
 // "" on the last page (contract §1/§2). The generated RepositoryList/TagList
-// drop it, so the body is decoded here. Paging goes through collectAll, so a
-// page number the API has already sent is an ERROR, not a stop (T14-15).
+// drop it, so the body is decoded here. An ABSENT next_cursor reads as ""
+// (last page): a future API that omits it there must not break reads (r1
+// N-5). Paging goes through collectAll, so a page number the API has already
+// sent is an ERROR, not a stop (T14-15).
 type harborListWire[T any] struct {
 	Items      *[]T    `json:"items"`
 	NextCursor *string `json:"next_cursor"`
@@ -55,21 +57,20 @@ type repositoryWire struct {
 	LastPush  *time.Time `json:"last_push"`
 }
 
-// decodeHarborPage decodes one registry list page. A body without items or
-// without next_cursor is not a page the paging contract can be applied to.
+// decodeHarborPage decodes one registry list page. A body without items is
+// not a page; an absent next_cursor means the last page, exactly like "".
 func decodeHarborPage[T any](hr *http.Response, status string, body []byte) ([]T, string, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	var page harborListWire[T]
-	err := json.Unmarshal(body, &page)
-	switch {
-	case err != nil || page.Items == nil:
+	if err := json.Unmarshal(body, &page); err != nil || page.Items == nil {
 		diags.AddError("Aether API returned no usable registry list", describeUndecodable(hr, status, err, "items"))
 		return nil, "", diags
-	case page.NextCursor == nil:
-		diags.AddError("Aether API returned no usable registry list", describeJSONWithout(hr, status, "next_cursor"))
-		return nil, "", diags
 	}
-	return *page.Items, *page.NextCursor, diags
+	next := ""
+	if page.NextCursor != nil {
+		next = *page.NextCursor
+	}
+	return *page.Items, next, diags
 }
 
 func (d *registryRepositoriesDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
@@ -100,22 +101,26 @@ func (d *registryRepositoriesDataSource) Configure(_ context.Context, req dataso
 
 func (d *registryRepositoriesDataSource) Read(ctx context.Context, _ datasource.ReadRequest, resp *datasource.ReadResponse) {
 	repos, err := collectAll(ctx, func(ctx context.Context, cursor string) ([]repositoryWire, string, error) {
-		res, err := d.pd.Client.ListRepositoriesWithResponse(ctx, d.pd.orgID, harborPageEditor(cursor))
+		hr, err := d.pd.Client.ListRepositories(ctx, d.pd.orgID, harborPageEditor(cursor))
+		if err != nil {
+			return nil, "", err
+		}
+		body, err := readRawBody(hr)
 		if err != nil {
 			return nil, "", err
 		}
 		var diags diag.Diagnostics
-		if res.StatusCode() != http.StatusOK {
-			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &diags, path.Empty())
+		if hr.StatusCode != http.StatusOK {
+			apierr.ToDiagnostics(apierr.Parse(hr.StatusCode, hr.Header, body), &diags, path.Empty())
 			return nil, "", pageFailure(diags)
 		}
-		items, next, diags := decodeHarborPage[repositoryWire](res.HTTPResponse, res.Status(), res.Body)
+		items, next, diags := decodeHarborPage[repositoryWire](hr, hr.Status, body)
 		if diags.HasError() {
 			return nil, "", pageFailure(diags)
 		}
 		for _, it := range items {
 			if it.Name == "" {
-				diags.AddError("Aether API returned no usable registry list", describeJSONWithout(res.HTTPResponse, res.Status(), "repository name"))
+				diags.AddError("Aether API returned no usable registry list", describeJSONWithout(hr, hr.Status, "repository name"))
 				return nil, "", pageFailure(diags)
 			}
 		}

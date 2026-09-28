@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -16,6 +17,17 @@ import (
 
 // Helpers shared by the Task 14 organization / registry / billing data
 // sources.
+
+// readRawBody reads and closes a PLAIN (non-WithResponse) client response.
+// Raw-decoded routes never use the *WithResponse form (T14-17): it first
+// json-decodes the whole body into the generated types, so a value the
+// provider never exposes (an unknown enum, a non-UUID id, an absent
+// timestamp) could fail the read before the provider's own decode ran.
+// A read-side Close error cannot change what was read; it is discarded.
+func readRawBody(hr *http.Response) ([]byte, error) {
+	defer func() { _ = hr.Body.Close() }()
+	return io.ReadAll(hr.Body)
+}
 
 // pageDiagsError carries diagnostics (an apierr-mapped API error, a decode
 // failure) through collectAll's plain error return, so a paged read reports

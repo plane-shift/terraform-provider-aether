@@ -111,26 +111,31 @@ func (d *auditLogDataSource) Read(ctx context.Context, req datasource.ReadReques
 	// ONE page only (T14-8): the API's cursor (`id <` over random UUIDs)
 	// returns a wrong set beyond page 1, so next_cursor is deliberately
 	// ignored.
-	res, err := d.pd.Client.ListAuditLogWithResponse(ctx, d.pd.orgID, &client.ListAuditLogParams{Limit: &limit})
+	hr, err := d.pd.Client.ListAuditLog(ctx, d.pd.orgID, &client.ListAuditLogParams{Limit: &limit})
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot read the audit log", err.Error())
 		return
 	}
-	if res.StatusCode() != http.StatusOK {
-		apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &resp.Diagnostics, path.Empty())
+	body, err := readRawBody(hr)
+	if err != nil {
+		resp.Diagnostics.AddError("Cannot read the audit log", err.Error())
+		return
+	}
+	if hr.StatusCode != http.StatusOK {
+		apierr.ToDiagnostics(apierr.Parse(hr.StatusCode, hr.Header, body), &resp.Diagnostics, path.Empty())
 		return
 	}
 	var page struct {
 		Items *[]auditEventWire `json:"items"`
 	}
-	if err := json.Unmarshal(res.Body, &page); err != nil || page.Items == nil {
-		resp.Diagnostics.AddError("Aether API returned no usable audit log", describeUndecodable(res.HTTPResponse, res.Status(), err, "items"))
+	if err := json.Unmarshal(body, &page); err != nil || page.Items == nil {
+		resp.Diagnostics.AddError("Aether API returned no usable audit log", describeUndecodable(hr, hr.Status, err, "items"))
 		return
 	}
 	out := auditLogModel{Limit: types.Int64Value(int64(limit)), Events: make([]auditEventDataModel, 0, len(*page.Items))}
 	for _, e := range *page.Items {
 		if e.ID == "" || e.CreatedAt == nil {
-			resp.Diagnostics.AddError("Aether API returned no usable audit log", describeJSONWithout(res.HTTPResponse, res.Status(), "event id or created_at"))
+			resp.Diagnostics.AddError("Aether API returned no usable audit log", describeJSONWithout(hr, hr.Status, "event id or created_at"))
 			return
 		}
 		md, err := compactMetadata(e.Metadata)

@@ -71,7 +71,8 @@ func (d *invoicesDataSource) Metadata(_ context.Context, req datasource.Metadata
 func (d *invoicesDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "The organization's invoices, newest period first. Amounts are integer cents. " +
-			"The buyer and issuer details printed on an invoice are not exposed.",
+			"The buyer and issuer details printed on an invoice are not exposed. " +
+			"Pages beyond the first hundred invoices may skip or repeat entries until the platform's cursor pagination is fixed (aether-api #318).",
 		Attributes: map[string]schema.Attribute{
 			"invoices": schema.ListNestedAttribute{Computed: true,
 				MarkdownDescription: "The invoices, in the API's order (newest period first).",
@@ -110,27 +111,31 @@ func (d *invoicesDataSource) Read(ctx context.Context, _ datasource.ReadRequest,
 			return nil, "", err
 		}
 		limit := invoiceListDSPageSize
-		res, err := d.pd.Client.ListInvoicesWithResponse(ctx, d.pd.orgID, &client.ListInvoicesParams{Limit: &limit, Cursor: c})
+		hr, err := d.pd.Client.ListInvoices(ctx, d.pd.orgID, &client.ListInvoicesParams{Limit: &limit, Cursor: c})
+		if err != nil {
+			return nil, "", err
+		}
+		body, err := readRawBody(hr)
 		if err != nil {
 			return nil, "", err
 		}
 		var diags diag.Diagnostics
-		if res.StatusCode() != http.StatusOK {
-			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &diags, path.Empty())
+		if hr.StatusCode != http.StatusOK {
+			apierr.ToDiagnostics(apierr.Parse(hr.StatusCode, hr.Header, body), &diags, path.Empty())
 			return nil, "", pageFailure(diags)
 		}
 		var page struct {
 			Items      *[]invoiceWire `json:"items"`
 			NextCursor *string        `json:"next_cursor"`
 		}
-		if err := json.Unmarshal(res.Body, &page); err != nil || page.Items == nil {
-			diags.AddError("Aether API returned no usable invoice list", describeUndecodable(res.HTTPResponse, res.Status(), err, "items"))
+		if err := json.Unmarshal(body, &page); err != nil || page.Items == nil {
+			diags.AddError("Aether API returned no usable invoice list", describeUndecodable(hr, hr.Status, err, "items"))
 			return nil, "", pageFailure(diags)
 		}
 		for _, inv := range *page.Items {
 			if inv.ID == "" || inv.InvoiceNumber == "" || inv.PeriodStart == nil || inv.PeriodEnd == nil || inv.CreatedAt == nil {
 				diags.AddError("Aether API returned no usable invoice list",
-					describeJSONWithout(res.HTTPResponse, res.Status(), "invoice id, invoice_number, period or created_at"))
+					describeJSONWithout(hr, hr.Status, "invoice id, invoice_number, period or created_at"))
 				return nil, "", pageFailure(diags)
 			}
 		}

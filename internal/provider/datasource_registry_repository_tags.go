@@ -128,29 +128,33 @@ func (d *registryRepositoryTagsDataSource) Read(ctx context.Context, req datasou
 	repo := cfg.Repository.ValueString()
 	var requestID string
 	tags, err := collectAll(ctx, func(ctx context.Context, cursor string) ([]tagWire, string, error) {
-		res, err := d.pd.Client.ListRepositoryTagsWithResponse(ctx, d.pd.orgID, repo, harborPageEditor(cursor))
+		hr, err := d.pd.Client.ListRepositoryTags(ctx, d.pd.orgID, repo, harborPageEditor(cursor))
+		if err != nil {
+			return nil, "", err
+		}
+		body, err := readRawBody(hr)
 		if err != nil {
 			return nil, "", err
 		}
 		var diags diag.Diagnostics
-		if res.StatusCode() == http.StatusNotFound {
+		if hr.StatusCode == http.StatusNotFound {
 			var ae *apierr.Error
-			if errors.As(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &ae) {
+			if errors.As(apierr.Parse(hr.StatusCode, hr.Header, body), &ae) {
 				requestID = ae.RequestID
 			}
 			return nil, "", errRepositoryNotFound
 		}
-		if res.StatusCode() != http.StatusOK {
-			apierr.ToDiagnostics(apierr.Parse(res.StatusCode(), res.HTTPResponse.Header, res.Body), &diags, path.Empty())
+		if hr.StatusCode != http.StatusOK {
+			apierr.ToDiagnostics(apierr.Parse(hr.StatusCode, hr.Header, body), &diags, path.Empty())
 			return nil, "", pageFailure(diags)
 		}
-		items, next, diags := decodeHarborPage[tagWire](res.HTTPResponse, res.Status(), res.Body)
+		items, next, diags := decodeHarborPage[tagWire](hr, hr.Status, body)
 		if diags.HasError() {
 			return nil, "", pageFailure(diags)
 		}
 		for _, it := range items {
 			if it.Digest == "" {
-				diags.AddError("Aether API returned no usable registry list", describeJSONWithout(res.HTTPResponse, res.Status(), "tag digest"))
+				diags.AddError("Aether API returned no usable registry list", describeJSONWithout(hr, hr.Status, "tag digest"))
 				return nil, "", pageFailure(diags)
 			}
 		}
