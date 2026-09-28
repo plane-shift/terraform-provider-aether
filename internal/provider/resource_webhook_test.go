@@ -197,7 +197,11 @@ func TestWebhookResource_CreateDisabledPostsThenPutsExactBody(t *testing.T) {
 // taint the resource so the next apply replaces it.
 func TestWebhookResource_CreateDisabledWhenThePUTFailsSavesStateAndTaints(t *testing.T) {
 	api := setupFake(t)
-	api.FailNextWebhookPUT(testOrg, http.StatusInternalServerError, "internal_error", "disable failed")
+	// T10-12: NOT a 5xx. PUT is idempotent (internal/provider/transport/retry.go
+	// isIdempotent), so a 500 here is retried by the provider's own transport -
+	// the one-shot override is consumed by the first attempt, the retry gets a
+	// normal 200, and no error ever reaches the resource. 422 is never retried.
+	api.FailNextWebhookPUT(testOrg, http.StatusUnprocessableEntity, "validation_error", "disable failed")
 	cfg := webhookHCL("https://example.com/hook", []string{"cluster.ready"}, "enabled = false")
 	var oldID string
 	resource.UnitTest(t, resource.TestCase{
@@ -636,24 +640,67 @@ func TestWebhookResource_ReadDeduplicatesEventsAndPreservesSecretAcrossRefresh(t
 // secret (the API never returns one), or if a post-import rotate_secret
 // does not obtain exactly one real secret via exactly one rotate call
 // (T10-1/T10-2/T10-9).
+//
+// T10-13: the webhook is SEEDED out of band, never created through a prior
+// apply step, and the import uses ImportStateCheck rather than
+// ImportStateVerify - mirroring resource_cluster_network_test.go's
+// TestClusterNetworkResource_ImportOfANeverConfiguredClusterReadsEmptyCIDRsAndNullRateLimit
+// (the same "adopt something this run never created" shape). A prior create
+// step is impossible here: with ImportStatePersist true, `terraform import`
+// runs in the SAME working directory/state as a preceding Config step, and
+// importing an address terraform already manages fails "Resource already
+// managed by Terraform" (the D2 defect this replaces). ImportStateVerify
+// itself cannot be used for the same reason from the other direction:
+// terraform-plugin-testing@v1.16.0's testStepNewImportState reads the
+// working directory's state from BEFORE this step to build its "old
+// resources" comparison set (testing_new_import_state.go:51-60), and with no
+// prior step that set is empty, so ImportStateVerify's own lookup would
+// t.Fatalf("... resource with ID ... not found") before ever reaching my
+// assertions - failing on a framework precondition, not on the provider.
 func TestWebhookResource_ImportByIDThenRotateObtainsASecret(t *testing.T) {
 	api := setupFake(t)
+	id := api.SeedWebhook(testOrg, "https://x.io/h", []string{"cluster.ready"}, true)
 	var seen int
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{
-			{Config: webhookHCL("https://x.io/h", []string{"cluster.ready"}, `description = "d"`)},
 			{
-				ResourceName:            webhookResource,
-				ImportState:             true,
-				ImportStatePersist:      true,
-				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"secret", "rotate_secret"},
+				ResourceName:       webhookResource,
+				ImportState:        true,
+				ImportStatePersist: true,
+				Config:             webhookHCL("https://x.io/h", []string{"cluster.ready"}),
+				ImportStateId:      id,
+				ImportStateCheck: func(is []*terraform.InstanceState) error {
+					if len(is) != 1 {
+						return fmt.Errorf("want exactly one imported instance, got %d", len(is))
+					}
+					a := is[0].Attributes
+					for k, want := range map[string]string{
+						"id": id, "url": "https://x.io/h", "enabled": "true",
+						"description": "", "events.#": "1",
+					} {
+						if a[k] != want {
+							return fmt.Errorf("imported %s = %q, want %q", k, a[k], want)
+						}
+					}
+					for _, k := range []string{"secret", "rotate_secret"} {
+						if v, has := a[k]; has {
+							return fmt.Errorf("imported %s = %q, want null (the API never returns secret on GET)", k, v)
+						}
+					}
+					if reqs := requestsMatching(api, http.MethodPut, webhookOneRE); len(reqs) != 0 {
+						return fmt.Errorf("import must never PUT (adopt-only), got %d: %v", len(reqs), reqs)
+					}
+					if reqs := requestsMatching(api, http.MethodPost, webhookRotateRE); len(reqs) != 0 {
+						return fmt.Errorf("import must never rotate, got %d: %v", len(reqs), reqs)
+					}
+					return nil
+				},
 			},
 			{
 				PreConfig: func() { seen = len(api.Requests()) },
-				Config:    webhookHCL("https://x.io/h", []string{"cluster.ready"}, `description = "d"`, `rotate_secret = "1"`),
+				Config:    webhookHCL("https://x.io/h", []string{"cluster.ready"}, `rotate_secret = "1"`),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestMatchResourceAttr(webhookResource, "secret", webhookSecretRE),
 					func(*terraform.State) error {
