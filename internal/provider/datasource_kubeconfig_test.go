@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
-	"github.com/hashicorp/terraform-plugin-testing/plancheck"
+	"github.com/hashicorp/terraform-plugin-testing/statecheck"
 	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 )
 
@@ -39,9 +39,9 @@ func TestDataSourceKubeconfig_ContentIsByteExactAndSensitive(t *testing.T) {
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{{
 			Config: kubeconfigDataSourceHCL(cid),
-			ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
-				plancheck.ExpectSensitiveValue("data.aether_kubeconfig.k", tfjsonpath.New("content")),
-			}},
+			ConfigStateChecks: []statecheck.StateCheck{
+				statecheck.ExpectSensitiveValue("data.aether_kubeconfig.k", tfjsonpath.New("content")),
+			},
 			Check: resource.TestCheckResourceAttr("data.aether_kubeconfig.k", "content", seededKubeconfigYAML),
 		}},
 	})

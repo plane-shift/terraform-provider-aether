@@ -111,10 +111,18 @@ func (s *Server) routeVolumes(w http.ResponseWriter, r *http.Request, path strin
 	}
 	items := make([]map[string]any, 0, len(vols))
 	for _, v := range vols {
+		createdAt := v.CreatedAt
+		if createdAt == "" {
+			// The real API always emits an RFC3339 time (contract §5); an
+			// unseeded/zero-value CreatedAt must still round-trip through the
+			// generated client's time.Time field instead of failing to parse
+			// the empty string.
+			createdAt = zeroVolumesSyncedAt
+		}
 		items = append(items, map[string]any{
 			"id": v.ID, "name": v.Name, "type": v.Type, "storage_class": v.StorageClass,
 			"provisioned_bytes": v.ProvisionedBytes, "used_bytes": v.UsedBytes, "used_percent": v.UsedPercent,
-			"billed_on": v.BilledOn, "state": v.State, "watchers": v.Watchers, "created_at": v.CreatedAt,
+			"billed_on": v.BilledOn, "state": v.State, "watchers": v.Watchers, "created_at": createdAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
