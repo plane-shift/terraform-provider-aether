@@ -301,7 +301,7 @@ func (r *clusterResource) Create(ctx context.Context, req resource.CreateRequest
 	// Persist the id immediately, with the create response flattened in, so a
 	// wait failure leaves an importable (tainted) resource in state rather than
 	// one whose computed attributes are still unknown.
-	r.flatten(created, &plan)
+	flattenCluster(created, &plan)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -312,7 +312,7 @@ func (r *clusterResource) Create(ctx context.Context, req resource.CreateRequest
 		resp.Diagnostics.AddError("Cluster did not become running", err.Error())
 		return
 	}
-	r.flatten(final.Cluster, &plan)
+	flattenCluster(final.Cluster, &plan)
 	if final.Warned {
 		resp.Diagnostics.AddWarning("Cluster is degraded", final.Message)
 	}
@@ -341,7 +341,7 @@ func (r *clusterResource) Read(ctx context.Context, req resource.ReadRequest, re
 		apierr.ToDiagnostics(err, &resp.Diagnostics, path.Empty())
 		return
 	}
-	r.flatten(c, &state)
+	flattenCluster(c, &state)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -458,7 +458,7 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 	if !calledAPI {
 		c := current
 		plan.ID = state.ID
-		r.flatten(c, &plan)
+		flattenCluster(c, &plan)
 		// The update itself changed nothing remotely, so it succeeds - but a
 		// cluster in a bad state must not pass silently.
 		switch c.Status {
@@ -492,7 +492,7 @@ func (r *clusterResource) Update(ctx context.Context, req resource.UpdateRequest
 		return
 	}
 	plan.ID = state.ID
-	r.flatten(final.Cluster, &plan)
+	flattenCluster(final.Cluster, &plan)
 	if final.Warned {
 		resp.Diagnostics.AddWarning("Cluster is degraded", final.Message)
 	}
@@ -606,9 +606,9 @@ func (r *clusterResource) waitForCluster(ctx context.Context, id client.ClusterI
 	return clusterWait{Cluster: last, Message: res.Message, Warned: res.Warned}, nil
 }
 
-// flatten copies an API cluster into the model. Timeouts is left untouched:
+// flattenCluster copies an API cluster into the model. Timeouts is left untouched:
 // it is configuration, not something the API reports.
-func (r *clusterResource) flatten(c *client.Cluster, m *clusterModel) {
+func flattenCluster(c *client.Cluster, m *clusterModel) {
 	m.ID = types.StringValue(c.Id.String())
 	m.Name = types.StringValue(c.Name)
 	m.Region = types.StringValue(c.Region)
