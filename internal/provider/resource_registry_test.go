@@ -485,15 +485,12 @@ func TestRegistryResource_ImportWhileDisabledErrors(t *testing.T) {
 // registry's id changes out of band (an out-of-band disable + re-enable
 // mints a NEW registry row and a NEW default robot with a secret this run
 // never saw - T11-18 amends T11-2: Read must null both credentials and, per
-// the ruling, emit a Warning). RED until the coder implements T11-18: today
-// flattenRegistry only updates id/harbor_project/etc. from the GET and
-// leaves robot_username/robot_secret exactly as they were in prior state,
-// so this test currently fails on the credential assertions (the id
-// assertion alone already passes, since flattenRegistry does update id).
-// v1.16.0's plugin-testing harness has no way to assert on a Warning
-// diagnostic from a successful apply (TDD:"...cannot assert a warning" -
-// same limitation noted for Task 9), so the absence of the stale
-// credentials is the whole test.
+// the ruling, emit a Warning). Asserts the id picks up the new registry AND
+// both credentials go null on that same refresh. v1.16.0's plugin-testing
+// harness has no way to assert on a Warning diagnostic from a successful
+// apply (TDD: "...cannot assert a warning" - same limitation noted for Task
+// 9), so the absence of the stale credentials is the whole test; the
+// id-changed Warning itself is exercised only by inspection of Read.
 func TestRegistryResource_ReadAfterOutOfBandReenableNullsCredentials(t *testing.T) {
 	api := setupFake(t)
 	var newID string

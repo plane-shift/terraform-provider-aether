@@ -102,9 +102,20 @@ func noCleanupPolicyRequests(t *testing.T, api *fakeapi.Server) {
 // and the "genuine 500" destroy tests need this, not just a bare DELETE
 // count, since the re-list is the whole point of the branch under test).
 func deleteThenListHappened(api *fakeapi.Server, seen int) (deleted, listAfterDelete bool) {
+	return deleteThenListHappenedInWindow(api, seen, len(api.Requests()))
+}
+
+// deleteThenListHappenedInWindow is deleteThenListHappened bounded to
+// api.Requests()[seen:end] instead of running to the CURRENT length: a
+// caller whose own TestStep issues further requests after the window it
+// means to inspect (e.g. a RefreshState step's own state-refresh GET, which
+// lands after a DELETE sent by a PRIOR step) must capture end before those
+// extra requests happen, or "a list GET after the DELETE" is trivially true
+// regardless of whether the code under test performed it (m-3e).
+func deleteThenListHappenedInWindow(api *fakeapi.Server, seen, end int) (deleted, listAfterDelete bool) {
 	oneRE, listRE := regexp.MustCompile(policyOneRE), regexp.MustCompile(policiesListRE)
 	deleteAt, listAfterDeleteAt := -1, -1
-	for i, r := range requestsSince(api, seen) {
+	for i, r := range api.Requests()[seen:end] {
 		if r.Method == http.MethodDelete && oneRE.MatchString(r.Path) {
 			deleteAt = i
 		}
@@ -533,7 +544,7 @@ func TestCleanupPolicyResource_DestroyOfAnAlreadyRemovedPolicyIsSuccess(t *testi
 func TestCleanupPolicyResource_DestroyGenuine500WithPolicyStillPresentErrors(t *testing.T) {
 	api := setupFake(t)
 	var route string
-	var seen int
+	var seen, end int
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
@@ -555,7 +566,18 @@ func TestCleanupPolicyResource_DestroyGenuine500WithPolicyStillPresentErrors(t *
 				ExpectError: loose("internal_error"),
 			},
 			{
-				PreConfig: func() { delete(api.Handlers, route) },
+				// end is captured here, BEFORE this step's own RefreshState
+				// GET fires, so the request-log check below sees only
+				// api.Requests()[seen:end] - the prior step's failed-destroy
+				// attempt - and not this step's unrelated state refresh.
+				// Without that bound, this step's own refresh GET always
+				// lands after the prior DELETE and "a list GET after the
+				// DELETE" would be trivially true even if Delete's re-list
+				// branch never ran (m-3e).
+				PreConfig: func() {
+					delete(api.Handlers, route)
+					end = len(api.Requests())
+				},
 				// The failed destroy must have kept the policy in state; a
 				// post-refresh plan against a state that still has it (config on
 				// disk is providerOnlyHCL) wants to destroy it again.
@@ -569,7 +591,7 @@ func TestCleanupPolicyResource_DestroyGenuine500WithPolicyStillPresentErrors(t *
 						return nil
 					},
 					func(*terraform.State) error {
-						deleted, listAfter := deleteThenListHappened(api, seen)
+						deleted, listAfter := deleteThenListHappenedInWindow(api, seen, end)
 						if !deleted {
 							return fmt.Errorf("no DELETE was sent during the genuine-500 destroy, want at least one")
 						}

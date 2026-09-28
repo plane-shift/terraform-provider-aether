@@ -233,6 +233,12 @@ func TestRobotAccountResource_PlanTimeValidationRefusesWithZeroRequests(t *testi
 // that sort BEFORE the target ("ffffffff-..."), so the target can only be on
 // page 2. Also fails if the provider never actually sends a `cursor` query
 // parameter while paging (proving genuine pagination, not a lucky read).
+//
+// T11-19 note: this test's premise (the target is found partway through
+// page 2) does not depend on the "a page shorter than 50 is the last page"
+// rule at all - find() returns as soon as it matches an item, before it ever
+// looks at the page's length - so it needed no change for T11-19 and remains
+// valid unmodified both before and after that fix.
 func TestRobotAccountResource_ReadPagesPastFiftyToFindTheTarget(t *testing.T) {
 	api := setupFake(t)
 	for i := 0; i < 55; i++ {
@@ -275,22 +281,17 @@ func TestRobotAccountResource_ReadPagesPastFiftyToFindTheTarget(t *testing.T) {
 	}
 }
 
-// T11-19 note: this test's premise (the target is found partway through
-// page 2) does not depend on the "a page shorter than 50 is the last page"
-// rule at all - find() returns as soon as it matches an item, before it ever
-// looks at the page's length - so it needs no change for T11-19 and remains
-// valid unmodified both before and after the coder's fix below.
-
 // Fails against the OLD "a page shorter than 50 is the last page" rule
 // (m-1b/T11-19): removes the managed robot out of band, then seeds 55 OTHER
 // robots so the not-found search must walk a full page (50) AND a
 // short-but-nonempty page (5) before it can ever reach a truly EMPTY page.
 // Under the old rule Read stops at the 5-item page and never issues the
-// empty-page request - RED until the coder implements T11-19 (page until an
-// EMPTY page; no hard-coded page-size assumption). Isolated to exactly the
-// refresh's own Read via RefreshState (no apply), so the recreate that a
-// normal step would trigger cannot add extra list GETs that would otherwise
-// make "the LAST recorded GET" ambiguous.
+// empty-page request; asserts the provider's own LAST list request, re-run
+// verbatim against the fake, comes back with zero items - proving find()
+// pages until an EMPTY page with no hard-coded page-size assumption (T11-19).
+// Isolated to exactly the refresh's own Read via RefreshState (no apply), so
+// the recreate that a normal step would trigger cannot add extra list GETs
+// that would otherwise make "the LAST recorded GET" ambiguous.
 func TestRobotAccountResource_ReadPagesToAnEmptyPageWhenNotFound(t *testing.T) {
 	api := setupFake(t)
 	var seen int
