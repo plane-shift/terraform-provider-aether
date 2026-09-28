@@ -40,6 +40,7 @@ type Server struct {
 	clusters    clusterStore // see clusters.go; own lock
 	pools       poolStore    // see nodepools.go; own lock
 	networks    networkStore // see networks.go; own lock
+	orgStore    orgStore     // see organizations.go + members.go; own lock
 	// Handlers lets a test override a route: key "METHOD /path" (path after /api/v1).
 	Handlers map[string]http.HandlerFunc
 }
@@ -124,30 +125,23 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
-	case r.Method == http.MethodGet && strings.HasPrefix(path, "/organizations/") && strings.Count(path, "/") == 2:
-		id := strings.TrimPrefix(path, "/organizations/")
-		s.mu.Lock()
-		var found *Org
-		for i := range s.orgs {
-			if s.orgs[i].ID == id {
-				found = &s.orgs[i]
-			}
-		}
-		s.mu.Unlock()
-		if found == nil {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "organization not found"}})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"id": found.ID, "name": found.Name, "slug": found.Slug, "plan": "free",
-			"created_at": "2026-09-17T00:00:00Z", "updated_at": "2026-09-17T00:00:00Z"})
+	case s.routeOrganizations(w, r, path, body):
+		// served by organizations.go
+	case s.routeMembers(w, r, path, body):
+		// served by members.go
 	case r.Method == http.MethodGet && path == "/organizations":
 		s.mu.Lock()
-		items := make([]map[string]any, 0, len(s.orgs))
-		for _, o := range s.orgs {
-			items = append(items, map[string]any{"id": o.ID, "name": o.Name, "slug": o.Slug, "plan": "free",
-				"created_at": "2026-09-17T00:00:00Z", "updated_at": "2026-09-17T00:00:00Z"})
-		}
+		orgs := append([]Org(nil), s.orgs...)
 		s.mu.Unlock()
+		items := make([]map[string]any, 0, len(orgs))
+		for _, o := range orgs {
+			s.orgStore.mu.Lock()
+			foreign := s.orgStore.foreign[o.ID]
+			s.orgStore.mu.Unlock()
+			if !foreign { // the token lists only the organizations it reaches
+				items = append(items, s.orgJSON(o))
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	case s.routeNodePools(w, r, path, body):
 		// served by nodepools.go

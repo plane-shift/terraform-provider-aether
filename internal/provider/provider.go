@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -36,6 +37,13 @@ type providerData struct {
 	// that arrive from STATE are a different case and are parsed per call:
 	// state is data from outside this process.
 	orgID client.OrgID
+	// ownerDeleteMu serialises the last-owner guard + DELETE of owner
+	// memberships (aether_organization_member). One provider process serves
+	// one Terraform run, so this stops parallel owner deletes in a run from
+	// each seeing the other as "another owner"; it cannot reach the portal
+	// or another run (the API has no guard, aether-api #302). providerData is
+	// shared by pointer and never copied.
+	ownerDeleteMu sync.Mutex
 }
 
 type aetherProvider struct{ version string }
@@ -263,7 +271,8 @@ func (p *aetherProvider) Configure(ctx context.Context, req provider.ConfigureRe
 }
 
 func (p *aetherProvider) Resources(context.Context) []func() resource.Resource {
-	return []func() resource.Resource{NewClusterResource, NewNodePoolResource, NewClusterNetworkResource}
+	return []func() resource.Resource{NewClusterResource, NewNodePoolResource, NewClusterNetworkResource,
+		NewOrganizationResource, NewOrganizationMemberResource}
 }
 
 func (p *aetherProvider) DataSources(context.Context) []func() datasource.DataSource {
