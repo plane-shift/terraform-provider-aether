@@ -257,14 +257,20 @@ func (r *registryResource) ImportState(ctx context.Context, _ resource.ImportSta
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
-// get reads GET /registry and discriminates the undiscriminated 200 union
-// itself (T11-16): the generated AsRegistry() also "succeeds" on
+// get reads the organization's registry; see getRegistry.
+func (r *registryResource) get(ctx context.Context) (*client.Registry, bool, diag.Diagnostics) {
+	return getRegistry(ctx, r.pd)
+}
+
+// getRegistry reads GET /registry and discriminates the undiscriminated 200
+// union itself (T11-16): the generated AsRegistry() also "succeeds" on
 // {"enabled":false}, yielding a zero Registry, so a body is a registry only
 // when it says enabled AND carries an id. enabled=false (the only other shape
-// the API sends) reports (nil, false).
-func (r *registryResource) get(ctx context.Context) (*client.Registry, bool, diag.Diagnostics) {
+// the API sends) reports (nil, false). Shared by the aether_registry resource
+// and data source.
+func getRegistry(ctx context.Context, pd *providerData) (*client.Registry, bool, diag.Diagnostics) {
 	var diags diag.Diagnostics
-	g, err := r.pd.Client.GetRegistryWithResponse(ctx, r.pd.orgID)
+	g, err := pd.Client.GetRegistryWithResponse(ctx, pd.orgID)
 	if err != nil {
 		diags.AddError("Cannot read registry", err.Error())
 		return nil, false, diags

@@ -335,12 +335,7 @@ func (r *cleanupPolicyResource) Read(ctx context.Context, req resource.ReadReque
 		return
 	}
 	resp.Diagnostics.Append(flattenCleanupPolicy(ctx, found, &state)...)
-	state.LastRunAt = types.StringNull()
-	if found.LastRunAt != nil {
-		state.LastRunAt = types.StringValue(found.LastRunAt.Format(time.RFC3339))
-	}
-	state.LastRunDeleted = optInt64(found.LastRunDeleted)
-	state.LastRunFreedBytes = optInt64(found.LastRunFreedBytes)
+	flattenCleanupLastRun(found, &state)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -429,8 +424,24 @@ func (r *cleanupPolicyResource) ImportState(ctx context.Context, req resource.Im
 // find lists the organization's policies (unpaginated, contract §10) and
 // returns the one with id, or nil when it does not exist.
 func (r *cleanupPolicyResource) find(ctx context.Context, id string) (*cleanupPolicyWire, diag.Diagnostics) {
+	items, diags := listCleanupPolicies(ctx, r.pd)
+	if diags.HasError() {
+		return nil, diags
+	}
+	for i := range items {
+		if items[i].ID == id {
+			return &items[i], diags
+		}
+	}
+	return nil, diags
+}
+
+// listCleanupPolicies reads GET /cleanup-policies (unpaginated, contract §10)
+// raw. Shared by the aether_registry_cleanup_policy resource and the
+// aether_registry_cleanup_policies data source.
+func listCleanupPolicies(ctx context.Context, pd *providerData) ([]cleanupPolicyWire, diag.Diagnostics) {
 	var diags diag.Diagnostics
-	res, err := r.pd.Client.ListCleanupPoliciesWithResponse(ctx, r.pd.orgID)
+	res, err := pd.Client.ListCleanupPoliciesWithResponse(ctx, pd.orgID)
 	if err != nil {
 		diags.AddError("Cannot list cleanup policies", err.Error())
 		return nil, diags
@@ -446,12 +457,7 @@ func (r *cleanupPolicyResource) find(ctx context.Context, id string) (*cleanupPo
 		diags.AddError("Aether API returned no usable cleanup policy list", describeUndecodable(res.HTTPResponse, res.Status(), err, "items"))
 		return nil, diags
 	}
-	for i := range *list.Items {
-		if (*list.Items)[i].ID == id {
-			return &(*list.Items)[i], diags
-		}
-	}
-	return nil, diags
+	return *list.Items, diags
 }
 
 // cleanupRequestBody renders the full create/update body from the plan:
@@ -517,6 +523,16 @@ func flattenCleanupPolicy(ctx context.Context, p *cleanupPolicyWire, m *cleanupP
 	m.CreatedAt = types.StringValue(p.CreatedAt.Format(time.RFC3339))
 	m.UpdatedAt = types.StringValue(p.UpdatedAt.Format(time.RFC3339))
 	return diags
+}
+
+// flattenCleanupLastRun copies the list-only last_run_* fields (absent → null).
+func flattenCleanupLastRun(p *cleanupPolicyWire, m *cleanupPolicyModel) {
+	m.LastRunAt = types.StringNull()
+	if p.LastRunAt != nil {
+		m.LastRunAt = types.StringValue(p.LastRunAt.Format(time.RFC3339))
+	}
+	m.LastRunDeleted = optInt64(p.LastRunDeleted)
+	m.LastRunFreedBytes = optInt64(p.LastRunFreedBytes)
 }
 
 // conditionValueString normalises a stored condition value (arbitrary JSON)

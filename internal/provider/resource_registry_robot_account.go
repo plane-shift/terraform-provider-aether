@@ -239,14 +239,35 @@ func (r *robotAccountResource) ImportState(ctx context.Context, req resource.Imp
 }
 
 // find pages GET /robot-accounts (the only read path, contract §6) until it
-// finds id or reaches an EMPTY page (T11-19). The page size (50 today,
-// `?limit` ignored) is deliberately not assumed: a short page is not treated
-// as the last one, so a smaller page size can never make Read drop a live
-// robot from state - the cost is one extra GET when the robot is absent. The
-// API returns no next_cursor; its undocumented `?cursor=<last id>` is added
-// through a RequestEditorFn because the generated call takes no parameters.
-// A nil result with no diagnostics means the robot does not exist.
+// finds id or reaches an EMPTY page (T11-19); see pageRobotAccounts. A nil
+// result with no diagnostics means the robot does not exist.
 func (r *robotAccountResource) find(ctx context.Context, id string) (*robotAccountWire, diag.Diagnostics) {
+	var found *robotAccountWire
+	diags := pageRobotAccounts(ctx, r.pd, func(items []robotAccountWire) bool {
+		for i := range items {
+			if items[i].ID == id {
+				found = &items[i]
+				return true
+			}
+		}
+		return false
+	})
+	if diags.HasError() {
+		return nil, diags
+	}
+	return found, diags
+}
+
+// pageRobotAccounts pages GET /robot-accounts, handing every non-empty page
+// to visit, until visit returns true or an EMPTY page arrives (T11-19). The
+// page size (50 today, `?limit` ignored) is deliberately not assumed: a short
+// page is not treated as the last one, so a smaller page size can never make
+// a reader drop a live robot - the cost is one extra GET. The API returns no
+// next_cursor; its undocumented `?cursor=<last id>` is added through a
+// RequestEditorFn because the generated call takes no parameters. Shared by
+// the aether_registry_robot_account resource and the
+// aether_registry_robot_accounts data source.
+func pageRobotAccounts(ctx context.Context, pd *providerData, visit func([]robotAccountWire) bool) diag.Diagnostics {
 	var diags diag.Diagnostics
 	cursor := ""
 	for {
@@ -260,30 +281,28 @@ func (r *robotAccountResource) find(ctx context.Context, id string) (*robotAccou
 				return nil
 			})
 		}
-		res, err := r.pd.Client.ListRobotAccountsWithResponse(ctx, r.pd.orgID, editors...)
+		res, err := pd.Client.ListRobotAccountsWithResponse(ctx, pd.orgID, editors...)
 		if err != nil {
 			diags.AddError("Cannot list robot accounts", err.Error())
-			return nil, diags
+			return diags
 		}
 		if res.StatusCode() != http.StatusOK {
 			addAPIError(&diags, res.StatusCode(), res.HTTPResponse.Header, res.Body, path.Empty())
-			return nil, diags
+			return diags
 		}
 		var page struct {
 			Items *[]robotAccountWire `json:"items"`
 		}
 		if err := json.Unmarshal(res.Body, &page); err != nil || page.Items == nil {
 			diags.AddError("Aether API returned no usable robot account list", describeUndecodable(res.HTTPResponse, res.Status(), err, "items"))
-			return nil, diags
+			return diags
 		}
 		items := *page.Items
-		for i := range items {
-			if items[i].ID == id {
-				return &items[i], diags
-			}
-		}
 		if len(items) == 0 {
-			return nil, diags
+			return diags
+		}
+		if visit(items) {
+			return diags
 		}
 		next := items[len(items)-1].ID
 		if next <= cursor {
@@ -292,7 +311,7 @@ func (r *robotAccountResource) find(ctx context.Context, id string) (*robotAccou
 			// would loop forever (T11-19).
 			diags.AddError("Aether API returned an unusable robot account list",
 				fmt.Sprintf("Paging with cursor %q returned a page ending at %q, which does not advance past the cursor.", cursor, next))
-			return nil, diags
+			return diags
 		}
 		cursor = next
 	}
