@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -92,6 +93,26 @@ func noCleanupPolicyRequests(t *testing.T, api *fakeapi.Server) {
 			t.Fatalf("a cleanup-policies API call was made: %s %s", r.Method, r.Path)
 		}
 	}
+}
+
+// deleteThenListHappened reports whether, among the requests recorded since
+// seen, at least one cleanup-policy DELETE was sent, and whether at least one
+// cleanup-policies list GET came AFTER the last such DELETE - the T11-13
+// re-list Delete must perform on any non-204 (I-2: both the "already gone"
+// and the "genuine 500" destroy tests need this, not just a bare DELETE
+// count, since the re-list is the whole point of the branch under test).
+func deleteThenListHappened(api *fakeapi.Server, seen int) (deleted, listAfterDelete bool) {
+	oneRE, listRE := regexp.MustCompile(policyOneRE), regexp.MustCompile(policiesListRE)
+	deleteAt, listAfterDeleteAt := -1, -1
+	for i, r := range requestsSince(api, seen) {
+		if r.Method == http.MethodDelete && oneRE.MatchString(r.Path) {
+			deleteAt = i
+		}
+		if deleteAt >= 0 && listAfterDeleteAt < 0 && r.Method == http.MethodGet && listRE.MatchString(r.Path) {
+			listAfterDeleteAt = i
+		}
+	}
+	return deleteAt >= 0, listAfterDeleteAt >= 0
 }
 
 // ---------------------------------------------------------------- C1
@@ -384,7 +405,8 @@ func TestCleanupPolicyResource_ReadRemovedOutOfBandRemovesFromState(t *testing.T
 // ---------------------------------------------------------------- C8
 
 // Fails if import does not adopt every GET-derived field via the id-matching
-// list read (there is no GET-by-id route, §10/T11-12).
+// list read (there is no GET-by-id route, §10/T11-12), including the actual
+// VALUES of repo_scope and conditions, not merely their counts (m-3b).
 func TestCleanupPolicyResource_ImportByIDAdoptsFields(t *testing.T) {
 	api := setupFake(t)
 	id := api.SeedPolicy(testOrg, "p", "protect", []map[string]any{
@@ -408,10 +430,14 @@ func TestCleanupPolicyResource_ImportByIDAdoptsFields(t *testing.T) {
 				for k, want := range map[string]string{
 					"id": id, "name": "p", "action": "protect", "schedule": "weekly", "enabled": "false",
 					"repo_scope.#": "1", "conditions.#": "1",
+					"conditions.0.type": "tag_name", "conditions.0.op": "eq", "conditions.0.value": "latest",
 				} {
 					if a[k] != want {
 						return fmt.Errorf("imported %s = %q, want %q", k, a[k], want)
 					}
+				}
+				if got, want := setValues(a, "repo_scope"), []string{"foo/*"}; !reflect.DeepEqual(got, want) {
+					return fmt.Errorf("imported repo_scope = %v, want %v", got, want)
 				}
 				return nil
 			},
@@ -450,10 +476,18 @@ func TestCleanupPolicyResource_DestroySendsExactlyOneDelete(t *testing.T) {
 
 // Fails if Delete treats the fake's real "already gone" answer (500
 // "cleanup policy not found" - the API never 404s here, T11-13) as an error
-// instead of re-listing and finding the id absent: destroy must succeed.
+// instead of re-listing and finding the id absent: destroy must succeed. The
+// removal happens INSIDE the DELETE route itself (a handler override
+// installed in step 1's Check), not in step 2's PreConfig, so the destroy
+// step's own refresh does NOT see the policy already gone and Delete's
+// re-list branch actually runs (I-2: the original version removed the
+// policy in PreConfig, so the refresh emptied the plan before apply and
+// Delete was never called - a real "treat this 500 as an error" bug would
+// still have passed 35/35 tests). Asserts a DELETE was sent AND a list GET
+// came after it, not just that the resource ended up absent.
 func TestCleanupPolicyResource_DestroyOfAnAlreadyRemovedPolicyIsSuccess(t *testing.T) {
 	api := setupFake(t)
-	var id string
+	var seen int
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
@@ -461,22 +495,31 @@ func TestCleanupPolicyResource_DestroyOfAnAlreadyRemovedPolicyIsSuccess(t *testi
 			{
 				Config: cleanupPolicyHCL("p", []map[string]string{{"type": "age", "op": "gt", "value": "30d"}}),
 				Check: func(s *terraform.State) error {
-					id = attrs(s, cleanupPolicyResource)["id"]
+					id := attrs(s, cleanupPolicyResource)["id"]
+					route := "DELETE /organizations/" + testOrg + "/registry/cleanup-policies/" + id
+					api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+						api.RemovePolicy(testOrg, id)
+						http.Error(w, "cleanup policy not found", http.StatusInternalServerError)
+					}
 					return nil
 				},
 			},
 			{
-				// See TestCleanupPolicyResource_ReadRemovedOutOfBandRemovesFromState:
-				// the removal must wait for step 2's PreConfig, not step 1's
-				// Check, or step 1's own post-apply refresh-plan check sees
-				// the policy missing and fails (T11 D3).
-				PreConfig: func() {
-					if !api.RemovePolicy(testOrg, id) {
-						t.Fatalf("RemovePolicy(%s) reported the policy missing", id)
-					}
-				},
-				Config: providerOnlyHCL,
-				Check:  checkAbsentFromState(cleanupPolicyResource),
+				PreConfig: func() { seen = len(api.Requests()) },
+				Config:    providerOnlyHCL,
+				Check: resource.ComposeTestCheckFunc(
+					checkAbsentFromState(cleanupPolicyResource),
+					func(*terraform.State) error {
+						deleted, listAfter := deleteThenListHappened(api, seen)
+						if !deleted {
+							return fmt.Errorf("no DELETE was sent, want at least one (§7/T11-13, I-2)")
+						}
+						if !listAfter {
+							return fmt.Errorf("no list GET after the DELETE, want at least one (T11-13's re-list, I-2)")
+						}
+						return nil
+					},
+				),
 			},
 		},
 	})
@@ -484,10 +527,13 @@ func TestCleanupPolicyResource_DestroyOfAnAlreadyRemovedPolicyIsSuccess(t *testi
 
 // Fails if Delete swallows a GENUINE 500 (the policy is still there) just
 // because the status code matches the "already gone" shape: re-listing must
-// find it present and error (T11-13).
+// find it present and error (T11-13). Also asserts the re-list itself
+// happened (DELETE + a list GET after it), which the original version left
+// unchecked (m-3e).
 func TestCleanupPolicyResource_DestroyGenuine500WithPolicyStillPresentErrors(t *testing.T) {
 	api := setupFake(t)
 	var route string
+	var seen int
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
@@ -500,6 +546,7 @@ func TestCleanupPolicyResource_DestroyGenuine500WithPolicyStillPresentErrors(t *
 					api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
 						http.Error(w, "internal_error: something else broke", http.StatusInternalServerError)
 					}
+					seen = len(api.Requests())
 					return nil
 				},
 			},
@@ -514,12 +561,24 @@ func TestCleanupPolicyResource_DestroyGenuine500WithPolicyStillPresentErrors(t *
 				// disk is providerOnlyHCL) wants to destroy it again.
 				RefreshState:       true,
 				ExpectNonEmptyPlan: true,
-				Check: func(s *terraform.State) error {
-					if _, ok := s.RootModule().Resources[cleanupPolicyResource]; !ok {
-						return fmt.Errorf("%s missing after the failed destroy, want it KEPT", cleanupPolicyResource)
-					}
-					return nil
-				},
+				Check: resource.ComposeTestCheckFunc(
+					func(s *terraform.State) error {
+						if _, ok := s.RootModule().Resources[cleanupPolicyResource]; !ok {
+							return fmt.Errorf("%s missing after the failed destroy, want it KEPT", cleanupPolicyResource)
+						}
+						return nil
+					},
+					func(*terraform.State) error {
+						deleted, listAfter := deleteThenListHappened(api, seen)
+						if !deleted {
+							return fmt.Errorf("no DELETE was sent during the genuine-500 destroy, want at least one")
+						}
+						if !listAfter {
+							return fmt.Errorf("no list GET after the DELETE during the genuine-500 destroy, want at least one (T11-13's re-list, I-2/m-3e)")
+						}
+						return nil
+					},
+				),
 			},
 		},
 	})
@@ -567,5 +626,95 @@ func TestCleanupPolicyResource_LastRunDriftRefreshesCleanly(t *testing.T) {
 				),
 			},
 		},
+	})
+}
+
+// ---------------------------------------------------------------- m-2/m-3(c)
+
+// Fails if updating a managed attribute after a scheduler run moves
+// last_run_at as a side effect of the PUT (the real API's PUT never touches
+// last_run_at - only a run does, §11/§12; m-2, mirrors
+// TestCleanupPutAfterRunKeepsLastRunAt at the fake level).
+func TestCleanupPolicyResource_UpdateAfterARunKeepsLastRunAt(t *testing.T) {
+	api := setupFake(t)
+	var id, before string
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				Config: cleanupPolicyHCL("p", []map[string]string{{"type": "age", "op": "gt", "value": "30d"}}),
+				Check: func(s *terraform.State) error {
+					id = attrs(s, cleanupPolicyResource)["id"]
+					return nil
+				},
+			},
+			{
+				// Unchanged config: a plain refresh that picks up SetLastRun,
+				// so `before` reflects what the provider itself read.
+				PreConfig: func() {
+					if !api.SetLastRun(testOrg, id, 4, 2048, "some artifacts skipped") {
+						t.Fatalf("SetLastRun(%s) reported the policy missing", id)
+					}
+				},
+				Config: cleanupPolicyHCL("p", []map[string]string{{"type": "age", "op": "gt", "value": "30d"}}),
+				Check: func(s *terraform.State) error {
+					before = attrs(s, cleanupPolicyResource)["last_run_at"]
+					if before == "" {
+						return fmt.Errorf("last_run_at empty after the refresh that should have picked up SetLastRun")
+					}
+					return nil
+				},
+			},
+			{
+				Config: cleanupPolicyHCL("p", []map[string]string{{"type": "age", "op": "gt", "value": "30d"}}, "enabled = false"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(cleanupPolicyResource, "enabled", "false"),
+					func(s *terraform.State) error {
+						after := attrs(s, cleanupPolicyResource)["last_run_at"]
+						if after != before {
+							return fmt.Errorf("last_run_at moved after an update (%q -> %q), want unchanged (only a run moves it, §11/§12, m-2)", before, after)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// Fails if Read does not stringify a BOOLEAN condition value (true ->
+// "true"), distinct from C6's numeric-value and portal-shape coverage
+// (m-3c).
+func TestCleanupPolicyResource_ReadNormalisesBooleanValue(t *testing.T) {
+	api := setupFake(t)
+	id := api.SeedPolicy(testOrg, "p", "delete", []map[string]any{
+		{"type": "untagged", "value": true},
+	}, []string{}, "nightly", true)
+
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			ResourceName:       cleanupPolicyResource,
+			ImportState:        true,
+			ImportStatePersist: true,
+			// The ruled plan-time validator (T11-10) refuses a valueless
+			// untagged condition, so Config must carry an explicit value -
+			// ImportStateCheck below inspects the imported STATE (the
+			// seeded policy's boolean `true`), not this config.
+			Config:        cleanupPolicyHCL("p", []map[string]string{{"type": "untagged", "value": "true"}}),
+			ImportStateId: id,
+			ImportStateCheck: func(is []*terraform.InstanceState) error {
+				if len(is) != 1 {
+					return fmt.Errorf("want exactly one imported instance, got %d", len(is))
+				}
+				a := is[0].Attributes
+				if a["conditions.0.value"] != "true" {
+					return fmt.Errorf("conditions.0.value = %q, want the stringified boolean \"true\"", a["conditions.0.value"])
+				}
+				return nil
+			},
+		}},
 	})
 }

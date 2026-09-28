@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -125,6 +126,23 @@ func writesSince(api *fakeapi.Server, n int) []fakeapi.Request {
 			out = append(out, r)
 		}
 	}
+	return out
+}
+
+// setValues collects a Set attribute's element values from a flatmap -
+// ImportStateCheck sees only the raw instance state, whose Set elements are
+// keyed by an internal hashcode (not index 0,1,...), so this is the only way
+// to assert Set CONTENTS there. Sorted for a deterministic comparison; the
+// ".#" count key is excluded.
+func setValues(attrs map[string]string, prefix string) []string {
+	var out []string
+	for k, v := range attrs {
+		if k == prefix+".#" || !strings.HasPrefix(k, prefix+".") {
+			continue
+		}
+		out = append(out, v)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -458,5 +476,124 @@ func TestRegistryResource_ImportWhileDisabledErrors(t *testing.T) {
 			ImportStateId: "00000000-0000-4000-8000-000000000000",
 			ExpectError:   loose("the organization's registry is not enabled"),
 		}},
+	})
+}
+
+// ---------------------------------------------------------------- I-1 (T11-18)
+
+// Fails if Read carries robot_username/robot_secret forward after the
+// registry's id changes out of band (an out-of-band disable + re-enable
+// mints a NEW registry row and a NEW default robot with a secret this run
+// never saw - T11-18 amends T11-2: Read must null both credentials and, per
+// the ruling, emit a Warning). RED until the coder implements T11-18: today
+// flattenRegistry only updates id/harbor_project/etc. from the GET and
+// leaves robot_username/robot_secret exactly as they were in prior state,
+// so this test currently fails on the credential assertions (the id
+// assertion alone already passes, since flattenRegistry does update id).
+// v1.16.0's plugin-testing harness has no way to assert on a Warning
+// diagnostic from a successful apply (TDD:"...cannot assert a warning" -
+// same limitation noted for Task 9), so the absence of the stale
+// credentials is the whole test.
+func TestRegistryResource_ReadAfterOutOfBandReenableNullsCredentials(t *testing.T) {
+	api := setupFake(t)
+	var newID string
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: registryHCL()},
+			{
+				PreConfig: func() {
+					api.Disable(testOrg)
+					reenabled := rawEnableRegistry(t, api, testOrg)
+					newID = reenabled["registry"].(map[string]any)["id"].(string)
+				},
+				Config: registryHCL(),
+				Check: resource.ComposeTestCheckFunc(
+					func(s *terraform.State) error {
+						a := attrs(s, registryResource)
+						if a["id"] != newID {
+							return fmt.Errorf("id after the out-of-band re-enable = %q, want the NEW registry id %q", a["id"], newID)
+						}
+						return nil
+					},
+					resource.TestCheckNoResourceAttr(registryResource, "robot_username"),
+					resource.TestCheckNoResourceAttr(registryResource, "robot_secret"),
+				),
+			},
+		},
+	})
+}
+
+// ---------------------------------------------------------------- m-3(c)/(d)
+
+// Fails if a 409 whose code is NOT robot_exists is silently adopted instead
+// of surfaced as an error: T11-1's adopt path is gated on robot_exists
+// specifically (m-3(c)).
+func TestRegistryResource_CreateConflictWithOtherCodeErrors(t *testing.T) {
+	api := setupFake(t)
+	route := "POST /organizations/" + testOrg + "/registry"
+	api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+		fakeapi.WriteJSON(w, http.StatusConflict, map[string]any{
+			"error": map[string]any{"code": "some_other_conflict", "message": "a different conflict entirely"},
+		})
+	}
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				Config:      registryHCL(),
+				ExpectError: loose("a different conflict entirely"),
+			},
+			{
+				// Nothing to refresh: the failed Create must not have saved
+				// anything (mirrors R4's shape).
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check:              checkAbsentFromState(registryResource),
+			},
+		},
+	})
+}
+
+// Fails if a non-204 from DELETE /registry is swallowed instead of surfaced
+// as an error with state KEPT (T11-3; m-3(d)).
+func TestRegistryResource_DestroyNon204Errors(t *testing.T) {
+	api := setupFake(t)
+	var route string
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				Config: registryHCL(),
+				Check: func(s *terraform.State) error {
+					route = "DELETE /organizations/" + testOrg + "/registry"
+					api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+						http.Error(w, "internal_error: something else broke", http.StatusInternalServerError)
+					}
+					return nil
+				},
+			},
+			{
+				Config:      providerOnlyHCL,
+				ExpectError: loose("internal_error"),
+			},
+			{
+				PreConfig: func() { delete(api.Handlers, route) },
+				// The failed destroy must have kept the registry in state; a
+				// post-refresh plan against a state that still has it (config
+				// on disk is providerOnlyHCL) wants to destroy it again.
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check: func(s *terraform.State) error {
+					if _, ok := s.RootModule().Resources[registryResource]; !ok {
+						return fmt.Errorf("%s missing after the failed destroy, want it KEPT", registryResource)
+					}
+					return nil
+				},
+			},
+		},
 	})
 }

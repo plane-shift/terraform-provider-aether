@@ -352,16 +352,22 @@ func TestRobotAccountListFixedPageNoNextCursorHonoursCursor(t *testing.T) {
 	}
 }
 
-// Fails if a malformed id does not 500 (mirroring pgx's uuid cast failure) or
-// a well-formed-but-unknown id is anything but 404 (§7).
+// Fails if a malformed id does not answer the JSON store_error envelope
+// mentioning "lookup robot account" (mirroring pgx's uuid cast failure -
+// never text/plain, §7 n-4) or a well-formed-but-unknown id is anything but
+// 404 (§7).
 func TestRobotAccountDeleteMalformedVsUnknownID(t *testing.T) {
 	s := newClusterFake(t)
 	resp, b := call(t, s, http.MethodDelete, robotsPath+"/not-a-uuid", "")
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("malformed id = %d %s, want 500", resp.StatusCode, b)
 	}
-	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
-		t.Fatalf("Content-Type = %q, want text/plain", ct)
+	m := decode(t, b)
+	if errCode(m) != "store_error" {
+		t.Fatalf("malformed id error code = %v, want store_error (JSON, never text/plain - §7 n-4): %v", errCode(m), m)
+	}
+	if msg, _ := m["error"].(map[string]any)["message"].(string); !strings.Contains(msg, "lookup robot account") {
+		t.Fatalf("malformed id message = %q, want it to contain \"lookup robot account\"", msg)
 	}
 
 	resp, b = call(t, s, http.MethodDelete, robotsPath+"/"+uuid.NewString(), "")
@@ -610,6 +616,49 @@ func TestCleanupPutUnknownIDIs500ExactMessage(t *testing.T) {
 	resp, b := call(t, s, http.MethodPut, policiesPath+"/"+uuid.NewString(), minimalPolicyBody)
 	if resp.StatusCode != http.StatusInternalServerError || strings.TrimSpace(string(b)) != "update cleanup policy: no rows in result set" {
 		t.Fatalf("PUT unknown id = %d %q, want 500 \"update cleanup policy: no rows in result set\"", resp.StatusCode, b)
+	}
+}
+
+// Fails if PUT to an unknown id validates the body BEFORE looking it up: the
+// real API's UPDATE matches zero rows first, so an invalid body against an
+// unknown id still answers "no rows in result set", never a CHECK-constraint
+// message (§11 - "a CHECK/NOT NULL cannot fire when zero rows match", n-5).
+func TestCleanupPutUnknownIDIgnoresInvalidBody(t *testing.T) {
+	s := newClusterFake(t)
+	// action/schedule/repo_scope all omitted - would 500 with the CHECK-
+	// constraint message instead if validated before the lookup.
+	resp, b := call(t, s, http.MethodPut, policiesPath+"/"+uuid.NewString(), `{"name":"p"}`)
+	if resp.StatusCode != http.StatusInternalServerError || strings.TrimSpace(string(b)) != "update cleanup policy: no rows in result set" {
+		t.Fatalf("PUT invalid body to unknown id = %d %q, want 500 \"update cleanup policy: no rows in result set\" regardless of body", resp.StatusCode, b)
+	}
+}
+
+// Fails if a PUT issued after SetLastRun moves last_run_at: the real PUT's
+// query does not select or write last_run_* - only a run does (§11/§12,
+// m-2). Before the fix, last_run_at was rendered from updatedSeq, which a
+// PUT also bumps.
+func TestCleanupPutAfterRunKeepsLastRunAt(t *testing.T) {
+	s := newClusterFake(t)
+	_, b := call(t, s, http.MethodPost, policiesPath, minimalPolicyBody)
+	id := decode(t, b)["id"].(string)
+	if !s.SetLastRun(testOrg, id, 3, 1024, "some artifacts skipped") {
+		t.Fatal("SetLastRun reported the policy missing")
+	}
+	_, lb := call(t, s, http.MethodGet, policiesPath, "")
+	before, _ := decode(t, lb)["items"].([]any)[0].(map[string]any)["last_run_at"].(string)
+	if before == "" {
+		t.Fatal("last_run_at empty right after SetLastRun")
+	}
+
+	resp, pb := call(t, s, http.MethodPut, policiesPath+"/"+id, minimalPolicyBody)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT = %d %s, want 200", resp.StatusCode, pb)
+	}
+
+	_, lb2 := call(t, s, http.MethodGet, policiesPath, "")
+	after, _ := decode(t, lb2)["items"].([]any)[0].(map[string]any)["last_run_at"].(string)
+	if after != before {
+		t.Fatalf("last_run_at moved after a PUT (%s -> %s), want unchanged (only a run moves it, m-2)", before, after)
 	}
 }
 

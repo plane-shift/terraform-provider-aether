@@ -127,6 +127,7 @@ type fakeCleanupPolicy struct {
 	enabled                           bool
 	createdSeq, updatedSeq            int
 	lastRunSet                        bool // false until a run: last_run_* keys are omitted, not merely null
+	lastRunSeq                        int  // separate from updatedSeq (m-2): a PUT after a run must NOT move last_run_at
 	lastRunDeleted                    int
 	lastRunFreedBytes                 int64
 	lastRunMessage                    string // stored but NEVER rendered (§10) - kept only so SetLastRun's signature is complete
@@ -267,7 +268,7 @@ func (s *Server) SeedRobotWithID(org, id, name string, permissions []string) str
 	rs.init()
 	rs.seq++
 	rs.harborIDSeq++
-	slug := s.orgSlugLocked(org)
+	slug := s.orgSlug(org)
 	r := &fakeRobot{
 		id: id, orgID: org, name: name,
 		permissions: append([]string(nil), permissions...),
@@ -277,12 +278,6 @@ func (s *Server) SeedRobotWithID(org, id, name string, permissions []string) str
 	rs.robots[org] = append(rs.robots[org], r)
 	return id
 }
-
-// orgSlugLocked is orgSlug for a caller that must not re-take s.mu re-entrantly
-// through orgSlug's own locking - registryStore.mu and Server.mu are already
-// disjoint, so this only exists to avoid a second full org-list scan call site
-// reading oddly; it is identical to orgSlug.
-func (s *Server) orgSlugLocked(org string) string { return s.orgSlug(org) }
 
 // RemoveRobot deletes a robot account out of band (no request recorded). It
 // reports whether the robot existed.
@@ -301,13 +296,14 @@ func (s *Server) RemoveRobot(org, id string) bool {
 }
 
 // StickyRobotDeleteFailure makes EVERY DELETE of org's robot id answer
-// (status, code, message) instead of deleting it, until this is called again
-// with a different id (or the server is discarded). Unlike webhookStore's
-// one-shot overrides, this does NOT auto-clear: the retrying transport
-// retries a DELETE up to 3 times (TR:148-157), and a one-shot override would
-// only fail the first attempt, letting the retry silently succeed - masking
-// exactly the "Harbor stays down across every retry" case this exists to
-// test (contract §7's 503, row kept).
+// (status, code, message) instead of deleting it. The map is keyed per id -
+// calling this again for a DIFFERENT id does NOT disarm the first one; only
+// ClearRobotDeleteFailure removes an armed failure. Unlike webhookStore's
+// one-shot overrides, this does NOT auto-clear: the retrying transport makes
+// 3 retries (4 attempts total, TR:148-157) at a DELETE, and a one-shot
+// override would only fail the first attempt, letting the retry silently
+// succeed - masking exactly the "Harbor stays down across every retry" case
+// this exists to test (contract §7's 503, row kept).
 func (s *Server) StickyRobotDeleteFailure(org, id string, status int, code, message string) {
 	rs := &s.registries
 	rs.mu.Lock()
@@ -355,7 +351,11 @@ func (s *Server) SeedPolicy(org, name, action string, conditions []map[string]an
 
 // SetLastRun records a completed run's result out of band (as the 60s
 // scheduler or POST .../run would), advancing updated_at exactly as a real
-// run does (§12). It reports whether the policy exists.
+// run does (§12). last_run_at is tracked with its OWN sequence number (m-2),
+// separate from updatedSeq: a subsequent PUT bumps updatedSeq again (a real
+// PUT moves updated_at) but must NOT move last_run_at (only a run does,
+// §11/§12 - the real PUT's query does not select or write last_run_*). It
+// reports whether the policy exists.
 func (s *Server) SetLastRun(org, id string, deleted int, freedBytes int64, message string) bool {
 	rs := &s.registries
 	rs.mu.Lock()
@@ -367,6 +367,7 @@ func (s *Server) SetLastRun(org, id string, deleted int, freedBytes int64, messa
 	rs.seq++
 	p.lastRunSet = true
 	p.lastRunDeleted, p.lastRunFreedBytes, p.lastRunMessage = deleted, freedBytes, message
+	p.lastRunSeq = rs.seq
 	p.updatedSeq = rs.seq
 	return true
 }
@@ -667,7 +668,9 @@ func (s *Server) deleteRobotAccount(w http.ResponseWriter, org, id string) {
 	robot, i := rs.findRobot(org, id)
 	if robot == nil {
 		if _, err := uuid.Parse(id); err != nil {
-			http.Error(w, fmt.Sprintf("store_error: invalid input syntax for type uuid: %q", id), http.StatusInternalServerError)
+			// A malformed id fails the uuid cast, not the "no rows" path -
+			// the JSON store_error envelope, never text/plain (§7, n-4).
+			apiError(w, http.StatusInternalServerError, "store_error", fmt.Sprintf("lookup robot account: invalid input syntax for type uuid: %q", id))
 			return
 		}
 		apiError(w, http.StatusNotFound, "not_found", "Resource not found")
@@ -705,7 +708,7 @@ func policyBaseJSON(p *fakeCleanupPolicy) map[string]any {
 func policyListJSON(p *fakeCleanupPolicy) map[string]any {
 	m := policyBaseJSON(p)
 	if p.lastRunSet {
-		m["last_run_at"] = registryTime(p.updatedSeq)
+		m["last_run_at"] = registryTime(p.lastRunSeq)
 		m["last_run_deleted"] = p.lastRunDeleted
 		m["last_run_freed_bytes"] = p.lastRunFreedBytes
 	}
@@ -796,11 +799,24 @@ func (s *Server) listCleanupPolicies(w http.ResponseWriter, org string) {
 
 // putCleanupPolicy is PUT .../cleanup-policies/{id} (§11): a FULL REPLACE of
 // every field but `enabled` (merged), an unknown/foreign id is 500 (never
-// 404), and - unlike create - `name` is NOT validated here at all.
+// 404), and - unlike create - `name` is NOT validated here at all. The id
+// lookup runs BEFORE any field validation (n-5): on the real API a CHECK/
+// NOT-NULL constraint cannot fire when the UPDATE matches zero rows, so an
+// invalid body sent to an unknown id answers "no rows in result set", not a
+// CHECK-constraint message.
 func (s *Server) putCleanupPolicy(w http.ResponseWriter, org, id string, body []byte) {
 	var req cleanupPolicyRequest
 	if !decodeLax(body, &req) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	rs := &s.registries
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.init()
+	p, _ := rs.findPolicy(org, id)
+	if p == nil {
+		http.Error(w, "update cleanup policy: no rows in result set", http.StatusInternalServerError)
 		return
 	}
 	action := ""
@@ -821,15 +837,6 @@ func (s *Server) putCleanupPolicy(w http.ResponseWriter, org, id string, body []
 	}
 	if req.RepoScope == nil {
 		http.Error(w, `update cleanup policy: ERROR: null value in column "repo_scope" of relation "cleanup_policies" violates not-null constraint`, http.StatusInternalServerError)
-		return
-	}
-	rs := &s.registries
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	rs.init()
-	p, _ := rs.findPolicy(org, id)
-	if p == nil {
-		http.Error(w, "update cleanup policy: no rows in result set", http.StatusInternalServerError)
 		return
 	}
 	var conditions []map[string]any

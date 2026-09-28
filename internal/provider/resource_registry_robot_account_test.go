@@ -3,6 +3,7 @@ package provider_test
 import (
 	"fmt"
 	"net/http"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -274,6 +275,67 @@ func TestRobotAccountResource_ReadPagesPastFiftyToFindTheTarget(t *testing.T) {
 	}
 }
 
+// T11-19 note: this test's premise (the target is found partway through
+// page 2) does not depend on the "a page shorter than 50 is the last page"
+// rule at all - find() returns as soon as it matches an item, before it ever
+// looks at the page's length - so it needs no change for T11-19 and remains
+// valid unmodified both before and after the coder's fix below.
+
+// Fails against the OLD "a page shorter than 50 is the last page" rule
+// (m-1b/T11-19): removes the managed robot out of band, then seeds 55 OTHER
+// robots so the not-found search must walk a full page (50) AND a
+// short-but-nonempty page (5) before it can ever reach a truly EMPTY page.
+// Under the old rule Read stops at the 5-item page and never issues the
+// empty-page request - RED until the coder implements T11-19 (page until an
+// EMPTY page; no hard-coded page-size assumption). Isolated to exactly the
+// refresh's own Read via RefreshState (no apply), so the recreate that a
+// normal step would trigger cannot add extra list GETs that would otherwise
+// make "the LAST recorded GET" ambiguous.
+func TestRobotAccountResource_ReadPagesToAnEmptyPageWhenNotFound(t *testing.T) {
+	api := setupFake(t)
+	var seen int
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: robotAccountHCL("ci", []string{"push"})},
+			{
+				PreConfig: func() {
+					id := attrsFromLastPlan(t, api)
+					if !api.RemoveRobot(testOrg, id) {
+						t.Fatalf("RemoveRobot(%s) reported the robot missing", id)
+					}
+					for i := 0; i < 55; i++ {
+						fid := fmt.Sprintf("22222222-2222-4222-8222-%012d", i)
+						api.SeedRobotWithID(testOrg, fid, fmt.Sprintf("other-%d", i), []string{"push"})
+					}
+					seen = len(api.Requests())
+				},
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check: resource.ComposeTestCheckFunc(
+					checkAbsentFromState(robotAccountResource),
+					func(*terraform.State) error {
+						gets := filterReqs(requestsSince(api, seen), http.MethodGet, robotsListRE)
+						if len(gets) == 0 {
+							return fmt.Errorf("no list GET was made during the refresh")
+						}
+						last := gets[len(gets)-1]
+						resp, b := rawCall(t, api, http.MethodGet, "/organizations/"+testOrg+"/registry/robot-accounts?"+last.Query, "")
+						if resp.StatusCode != http.StatusOK {
+							t.Fatalf("re-issuing the provider's last list request = %d %s", resp.StatusCode, b)
+						}
+						if items := rawDecode(t, b)["items"].([]any); len(items) != 0 {
+							return fmt.Errorf("provider's LAST list request (query %q) answers %d items, want the not-found search's LAST page to be EMPTY (T11-19) - a page short of 50 must not be treated as the last page", last.Query, len(items))
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
 // ---------------------------------------------------------------- B6
 
 // Fails if Read does not remove a robot account deleted out of band.
@@ -319,9 +381,11 @@ func TestRobotAccountResource_ReadRemovedOutOfBandRemovesFromState(t *testing.T)
 
 // ---------------------------------------------------------------- B7
 
-// Fails if import does not adopt every GET-derived field, if it invents a
-// secret (never returned by the list), or if importing the platform's
-// default "org-<slug>" robot is silently accepted instead of erroring (T11-7).
+// Fails if import does not adopt every GET-derived field (id, name,
+// harbor_username, permissions, harbor_id, created_at, updated_at - m-3a),
+// if it invents a secret (never returned by the list), or if importing the
+// platform's default "org-<slug>" robot is silently accepted instead of
+// erroring (T11-7).
 func TestRobotAccountResource_ImportAdoptsFieldsAndRefusesTheDefaultRobot(t *testing.T) {
 	api := setupFake(t)
 	id := api.SeedRobot(testOrg, "ci", []string{"push", "pull"})
@@ -339,9 +403,19 @@ func TestRobotAccountResource_ImportAdoptsFieldsAndRefusesTheDefaultRobot(t *tes
 					return fmt.Errorf("want exactly one imported instance, got %d", len(is))
 				}
 				a := is[0].Attributes
-				for k, want := range map[string]string{"id": id, "name": "ci", "harbor_username": "robot$aether-acme+ci"} {
+				for k, want := range map[string]string{
+					"id": id, "name": "ci", "harbor_username": "robot$aether-acme+ci", "permissions.#": "2",
+				} {
 					if a[k] != want {
 						return fmt.Errorf("imported %s = %q, want %q", k, a[k], want)
+					}
+				}
+				if got, want := setValues(a, "permissions"), []string{"pull", "push"}; !reflect.DeepEqual(got, want) {
+					return fmt.Errorf("imported permissions = %v, want %v", got, want)
+				}
+				for _, k := range []string{"harbor_id", "created_at", "updated_at"} {
+					if a[k] == "" {
+						return fmt.Errorf("imported %s is empty, want it populated from the GET-derived robot", k)
 					}
 				}
 				if v, has := a["secret"]; has {
@@ -431,23 +505,47 @@ func TestRobotAccountResource_DestroySendsExactlyOneDelete(t *testing.T) {
 }
 
 // Fails if Delete treats the API's 404 (already removed out of band) as an
-// error: destroy must succeed (§7 - a 404 on delete is success).
+// error: destroy must succeed (§7 - a 404 on delete is success). The removal
+// happens INSIDE the DELETE route itself (a handler override installed in
+// step 1's Check), not in step 2's PreConfig, so the destroy step's own
+// refresh does NOT see the robot already gone and Delete's 404 branch
+// actually runs (I-2: the original version removed the robot in PreConfig,
+// so the refresh emptied the plan before apply and Delete was never called -
+// a real "treat 404 as an error" bug would still have passed 35/35 tests).
 func TestRobotAccountResource_DeleteOfAnAlreadyRemovedRobotIsSuccess(t *testing.T) {
 	api := setupFake(t)
+	var seen int
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{
-			{Config: robotAccountHCL("ci", []string{"push"})},
 			{
-				PreConfig: func() {
-					id := attrsFromLastPlan(t, api)
-					if !api.RemoveRobot(testOrg, id) {
-						t.Fatalf("RemoveRobot(%s) reported the robot missing", id)
+				Config: robotAccountHCL("ci", []string{"push"}),
+				Check: func(s *terraform.State) error {
+					id := attrs(s, robotAccountResource)["id"]
+					route := "DELETE /organizations/" + testOrg + "/registry/robot-accounts/" + id
+					api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+						api.RemoveRobot(testOrg, id)
+						fakeapi.WriteJSON(w, http.StatusNotFound, map[string]any{
+							"error": map[string]any{"code": "not_found", "message": "Resource not found"},
+						})
 					}
+					return nil
 				},
-				Config: providerOnlyHCL,
-				Check:  checkAbsentFromState(robotAccountResource),
+			},
+			{
+				PreConfig: func() { seen = len(api.Requests()) },
+				Config:    providerOnlyHCL,
+				Check: resource.ComposeTestCheckFunc(
+					checkAbsentFromState(robotAccountResource),
+					func(*terraform.State) error {
+						d := filterReqs(requestsSince(api, seen), http.MethodDelete, robotOneRE)
+						if len(d) != 1 {
+							return fmt.Errorf("DELETEs = %v, want exactly one (404 is not retried) - proves the 404 branch actually ran (§7, I-2)", d)
+						}
+						return nil
+					},
+				),
 			},
 		},
 	})
@@ -476,6 +574,7 @@ func TestRobotAccountResource_DestroyStickyFailureErrorsAndKeepsState(t *testing
 	api := setupFake(t)
 	cfg := robotAccountHCL("ci", []string{"push"})
 	var id string
+	var seen int
 	resource.UnitTest(t, resource.TestCase{
 		IsUnitTest:               true,
 		ProtoV6ProviderFactories: factories(),
@@ -509,12 +608,26 @@ func TestRobotAccountResource_DestroyStickyFailureErrorsAndKeepsState(t *testing
 			},
 			{
 				// Clear the sticky failure and prove the destroy then
-				// succeeds with exactly one more DELETE - this also stands
-				// in for the harness's own post-test cleanup destroy, which
-				// would otherwise hit the same still-armed 503 (T11 D4).
-				PreConfig: func() { api.ClearRobotDeleteFailure(testOrg, id) },
-				Config:    providerOnlyHCL,
-				Check:     checkAbsentFromState(robotAccountResource),
+				// succeeds with exactly one more DELETE (n-3: this step used
+				// to only assert absence, not the "exactly one more DELETE"
+				// its own comment claimed) - this also stands in for the
+				// harness's own post-test cleanup destroy, which would
+				// otherwise hit the same still-armed 503 (T11 D4).
+				PreConfig: func() {
+					api.ClearRobotDeleteFailure(testOrg, id)
+					seen = len(api.Requests())
+				},
+				Config: providerOnlyHCL,
+				Check: resource.ComposeTestCheckFunc(
+					checkAbsentFromState(robotAccountResource),
+					func(*terraform.State) error {
+						d := filterReqs(requestsSince(api, seen), http.MethodDelete, robotOneRE)
+						if len(d) != 1 {
+							return fmt.Errorf("DELETEs after clearing the sticky failure = %v, want exactly one more", d)
+						}
+						return nil
+					},
+				),
 			},
 		},
 	})
