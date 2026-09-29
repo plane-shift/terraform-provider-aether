@@ -217,3 +217,77 @@ func TestAuditLogDataSource_LimitDefaultsToFifty(t *testing.T) {
 		}},
 	})
 }
+
+// PR #20 CodeRabbit finding: auditEventWire (datasource_audit_log.go) decodes
+// a required field (action/actor_type/resource_type) that is entirely ABSENT
+// from the item's JSON as its Go zero value "" and writes it to state with no
+// diagnostic - an API bug (a required field the platform's own OpenAPI spec
+// promises but a handler forgot to serialize) would silently read as an
+// empty string instead of surfacing. The fix must ERROR when a required
+// field's key is missing from the item, naming the missing field; this test
+// only requires the message to name "action" (loose enough to survive
+// exact wording changes) - coordinate with the coder on a stable phrase such
+// as `missing required field "action"` so future fields can reuse it.
+//
+// RED today (2026-09-29): the current Read has no such check, so the request
+// succeeds with events.0.action == "" and this step fails because
+// ExpectError finds no error where one is required.
+func TestAuditLogDataSource_OmittedRequiredFieldIsAnError(t *testing.T) {
+	api := setupFake(t)
+	route := "GET /organizations/" + testOrg + "/audit-log"
+	api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+		fakeapi.WriteJSON(w, http.StatusOK, map[string]any{
+			"items": []map[string]any{
+				{
+					"id":         "11111111-1111-4111-8111-111111111111",
+					"actor_type": "system",
+					// "action" key entirely absent - not sent as "".
+					"resource_type": "cluster",
+					"created_at":    "2026-09-28T00:00:00Z",
+				},
+			},
+		})
+	}
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      auditLogHCL(),
+			ExpectError: loose("action"),
+		}},
+	})
+}
+
+// Symmetric case, pinning the distinction the fix above must preserve: an
+// explicit empty string IS a valid value for a required field (the API sent
+// the key, just with "" content) and must keep reading successfully - only
+// true KEY OMISSION (the case above) is an error. GREEN today and must stay
+// GREEN after the fix.
+func TestAuditLogDataSource_ExplicitEmptyStringActionSucceeds(t *testing.T) {
+	api := setupFake(t)
+	route := "GET /organizations/" + testOrg + "/audit-log"
+	api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+		fakeapi.WriteJSON(w, http.StatusOK, map[string]any{
+			"items": []map[string]any{
+				{
+					"id":            "11111111-1111-4111-8111-111111111111",
+					"actor_type":    "system",
+					"action":        "",
+					"resource_type": "cluster",
+					"created_at":    "2026-09-28T00:00:00Z",
+				},
+			},
+		})
+	}
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config: auditLogHCL(),
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr(auditLogDataSource, "events.#", "1"),
+				resource.TestCheckResourceAttr(auditLogDataSource, "events.0.action", ""),
+			),
+		}},
+	})
+}
