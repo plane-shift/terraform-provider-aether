@@ -19,7 +19,9 @@ data "aether_audit_log" "recent" {
 }
 
 output "recent_actions" {
-  value = [for e in data.aether_audit_log.recent.events : "${e.created_at} ${e.actor_email} ${e.action}"]
+  # actor_email is null for api_token and system actors; coalesce so the
+  # interpolation below never fails on exactly those events.
+  value = [for e in data.aether_audit_log.recent.events : "${e.created_at} ${coalesce(e.actor_email, e.actor_type)} ${e.action}"]
 }
 ```
 

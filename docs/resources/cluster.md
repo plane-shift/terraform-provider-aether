@@ -16,8 +16,10 @@ A managed Kubernetes cluster (control plane). Node pools are separate `aether_no
 data "aether_k8s_versions" "offered" {}
 
 resource "aether_cluster" "prod" {
-  name        = "prod"
-  region      = "eu-fi"
+  name   = "prod"
+  region = "eu-fi"
+  # latest is null while the platform's version window is unavailable; pin a
+  # minor instead (e.g. "1.37") if that's not acceptable.
   k8s_version = data.aether_k8s_versions.offered.latest
   # Defaults to true: the public API endpoint is billed as one public IP (€4/month).
   public_endpoint = true

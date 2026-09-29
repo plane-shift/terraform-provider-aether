@@ -5,7 +5,7 @@ description: Manage Aether Kubernetes clusters, access and registry with Terrafo
 
 # Aether Provider
 
-Works with Terraform 1.x and OpenTofu 1.6+.
+Works with Terraform 1.5+ and OpenTofu 1.6+.
 
 **Terraform vs OpenTofu:** the provider is published under the same address, `plane-shift/aether`, on both the Terraform Registry and the OpenTofu Registry, and behaves identically on both engines. Use `terraform` or `tofu` for every command shown in these docs.
 

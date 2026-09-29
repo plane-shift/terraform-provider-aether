@@ -17,7 +17,8 @@ variable "cluster_id" {
   type = string
 }
 
-# Fixed pool: billed as a flat monthly fee; apply waits until desired_nodes nodes are ready.
+# Fixed pool: billed as a flat monthly fee; create waits until the pool is running,
+# and a later change to desired_nodes waits until that many nodes are ready.
 # vcpus, memory_gb, disk_gb and name REPLACE the pool when changed.
 resource "aether_node_pool" "workers" {
   cluster_id            = var.cluster_id
