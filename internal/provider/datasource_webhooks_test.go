@@ -63,3 +63,22 @@ func TestWebhooksDataSource_ReadAllAttributesNoSecret(t *testing.T) {
 		}},
 	})
 }
+
+// T14-15 (the same collectAll pager family as
+// TestOrganizationMembersDataSource_RepeatedCursorErrors, distinct from the
+// Harbor-page pager): a server that repeats next_cursor must be an error
+// here too, not a silently truncated/looping list (ruling T14-15, review r1
+// M-1). Named as a coverage gap in task-14-tests-report.md's "Fix round 1".
+func TestWebhooksDataSource_RepeatedCursorErrors(t *testing.T) {
+	api := setupFake(t)
+	id := api.SeedWebhook(testOrg, "https://example.com/hook", []string{"cluster.ready"}, true)
+	api.SetRepeatingWebhookCursor(testOrg, id)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      webhooksDSHCL,
+			ExpectError: loose("repeated"),
+		}},
+	})
+}

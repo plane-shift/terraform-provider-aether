@@ -4,14 +4,18 @@ package provider_test
 // registered as NewInvoicesDataSource in provider.go's DataSources().
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
+	"github.com/plane-shift/terraform-provider-aether/internal/provider"
 	"github.com/plane-shift/terraform-provider-aether/internal/provider/fakeapi"
 )
 
@@ -67,8 +71,29 @@ func TestInvoicesDataSource_ReadRawFieldsNoPIITwoPages(t *testing.T) {
 			Check: resource.ComposeTestCheckFunc(
 				resource.TestCheckResourceAttr(invoicesDataSource, "invoices.#", "150"),
 				findInvoiceByID(invoicesDataSource, firstID, func(inv map[string]string) error {
+					// M-7: the original assertion set skipped id, period_start,
+					// period_end, created_at and tax_cents entirely - a mutation
+					// dropping any one of those five from invoiceDataModel/the
+					// flatten would have passed.
+					if inv["id"] != firstID {
+						return fmt.Errorf("id = %q, want %q", inv["id"], firstID)
+					}
 					if inv["invoice_number"] != "AE-2020-0000" {
 						return fmt.Errorf("invoice_number = %q, want AE-2020-0000", inv["invoice_number"])
+					}
+					wantStart := base.Format(time.RFC3339)
+					if inv["period_start"] != wantStart {
+						return fmt.Errorf("period_start = %q, want %q", inv["period_start"], wantStart)
+					}
+					wantEnd := base.AddDate(0, 1, 0).Format(time.RFC3339)
+					if inv["period_end"] != wantEnd {
+						return fmt.Errorf("period_end = %q, want %q", inv["period_end"], wantEnd)
+					}
+					if _, err := time.Parse(time.RFC3339, inv["created_at"]); err != nil {
+						return fmt.Errorf("created_at = %q is not a valid RFC 3339 timestamp: %s", inv["created_at"], err)
+					}
+					if inv["tax_cents"] != "1900" {
+						return fmt.Errorf("tax_cents = %q, want 1900", inv["tax_cents"])
 					}
 					if inv["tax_rate_bp"] != "1900" {
 						return fmt.Errorf("tax_rate_bp = %q, want 1900", inv["tax_rate_bp"])
@@ -134,4 +159,59 @@ func findInvoiceByID(addr, id string, check func(map[string]string) error) resou
 		}
 		return fmt.Errorf("%s: no invoice with id %q found", addr, id)
 	}
+}
+
+// M-6: a non-200 (502, an upstream gateway failure) from the invoices route
+// must surface as a plan-time error carrying the status and message.
+func TestInvoicesDataSource_APIErrorSurfaces(t *testing.T) {
+	api := setupFake(t)
+	route := "GET /organizations/" + testOrg + "/billing/invoices"
+	api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+		fakeapi.WriteJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"code": "upstream_error", "message": "billing service unavailable"}})
+	}
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      invoicesDSHCL,
+			ExpectError: loose("502 upstream_error: billing service unavailable"),
+		}},
+	})
+}
+
+// Coder's suggested pin 3 (task-14-report.md "Fix round 2", review r1 M-2):
+// the schema description must cite the tracking issue, not just describe the
+// defect in prose that could silently drift. Calls NewInvoicesDataSource's
+// Schema method directly (reachable from this external test package since
+// it, like the schema.Schema type, is exported), so this fails on the exact
+// text going missing or being reworded without a matching test update.
+func TestInvoicesDataSource_SchemaDescriptionCitesAPIIssue(t *testing.T) {
+	var resp datasource.SchemaResponse
+	provider.NewInvoicesDataSource().Schema(context.Background(), datasource.SchemaRequest{}, &resp)
+	const want = "aether-api #318"
+	if !strings.Contains(resp.Schema.MarkdownDescription, want) {
+		t.Fatalf("aether_invoices description = %q, want it to contain %q", resp.Schema.MarkdownDescription, want)
+	}
+}
+
+// T14-15 (the same collectAll pager family as
+// TestOrganizationMembersDataSource_RepeatedCursorErrors, distinct from the
+// Harbor-page pager): a server that repeats next_cursor must be an error
+// here too, not a silently truncated/looping list (ruling T14-15, review r1
+// M-1). Named as a coverage gap in task-14-tests-report.md's "Fix round 1".
+func TestInvoicesDataSource_RepeatedCursorErrors(t *testing.T) {
+	api := setupFake(t)
+	id := api.SeedInvoice(testOrg, fakeapi.InvoiceSeed{
+		PeriodStart: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), PeriodEnd: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
+		SubtotalCents: 100, TotalCents: 100, Status: "issued",
+	})
+	api.SetRepeatingInvoiceCursor(testOrg, id)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      invoicesDSHCL,
+			ExpectError: loose("repeated"),
+		}},
+	})
 }

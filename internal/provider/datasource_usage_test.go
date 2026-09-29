@@ -4,6 +4,7 @@ package provider_test
 // registered as NewUsageDataSource in provider.go's DataSources().
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -26,8 +27,15 @@ data "aether_usage" "u" {}
 func TestUsageDataSource_ReadAllAttributesNoItemsKey(t *testing.T) {
 	api := setupFake(t)
 	clusterID := "66666666-6666-4666-8666-666666666666"
+	// review r1 M-5: seeded items carry realistic UUID id/org_id and a
+	// recorded_at (contract §4), not the opaque "u1"/"u2" placeholders the
+	// original seed used - fidelity only, since T14-9 drops `items` and
+	// neither field is ever decoded by the data source.
 	api.SetUsage(testOrg,
-		[]map[string]any{{"id": "u1", "resource_type": "registry"}, {"id": "u2", "resource_type": "vcpu"}},
+		[]map[string]any{
+			{"id": "10000000-0000-4000-8000-000000000001", "org_id": testOrg, "recorded_at": "2026-09-01T00:00:00Z", "resource_type": "registry"},
+			{"id": "10000000-0000-4000-8000-000000000002", "org_id": testOrg, "recorded_at": "2026-09-02T00:00:00Z", "resource_type": "vcpu"},
+		},
 		[]fakeapi.SubscriptionLine{{Kind: "plan", ClusterID: &clusterID, Name: "starter", AmountEUR: 20, GrossAmountEUR: 20, DiscountEUR: 0}},
 		20.75,
 	)
@@ -91,6 +99,24 @@ func TestUsageDataSource_EmptyMonthReadsZeros(t *testing.T) {
 				resource.TestCheckResourceAttr(usageDataSource, "total_eur", "0"),
 				resource.TestCheckResourceAttr(usageDataSource, "subscriptions.#", "0"),
 			),
+		}},
+	})
+}
+
+// M-6: a non-200 from the usage route must surface as a plan-time error
+// carrying the status and message, not be swallowed or read as a zero month.
+func TestUsageDataSource_APIErrorSurfaces(t *testing.T) {
+	api := setupFake(t)
+	route := "GET /organizations/" + testOrg + "/billing/usage"
+	api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+		fakeapi.WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "internal", "message": "usage store unavailable"}})
+	}
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      usageDSHCL,
+			ExpectError: loose("500 internal: usage store unavailable"),
 		}},
 	})
 }

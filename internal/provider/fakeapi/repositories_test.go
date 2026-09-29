@@ -178,6 +178,26 @@ func TestRepositoriesListRepeatingCursorIsForcedPastNaturalEnd(t *testing.T) {
 	}
 }
 
+// SetOmitNextCursor (coder's suggested pin 2, task-14-report.md "Fix round
+// 2"): once armed, the repositories list response drops the "next_cursor"
+// key entirely - not merely sends it as "" - even though the seeded list is
+// a single item and would naturally end there anyway.
+func TestRepositoriesListOmitNextCursorDropsTheKey(t *testing.T) {
+	s := newClusterFake(t)
+	s.SeedRepository(testOrg, "solo", 1, 10, nil)
+	s.SetOmitNextCursor(testOrg, true)
+
+	_, b := call(t, s, http.MethodGet, repositoriesPath, "")
+	m := decode(t, b)
+	if _, ok := m["next_cursor"]; ok {
+		t.Fatalf("response %v carries a next_cursor key, want it entirely absent", m)
+	}
+	items, _ := m["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items = %v, want exactly 1", m["items"])
+	}
+}
+
 // D5: tags_count is honestly the ARTIFACT count (whatever the seed says),
 // distinct from an item count - not re-derived from anything else.
 func TestRepositoriesListTagsCountIsArtifactCountVerbatim(t *testing.T) {

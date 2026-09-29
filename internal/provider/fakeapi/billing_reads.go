@@ -131,6 +131,14 @@ type billingReadStore struct {
 	breakdown map[string]*fakeBreakdown
 	invoices  map[string][]*fakeInvoice
 	seq       int
+
+	// forceCursor, keyed by org, when present makes the invoice list report
+	// this value as next_cursor on EVERY page, regardless of the natural
+	// (broken) cursor arithmetic brokenCursorPage computes - a fake server
+	// contract violation used to prove the data source's collectAll pager
+	// fails loud on a repeated cursor instead of looping/truncating (ruling
+	// T14-15, review r1 M-1). See SetRepeatingInvoiceCursor.
+	forceCursor map[string]string
 }
 
 // SetUsage replaces org's billing/usage answer wholesale. items is rendered
@@ -191,6 +199,20 @@ func (s *Server) SeedInvoice(org string, inv InvoiceSeed) string {
 	}
 	br.invoices[org] = append(br.invoices[org], fi)
 	return id
+}
+
+// SetRepeatingInvoiceCursor forces the aether_invoices list to report cursor
+// as next_cursor on EVERY page for org, regardless of what brokenCursorPage
+// would naturally compute. cursor must be a UUID the caller controls (e.g. a
+// SeedInvoice id), since nextUUIDCursor parses next_cursor as one.
+func (s *Server) SetRepeatingInvoiceCursor(org, cursor string) {
+	br := &s.billing
+	br.mu.Lock()
+	defer br.mu.Unlock()
+	if br.forceCursor == nil {
+		br.forceCursor = map[string]string{}
+	}
+	br.forceCursor[org] = cursor
 }
 
 func padInvoiceSeq(n int) string {
@@ -334,6 +356,7 @@ func (s *Server) listInvoices(w http.ResponseWriter, r *http.Request, org string
 	br := &s.billing
 	br.mu.Lock()
 	all := append([]*fakeInvoice(nil), br.invoices[org]...)
+	forced, forcedOK := br.forceCursor[org]
 	br.mu.Unlock()
 	limit := auditLimit(r.URL.Query().Get("limit")) // identical 1..100/default-50 rule (§6)
 	cursor := r.URL.Query().Get("cursor")
@@ -344,6 +367,9 @@ func (s *Server) listInvoices(w http.ResponseWriter, r *http.Request, org string
 		return a.id > b.id // id DESC tiebreak
 	}
 	page, next := brokenCursorPage(all, func(i *fakeInvoice) string { return i.id }, less, cursor, limit)
+	if forcedOK {
+		next = forced
+	}
 	items := make([]map[string]any, 0, len(page))
 	for _, inv := range page {
 		items = append(items, invoiceJSON(inv))

@@ -258,3 +258,23 @@ func TestInvoicesListPage2CursorIsWrong(t *testing.T) {
 	_ = i1
 	_ = i3
 }
+
+// SetRepeatingInvoiceCursor (ruling T14-15 support): the forced cursor is
+// served as next_cursor even though the seeded list is a single invoice and
+// would naturally end there - the "always answers the same next_cursor" fake
+// behaviour a provider-level test uses to prove aether_invoices' collectAll
+// pager fails loud on a repeated cursor instead of looping or truncating.
+func TestInvoicesListRepeatingCursorOverridesNaturalEnd(t *testing.T) {
+	s := newClusterFake(t)
+	const forced = "11111111-1111-4111-8111-111111111111"
+	s.SeedInvoice(testOrg, InvoiceSeed{
+		PeriodStart: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), PeriodEnd: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC),
+		SubtotalCents: 100, TotalCents: 100, Status: "issued",
+	})
+	s.SetRepeatingInvoiceCursor(testOrg, forced)
+	_, b := call(t, s, http.MethodGet, invoicesPath+"?limit=100", "")
+	m := decode(t, b)
+	if m["next_cursor"] != forced {
+		t.Fatalf("next_cursor = %v, want the forced %q even though the one-invoice page is far from full", m["next_cursor"], forced)
+	}
+}

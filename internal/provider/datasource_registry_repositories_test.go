@@ -59,20 +59,18 @@ func TestRegistryRepositoriesDataSource_TwoPagesSortedByName(t *testing.T) {
 				resource.TestCheckResourceAttrSet(repositoriesDataSource, "repositories.2.last_push"),
 				checkAbsentFromStateSubstring(repositoriesDataSource, "vulnerabilities"),
 				func(*terraform.State) error {
+					// M-7: exactly 2, not merely ">= 2" - a 3-item, 2-per-page
+					// listing ends with page 2's next_cursor "" (page 1 has 2
+					// items + next_cursor "2", page 2 has the remaining 1 item +
+					// next_cursor ""). The looser ">=2" bound could not tell
+					// "stopped on the empty cursor" apart from "kept walking
+					// past it" (collectAll looping until an error or timeout).
 					gets := requestsMatching(api, http.MethodGet, `/registry/repositories$`)
-					if len(gets) < 2 {
-						return fmt.Errorf("GET repositories calls = %d, want >= 2 (a 3-item, 2-per-page Harbor listing)", len(gets))
+					if len(gets) != 2 {
+						return fmt.Errorf("GET repositories calls = %d, want exactly 2 (a 3-item, 2-per-page Harbor listing that stops on next_cursor==\"\")", len(gets))
 					}
-					var sawCursor2 bool
-					var queries []string
-					for _, g := range gets[1:] {
-						queries = append(queries, g.Query)
-						if hasQueryPair(g.Query, "cursor", "2") {
-							sawCursor2 = true
-						}
-					}
-					if !sawCursor2 {
-						return fmt.Errorf("no follow-up GET carried cursor=2, want the provider to have followed page 1's next_cursor; queries: %v", queries)
+					if !hasQueryPair(gets[1].Query, "cursor", "2") {
+						return fmt.Errorf("second GET query = %q, want the provider to have followed page 1's next_cursor=2", gets[1].Query)
 					}
 					return nil
 				},
@@ -140,6 +138,35 @@ func TestRegistryRepositoriesDataSource_DisabledWithoutPurgeStillLists(t *testin
 			Check: resource.ComposeTestCheckFunc(
 				resource.TestCheckResourceAttr(repositoriesDataSource, "repositories.#", "1"),
 				resource.TestCheckResourceAttr(repositoriesDataSource, "repositories.0.name", "keep"),
+			),
+		}},
+	})
+}
+
+// Coder's suggested pin 2 (task-14-report.md "Fix round 2", review r1 N-5):
+// a page whose body OMITS the "next_cursor" key entirely (not merely sends
+// it as "") must still be read as the last page - a future API move to the
+// common ListResponse (aether-api#311, omitempty) would otherwise break
+// every repositories/tags read. Exactly one GET, no error, items present.
+func TestRegistryRepositoriesDataSource_AbsentNextCursorKeyEndsWalk(t *testing.T) {
+	api := setupFake(t)
+	api.SeedRepository(testOrg, "solo", 1, 100, nil)
+	api.SetOmitNextCursor(testOrg, true)
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config: repositoriesDSHCL,
+			Check: resource.ComposeTestCheckFunc(
+				resource.TestCheckResourceAttr(repositoriesDataSource, "repositories.#", "1"),
+				resource.TestCheckResourceAttr(repositoriesDataSource, "repositories.0.name", "solo"),
+				func(*terraform.State) error {
+					gets := requestsMatching(api, http.MethodGet, `/registry/repositories$`)
+					if len(gets) != 1 {
+						return fmt.Errorf("GET repositories calls = %d, want exactly 1 (an absent next_cursor key must be treated as the last page)", len(gets))
+					}
+					return nil
+				},
 			),
 		}},
 	})

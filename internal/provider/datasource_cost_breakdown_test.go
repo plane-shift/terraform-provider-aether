@@ -5,6 +5,7 @@ package provider_test
 // NewCostBreakdownDataSource in provider.go's DataSources().
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -73,6 +74,24 @@ func TestCostBreakdownDataSource_EmptyMonthReadsZeros(t *testing.T) {
 				resource.TestCheckResourceAttr(costBreakdownDataSource, "subscriptions.#", "0"),
 				resource.TestCheckResourceAttr(costBreakdownDataSource, "autoscaling.#", "0"),
 			),
+		}},
+	})
+}
+
+// M-6: a non-200 from the breakdown route must surface as a plan-time error
+// carrying the status and message, not be swallowed or read as an empty month.
+func TestCostBreakdownDataSource_APIErrorSurfaces(t *testing.T) {
+	api := setupFake(t)
+	route := "GET /organizations/" + testOrg + "/billing/breakdown"
+	api.Handlers[route] = func(w http.ResponseWriter, r *http.Request) {
+		fakeapi.WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]any{"code": "internal", "message": "breakdown store unavailable"}})
+	}
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{{
+			Config:      costBreakdownDSHCL,
+			ExpectError: loose("500 internal: breakdown store unavailable"),
 		}},
 	})
 }

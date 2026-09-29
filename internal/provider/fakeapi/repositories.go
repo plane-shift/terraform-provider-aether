@@ -114,6 +114,13 @@ type repositoryStore struct {
 	// overriding whatever the normal Harbor-page arithmetic would compute -
 	// a fake server contract violation (see SetRepeatingHarborCursor).
 	forceCursor map[string]string
+
+	// omitNextCursor, keyed by org, when true drops the "next_cursor" key
+	// entirely from the repositories list response (as opposed to sending it
+	// present but ""), regardless of pagination state - a future API that
+	// stops sending the key on the last page (r1 N-5) instead of sending it
+	// empty. See SetOmitNextCursor.
+	omitNextCursor map[string]bool
 }
 
 func (rp *repositoryStore) init() {
@@ -131,6 +138,9 @@ func (rp *repositoryStore) init() {
 	}
 	if rp.forceCursor == nil {
 		rp.forceCursor = map[string]string{}
+	}
+	if rp.omitNextCursor == nil {
+		rp.omitNextCursor = map[string]bool{}
 	}
 }
 
@@ -212,6 +222,22 @@ func (s *Server) SetRepeatingHarborCursor(org, cursor string) {
 	defer rp.mu.Unlock()
 	rp.init()
 	rp.forceCursor[org] = cursor
+}
+
+// SetOmitNextCursor, when omit is true, makes the registry repositories list
+// response for org drop the "next_cursor" key entirely instead of sending it
+// present-but-"" on the last page. This is the coder's suggested pin 2
+// (task-14-report.md "Fix round 2"): decodeHarborPage (r1 N-5) must read an
+// ABSENT key the same as an empty one, since a future API move to the common
+// ListResponse (aether-api#311, omitempty) would omit the key rather than
+// send it empty. Applies only to the repositories route (the pin names it
+// specifically); n<=0/false removes the override.
+func (s *Server) SetOmitNextCursor(org string, omit bool) {
+	rp := &s.repositories
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	rp.init()
+	rp.omitNextCursor[org] = omit
 }
 
 // ---------------------------------------------------------------- rendering + paging
@@ -330,6 +356,7 @@ func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request, org st
 	all := append([]*fakeRepository(nil), rp.repos[org]...)
 	pageCap := rp.pageCap[org]
 	forced, forcedOK := rp.forceCursor[org]
+	omit := rp.omitNextCursor[org]
 	rp.mu.Unlock()
 	if !exists {
 		apiError(w, http.StatusBadGateway, "harbor_error", "list repos")
@@ -340,7 +367,11 @@ func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request, org st
 	if forcedOK {
 		next = forced
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": next})
+	body := map[string]any{"items": items}
+	if !omit {
+		body["next_cursor"] = next
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // listRepositoryTags is GET .../repositories/{repoName}/tags (§2): 404 for a

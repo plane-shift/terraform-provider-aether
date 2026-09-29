@@ -484,3 +484,20 @@ func TestWebhookListPaginatesByID(t *testing.T) {
 		t.Fatalf("partial page carries next_cursor: %s", b2)
 	}
 }
+
+// SetRepeatingWebhookCursor (ruling T14-15 support): the forced cursor is
+// served as next_cursor even though the seeded list has just one webhook and
+// the page is far from full - the "always answers the same next_cursor" fake
+// behaviour a provider-level test uses to prove aether_webhooks' collectAll
+// pager fails loud on a repeated cursor instead of silently truncating.
+func TestWebhookListRepeatingCursorOverridesFullPageRule(t *testing.T) {
+	s := newClusterFake(t)
+	const forced = "11111111-1111-4111-8111-111111111111"
+	s.SeedWebhook(testOrg, "https://x.io/solo", []string{"cluster.ready"}, true)
+	s.SetRepeatingWebhookCursor(testOrg, forced)
+	_, b := call(t, s, http.MethodGet, webhooksPath+"?limit=100", "")
+	m := decode(t, b)
+	if m["next_cursor"] != forced {
+		t.Fatalf("next_cursor = %v, want the forced %q even though the one-webhook page is far from full", m["next_cursor"], forced)
+	}
+}
