@@ -1,14 +1,11 @@
 package provider_test
 
-// Tests for the aether_organization_members data source (not yet
-// implemented - datasource_organization_members.go, T14-1 of
-// task-14-brief-amended.md). Until NewOrganizationMembersDataSource is
-// registered in provider.go's DataSources(), EVERY test in this file fails
-// at plan time with terraform-plugin-framework's own "Invalid Data Source
-// Type" diagnostic (mirrors task-13-brief.md's note on resources) - the
-// expected RED state. A wrong (but present) implementation fails on the
-// specific assertion instead, which is how each test below is shown able to
-// fail on more than just "missing".
+// Tests for the aether_organization_members data source
+// (datasource_organization_members.go, T14-1 of task-14-brief-amended.md,
+// registered as NewOrganizationMembersDataSource in provider.go's
+// DataSources()): flattened member attributes (including the never-written
+// invited_by/accepted_at staying null), and the collectAll repeated-cursor
+// guard below.
 
 import (
 	"fmt"
@@ -51,13 +48,14 @@ func TestOrganizationMembersDataSource_ReadAllAttributes(t *testing.T) {
 	})
 }
 
-// T14-15 (RED until Task 13's collectAll fix lands here at rebase - see
+// T14-15 (fixed by Task 13's collectAll, carried forward at rebase - see
 // task-14-tests-report.md "Fix round 1"): the members data source is a
 // collectAll consumer distinct from the Harbor-page pager (compare
-// TestRegistryRepositoriesDataSource_RepeatedCursorErrors). Today collectAll
-// stops SILENTLY on an unchanged cursor (paging.go:15), so this read
-// succeeds with a truncated list; ruling T14-15 (review r1 M-1) says it must
-// error instead.
+// TestRegistryRepositoriesDataSource_RepeatedCursorErrors). collectAll now
+// tracks every cursor it has already sent and errors the moment the API
+// repeats one, per ruling T14-15 (review r1 M-1) - this proves that error
+// reaches the data source read as a Terraform diagnostic rather than a
+// silently truncated list.
 func TestOrganizationMembersDataSource_RepeatedCursorErrors(t *testing.T) {
 	api := setupFake(t)
 	const cursor = "11111111-1111-4111-8111-111111111111"

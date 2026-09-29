@@ -1,11 +1,10 @@
 package provider_test
 
-// Tests for the aether_registry_robot_accounts data source (not yet
-// implemented - datasource_registry_robot_accounts.go, T14-6). Until
-// NewRegistryRobotAccountsDataSource is registered in provider.go's
-// DataSources(), every test here fails at plan time with "Invalid Data
-// Source Type" (see datasource_organization_members_test.go's header
-// comment).
+// Tests for the aether_registry_robot_accounts data source
+// (datasource_registry_robot_accounts.go, T14-6, registered as
+// NewRegistryRobotAccountsDataSource in provider.go's DataSources()): the
+// raw-decoded harbor_username, permissions exposed as a Set, and secret/
+// last_used_at never leaking into state.
 
 import (
 	"testing"

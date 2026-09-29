@@ -1,11 +1,11 @@
 package provider_test
 
-// Tests for the aether_registry_repositories data source (not yet
-// implemented - datasource_registry_repositories.go, T14-4). Until
-// NewRegistryRepositoriesDataSource is registered in provider.go's
-// DataSources(), every test here fails at plan time with "Invalid Data
-// Source Type" (see datasource_organization_members_test.go's header
-// comment).
+// Tests for the aether_registry_repositories data source
+// (datasource_registry_repositories.go, T14-4, registered as
+// NewRegistryRepositoriesDataSource in provider.go's DataSources()):
+// Harbor-page pagination (next_cursor "2", "3", ...), attribute mapping,
+// disabled-without-purge listing, and the collectAll repeated-cursor guard
+// below.
 
 import (
 	"fmt"
@@ -103,12 +103,13 @@ func TestRegistryRepositoriesDataSource_NeverEnabledErrors(t *testing.T) {
 	})
 }
 
-// T14-15 (RED until Task 13's collectAll fix lands here at rebase - see
+// T14-15 (fixed by Task 13's collectAll, carried forward at rebase - see
 // task-14-tests-report.md "Fix round 1"): a Harbor page pager that answers
-// the SAME next_cursor on every page is a broken server contract. Today
-// collectAll stops SILENTLY on an unchanged cursor (paging.go:15), so this
-// read succeeds with a truncated list; ruling T14-15 (review r1 M-1) says it
-// must error instead.
+// the SAME next_cursor on every page is a broken server contract. collectAll
+// now tracks every cursor it has already sent and errors the moment the API
+// repeats one, per ruling T14-15 (review r1 M-1) - this proves that error
+// reaches the data source read as a Terraform diagnostic rather than a
+// silently truncated list.
 func TestRegistryRepositoriesDataSource_RepeatedCursorErrors(t *testing.T) {
 	api := setupFake(t)
 	api.SeedRepository(testOrg, "app", 1, 10, nil)

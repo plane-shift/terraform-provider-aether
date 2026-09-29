@@ -1,11 +1,10 @@
 package provider_test
 
-// Tests for the aether_registry_cleanup_policies data source (not yet
-// implemented - datasource_registry_cleanup_policies.go, T14-7). Until
-// NewRegistryCleanupPoliciesDataSource is registered in provider.go's
-// DataSources(), every test here fails at plan time with "Invalid Data
-// Source Type" (see datasource_organization_members_test.go's header
-// comment).
+// Tests for the aether_registry_cleanup_policies data source
+// (datasource_registry_cleanup_policies.go, T14-7, registered as
+// NewRegistryCleanupPoliciesDataSource in provider.go's DataSources()):
+// condition value normalisation matching the resource's own, and
+// last_run_message never leaking into state.
 
 import (
 	"testing"

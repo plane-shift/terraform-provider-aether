@@ -1,11 +1,11 @@
 package provider_test
 
-// Tests for the aether_registry_repository_tags data source (not yet
-// implemented - datasource_registry_repository_tags.go, T14-5). Until
-// NewRegistryRepositoryTagsDataSource is registered in provider.go's
-// DataSources(), every test here fails at plan time with "Invalid Data
-// Source Type" (see datasource_organization_members_test.go's header
-// comment).
+// Tests for the aether_registry_repository_tags data source
+// (datasource_registry_repository_tags.go, T14-5, registered as
+// NewRegistryRepositoryTagsDataSource in provider.go's DataSources()):
+// raw-decoded vulnerability counts, nested repository path escaping, and the
+// collectAll repeated-cursor guard below (shares the Harbor-page pager with
+// datasource_registry_repositories_test.go).
 
 import (
 	"fmt"
@@ -137,12 +137,12 @@ func wantEscapedNestedSegment(raw string) bool {
 	return strings.Contains(raw, "team%2Fapp") && !strings.Contains(raw, "team%252Fapp")
 }
 
-// T14-15 (RED until Task 13's collectAll fix lands here at rebase - see
+// T14-15 (fixed by Task 13's collectAll, carried forward at rebase - see
 // task-14-tests-report.md "Fix round 1"): the tags route shares the same
 // Harbor-page collectAll pager as repositories (TestRegistryRepositories
-// DataSource_RepeatedCursorErrors); a server that repeats next_cursor must
-// be an error here too, not a silently truncated list (ruling T14-15, review
-// r1 M-1).
+// DataSource_RepeatedCursorErrors); collectAll tracks every cursor it has
+// already sent and errors here too the moment the API repeats one, not a
+// silently truncated list (ruling T14-15, review r1 M-1).
 func TestRegistryRepositoryTagsDataSource_RepeatedCursorErrors(t *testing.T) {
 	api := setupFake(t)
 	api.SeedTag(testOrg, "app", "v1", "sha256:aaa", 10, nil, nil, false, nil)

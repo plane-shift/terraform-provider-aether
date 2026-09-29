@@ -231,7 +231,7 @@ func (s *Server) SetRepeatingHarborCursor(org, cursor string) {
 // ABSENT key the same as an empty one, since a future API move to the common
 // ListResponse (aether-api#311, omitempty) would omit the key rather than
 // send it empty. Applies only to the repositories route (the pin names it
-// specifically); n<=0/false removes the override.
+// specifically); passing omit=false removes the override.
 func (s *Server) SetOmitNextCursor(org string, omit bool) {
 	rp := &s.repositories
 	rp.mu.Lock()
