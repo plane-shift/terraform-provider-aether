@@ -33,6 +33,16 @@ type Request struct {
 	// `?cursor=`, the registry disable's `?purge=`) that the recorded Path
 	// alone cannot show.
 	Query string
+	// RawPath is path (see above), but derived from r.URL.EscapedPath()
+	// instead of r.URL.Path - so a percent-encoded slash inside a path
+	// segment (a nested registry repository name, `team%2Fapp`, produced by
+	// the generated client's runtime.StyleParamWithOptions -> url.PathEscape)
+	// survives here even though net/http has already decoded it into an
+	// extra "/" in r.URL.Path, and therefore in Path above. A test asserting
+	// that the provider sent the escaped form (rather than a second,
+	// self-inflicted escape, or the raw unescaped name) must read THIS
+	// field, never Path.
+	RawPath string
 }
 
 type Server struct {
@@ -57,6 +67,9 @@ type Server struct {
 	lbs          lbStore          // see loadbalancers.go; own lock
 	volumes      volumeStore      // see volumes.go; own lock
 	machines     machineStore     // see machines.go; own lock
+	repositories repositoryStore  // see repositories.go; own lock
+	auditLog     auditLogStore    // see audit_log.go; own lock
+	billing      billingReadStore // see billing_reads.go; own lock
 	// Handlers lets a test override a route: key "METHOD /path" (path after /api/v1).
 	Handlers map[string]http.HandlerFunc
 }
@@ -113,6 +126,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"code": "unauthorized", "message": "invalid token"}})
 		return
 	}
+	rawPath, _ := strings.CutPrefix(r.URL.EscapedPath(), "/api/v1")
 	var body []byte
 	if r.Body != nil {
 		// io.ReadAll, not a single Read call: httptest bodies can arrive
@@ -136,7 +150,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		body = b
 	}
 	s.mu.Lock()
-	s.requests = append(s.requests, Request{Method: r.Method, Path: path, Body: body, Query: r.URL.RawQuery})
+	s.requests = append(s.requests, Request{Method: r.Method, Path: path, Body: body, Query: r.URL.RawQuery, RawPath: rawPath})
 	h := s.Handlers[r.Method+" "+path]
 	s.mu.Unlock()
 	if h != nil {
@@ -186,6 +200,14 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		// served by registry.go
 	case s.routeBudget(w, r, path, body):
 		// served by budgets.go
+	case s.routeRepositories(w, r, rawPath):
+		// served by repositories.go - routes on rawPath (EscapedPath), not
+		// path, so a nested repository name's escaped "/" is never confused
+		// with a path separator (see repositories.go's package doc comment)
+	case s.routeAuditLog(w, r, path):
+		// served by audit_log.go
+	case s.routeBillingReads(w, r, path):
+		// served by billing_reads.go (usage, breakdown, invoices)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"code": "not_found", "message": "no route " + r.Method + " " + path}})
 	}

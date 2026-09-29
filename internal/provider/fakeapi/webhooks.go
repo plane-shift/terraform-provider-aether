@@ -132,6 +132,12 @@ type webhookStore struct {
 	// One-shot overrides, keyed by org; see FailNextWebhookPUT/Rotate.
 	failNextPUT    map[string]*webhookFailure
 	failNextRotate map[string]*webhookFailure
+
+	// forceCursor, keyed by org, when present makes the webhook list report
+	// this value as next_cursor on EVERY page, even an incomplete one,
+	// overriding the normal "full page only" rule - see
+	// SetRepeatingWebhookCursor.
+	forceCursor map[string]string
 }
 
 func (ws *webhookStore) init() {
@@ -267,6 +273,24 @@ func (s *Server) FailNextWebhookRotate(org string, status int, code, message str
 		ws.failNextRotate = map[string]*webhookFailure{}
 	}
 	ws.failNextRotate[org] = &webhookFailure{status: status, code: code, message: message}
+}
+
+// SetRepeatingWebhookCursor forces the aether_webhooks list to report cursor
+// as next_cursor on EVERY page for org, regardless of whether the page is
+// full - a fake server contract violation used to prove the data source's
+// collectAll pager (T14-2, the same pager family as
+// aether_organization_members) fails loud on a repeated cursor instead of
+// silently truncating the list (ruling T14-15, review r1 M-1). cursor must
+// be a UUID the caller controls (e.g. a SeedWebhook id), since
+// nextUUIDCursor parses next_cursor as one.
+func (s *Server) SetRepeatingWebhookCursor(org, cursor string) {
+	ws := &s.webhooks
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.forceCursor == nil {
+		ws.forceCursor = map[string]string{}
+	}
+	ws.forceCursor[org] = cursor
 }
 
 // consumeFailureLocked pops (and clears) an armed override for org, or
@@ -602,6 +626,7 @@ func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request, org string
 	ws := &s.webhooks
 	ws.mu.Lock()
 	all := append([]*fakeWebhook(nil), ws.byOrg[org]...)
+	forced, forcedOK := ws.forceCursor[org]
 	ws.mu.Unlock()
 	sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
 	items := []map[string]any{}
@@ -617,7 +642,9 @@ func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request, org string
 		last = wh.id
 	}
 	out := map[string]any{"items": items}
-	if len(items) == limit {
+	if forcedOK {
+		out["next_cursor"] = forced
+	} else if len(items) == limit {
 		out["next_cursor"] = last
 	}
 	writeJSON(w, http.StatusOK, out)
