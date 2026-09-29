@@ -54,10 +54,10 @@ type auditLogModel struct {
 type auditEventWire struct {
 	ID           string          `json:"id"`
 	ActorID      *string         `json:"actor_id"`
-	ActorType    string          `json:"actor_type"`
+	ActorType    *string         `json:"actor_type"`
 	ActorEmail   *string         `json:"actor_email"`
-	Action       string          `json:"action"`
-	ResourceType string          `json:"resource_type"`
+	Action       *string         `json:"action"`
+	ResourceType *string         `json:"resource_type"`
 	ResourceID   *string         `json:"resource_id"`
 	Metadata     json.RawMessage `json:"metadata"`
 	IPAddress    *string         `json:"ip_address"`
@@ -138,6 +138,20 @@ func (d *auditLogDataSource) Read(ctx context.Context, req datasource.ReadReques
 			resp.Diagnostics.AddError("Aether API returned no usable audit log", describeJSONWithout(hr, hr.Status, "event id or created_at"))
 			return
 		}
+		for _, f := range []struct {
+			name string
+			val  *string
+		}{
+			{"actor_type", e.ActorType},
+			{"action", e.Action},
+			{"resource_type", e.ResourceType},
+		} {
+			if f.val == nil {
+				resp.Diagnostics.AddError("Aether API returned an incomplete audit event",
+					fmt.Sprintf("Event %s: %s.", e.ID, describeJSONWithout(hr, hr.Status, fmt.Sprintf("missing required field %q", f.name))))
+				return
+			}
+		}
 		md, err := compactMetadata(e.Metadata)
 		if err != nil {
 			resp.Diagnostics.AddError("Aether API returned an unreadable audit event",
@@ -147,10 +161,10 @@ func (d *auditLogDataSource) Read(ctx context.Context, req datasource.ReadReques
 		out.Events = append(out.Events, auditEventDataModel{
 			ID:           types.StringValue(e.ID),
 			ActorID:      optString(e.ActorID),
-			ActorType:    types.StringValue(e.ActorType),
+			ActorType:    types.StringValue(*e.ActorType),
 			ActorEmail:   optString(e.ActorEmail),
-			Action:       types.StringValue(e.Action),
-			ResourceType: types.StringValue(e.ResourceType),
+			Action:       types.StringValue(*e.Action),
+			ResourceType: types.StringValue(*e.ResourceType),
 			ResourceID:   optString(e.ResourceID),
 			MetadataJSON: md,
 			IPAddress:    optString(e.IPAddress),
