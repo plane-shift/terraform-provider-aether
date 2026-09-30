@@ -1,0 +1,73 @@
+name: Build & Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.engine }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [terraform, tofu]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: matrix.engine == 'terraform'
+        with:
+          terraform_wrapper: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        if: matrix.engine == 'tofu'
+        with:
+          tofu_wrapper: false
+      # setup-opentofu installs into the runner tool cache (a per-run directory), not
+      # /usr/local/bin, so the engine path is resolved from PATH after setup. Its
+      # provider_acceptance_tests input is not used: it also exports TF_ACC=1, which
+      # would turn this unit leg into a live-API run.
+      - name: Select engine for the test framework
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: |
+          engine_path="$(command -v "$ENGINE")"
+          echo "TF_ACC_TERRAFORM_PATH=${engine_path}" >> "$GITHUB_ENV"
+          if [ "$ENGINE" = tofu ]; then
+            echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org" >> "$GITHUB_ENV"
+          fi
+          "$engine_path" version
+      - name: Generated client is up to date
+        run: go generate ./... && git diff --exit-code -- internal/client
+      - name: Lint
+        run: go vet ./... && test -z "$(gofmt -l .)"
+      - name: Unit tests
+        run: go test ./... -count=1 -race
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+      - name: docs/ is up to date
+        run: |
+          make docs
+          git add -N docs
+          git diff --exit-code -- docs

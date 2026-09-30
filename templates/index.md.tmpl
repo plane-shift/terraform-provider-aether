@@ -1,0 +1,28 @@
+---
+page_title: "Aether Provider"
+description: Manage Aether Kubernetes clusters, access and registry with Terraform or OpenTofu.
+---
+
+# Aether Provider
+
+Works with Terraform 1.5+ and OpenTofu 1.6+.
+
+**Terraform vs OpenTofu:** the provider is published under the same address, `plane-shift/aether`, on both the Terraform Registry and the OpenTofu Registry, and behaves identically on both engines. Use `terraform` or `tofu` for every command shown in these docs.
+
+## Prerequisite: an API token
+
+Create a token in the Aether portal (Organization → API tokens). The token belongs to one organization; the provider uses that organization for every resource. Tokens are managed in the portal only — this provider has no resource for them.
+
+## Endpoint
+
+The `endpoint` attribute (or `AETHER_ENDPOINT`) selects the API. It defaults to production, `https://api.aetherplatform.cloud`; use `https://dev.api.aetherplatform.cloud` for the dev environment.
+
+## State holds secrets
+
+The state stores the cluster kubeconfig, registry robot secrets, the registry's default robot credential and webhook signing secrets in plain text. Keep state in an encrypted backend with restricted access.
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Example
+
+{{ tffile "examples/provider/provider.tf" }}

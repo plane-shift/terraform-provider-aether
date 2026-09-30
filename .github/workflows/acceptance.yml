@@ -1,0 +1,61 @@
+name: Acceptance
+
+# Runs the acceptance suite against the DEV API: it creates and destroys real
+# clusters in the dedicated acceptance organization. One run at a time, and the
+# two engine legs one after the other: they share that organization and its
+# per-organization singletons (registry, billing budget).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: acceptance (${{ matrix.engine }})
+    # Forks have no token and must never run this.
+    if: github.repository == 'plane-shift/terraform-provider-aether'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        engine: [terraform, tofu]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: matrix.engine == 'terraform'
+        with:
+          terraform_wrapper: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        if: matrix.engine == 'tofu'
+        with:
+          tofu_wrapper: false
+      # See build-test.yml: the engine path is resolved from PATH after setup.
+      - name: Select engine for the test framework
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: |
+          engine_path="$(command -v "$ENGINE")"
+          echo "TF_ACC_TERRAFORM_PATH=${engine_path}" >> "$GITHUB_ENV"
+          if [ "$ENGINE" = tofu ]; then
+            echo "TF_ACC_PROVIDER_HOST=registry.opentofu.org" >> "$GITHUB_ENV"
+          fi
+          "$engine_path" version
+      - name: Acceptance tests
+        run: make testacc
+        env:
+          AETHER_ENDPOINT: https://dev.api.aetherplatform.cloud
+          AETHER_API_TOKEN: ${{ secrets.AETHER_DEV_API_TOKEN }}
