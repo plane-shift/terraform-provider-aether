@@ -30,7 +30,7 @@ same address on `registry.opentofu.org`. No other change is needed to switch eng
 
 ## Prerequisite: an API token
 
-Create an API token in the Aether portal (Organization → API tokens) and pass it as
+Create an API token in the Aether portal (Settings → API Tokens) and pass it as
 `api_token` or `AETHER_API_TOKEN`. A token belongs to one organization, and the provider
 manages that organization's resources (`organization_id` is resolved from the token; setting
 it explicitly is validated against the token). Tokens are created and revoked in the portal
