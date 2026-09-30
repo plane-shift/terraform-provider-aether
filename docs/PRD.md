@@ -56,7 +56,7 @@ Out of scope for the provider: payment methods, support tickets, admin routes.
 
 #### 7.2.3 Example Terraform Usage
 
-HCL is **not** hand-written here. The examples below are copied verbatim from the provider's `examples/` directory, which CI validates on both Terraform and OpenTofu; the provider block itself is `examples/provider/provider.tf` (source `plane-shift/aether`, version `~> 0.1`; `api_token` or `AETHER_API_TOKEN`; `endpoint` defaults to `https://api.aetherplatform.cloud`, `https://dev.api.aetherplatform.cloud` for dev; optional `organization_id`). When the provider changes, re-copy from there.
+HCL is **not** hand-written here. The examples below are copied verbatim from the provider's `examples/` directory, which is validated locally on both Terraform and OpenTofu (CI enforcement of the examples is a follow-up — see the provider's `README.md`); the provider block itself is `examples/provider/provider.tf` (source `plane-shift/aether`, version `~> 0.1`; `api_token` or `AETHER_API_TOKEN`; `endpoint` defaults to `https://api.aetherplatform.cloud`, `https://dev.api.aetherplatform.cloud` for dev; optional `organization_id`). When the provider changes, re-copy from there.
 
 Cluster, pools and kubeconfig (`examples/resources/aether_cluster/resource.tf`):
 
