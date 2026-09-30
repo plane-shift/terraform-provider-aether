@@ -22,6 +22,8 @@ The API is consumed by `terraform-provider-aether` (registry address `plane-shif
 
 **Billing properties a Terraform user triggers** (stated once here; §22 is authoritative): `public_endpoint` defaults to **true** in the provider (the API default is `false`) and bills one public IP at **€4/month**; fixed node pools and the control plane bill a **flat monthly** fee; autoscaling pools (budget-based: `max_vcpus > min_vcpus` or `max_memory_gb > min_memory_gb`) bill **hourly per node**.
 
+**Terraform state holds these secrets in clear text.** The admin kubeconfig, the registry and robot enable credentials, and the webhook signing secret are all written unencrypted into the Terraform/OpenTofu state file once read into an attribute — `sensitive = true` only redacts CLI and log output, it does not encrypt the state. Treat the state file itself as a secret: store it in a remote backend with encryption at rest and restricted access, never commit it to version control.
+
 #### 7.2.2 Terraform Resource Mapping
 
 The organization is a **provider-level** setting: `organization_id` is optional on the provider (resolved from the API token, validated when given) and appears on **no** resource. There is no `region` on the provider; the region string is `eu-fi` everywhere. **API tokens are created in the portal only — there is no token resource.**
