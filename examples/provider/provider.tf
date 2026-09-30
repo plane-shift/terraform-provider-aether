@@ -11,6 +11,7 @@ terraform {
 variable "aether_api_token" {
   type      = string
   sensitive = true
+  default   = null # unset here so the provider falls back to AETHER_API_TOKEN
 }
 
 # Create an API token in the Aether portal first (Organization → API tokens).
