@@ -127,3 +127,7 @@ provider_installation {
    public GPG key must be registered with both).
 
 There is no CHANGELOG file; release notes are written on the GitHub release.
+
+## License
+
+Mozilla Public License 2.0 — see [LICENSE](LICENSE).
