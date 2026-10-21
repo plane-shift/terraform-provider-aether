@@ -15,9 +15,11 @@ package fakeapi
 //     unknown key is 400. 422 details: email/required/"Email is required",
 //     role/required/"Role is required", role/invalid/"Role must be one of:
 //     owner, admin, member, viewer". The email is stored VERBATIM and
-//     uniqueness is case-sensitive: an exact duplicate is 409 conflict
-//     "Member already exists", "Alice@x" and "alice@x" are two members. No
-//     role gate: any token may add any role, owner included;
+//     uniqueness is case-INSENSITIVE, as aether-api's organization role
+//     enforcement compares member emails (lower(email) on both sides): an
+//     address equal to an existing member's in any letter case is 409
+//     conflict "Member already exists". No role gate: an organization token
+//     may add any role, owner included;
 //   - the response Member carries id (the membership row id), org_id, email,
 //     role, created_at and NEVER invited_by / accepted_at (no code path writes
 //     them on API-created rows);
@@ -26,8 +28,10 @@ package fakeapi
 //     is read or the member looked up (§8). The API's 500 for an invalid role
 //     on PUT is therefore unreachable with a token and is not modelled;
 //   - GET/DELETE of a missing member, or another org's member, is 404. DELETE
-//     answers 204 and a second DELETE 404. There is no last-owner or
-//     self-removal guard (that is the provider's job);
+//     answers 204 and a second DELETE 404. By default there is no
+//     last-owner guard (an API that does not refuse it: the provider's own
+//     guard is what is under test); SetLastOwnerEnforced turns on the API's
+//     409 last_owner refusal;
 //   - the list is ordered by id, "id > cursor", limit clamped to 1..100
 //     (default 50), and next_cursor (the last id of the page) is emitted
 //     whenever the page is FULL - even when nothing follows it (§10).
@@ -37,6 +41,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -64,7 +69,15 @@ type memberStore struct {
 	// overriding the normal "full page only" rule - see
 	// SetRepeatingMemberCursor.
 	forceCursor map[string]string
+
+	// lastOwner, keyed by org, makes a DELETE of the org's only owner answer
+	// 409 last_owner - see SetLastOwnerEnforced.
+	lastOwner map[string]bool
 }
+
+// lastOwnerMessage is aether-api's 409 last_owner message
+// (internal/api/handler/member.go writeMemberChangeError).
+const lastOwnerMessage = "The organization's last owner cannot be removed or demoted — add another owner first"
 
 func (ms *memberStore) add(org, email, role string) *fakeMember {
 	if ms.byOrg == nil {
@@ -83,6 +96,16 @@ func (ms *memberStore) find(org, id string) (*fakeMember, int) {
 		}
 	}
 	return nil, -1
+}
+
+// otherOwner reports whether org has an owner other than id.
+func (ms *memberStore) otherOwner(org, id string) bool {
+	for _, m := range ms.byOrg[org] {
+		if m.id != id && m.role == "owner" {
+			return true
+		}
+	}
+	return false
 }
 
 func memberJSON(org string, m *fakeMember) map[string]any {
@@ -150,6 +173,21 @@ func (s *Server) SetRepeatingMemberCursor(org, cursor string) {
 	s.orgStore.members.forceCursor[org] = cursor
 }
 
+// SetLastOwnerEnforced makes a member DELETE in org answer 409 last_owner
+// (and keep the row) when it would remove the org's only owner, as aether-api
+// does where it enforces organization roles. The check and the removal happen
+// under one lock section, like the API's single write transaction, so it also
+// refuses when another owner was removed after the provider's own guard
+// listed the members. Other deletes are unaffected.
+func (s *Server) SetLastOwnerEnforced(org string) {
+	s.orgStore.mu.Lock()
+	defer s.orgStore.mu.Unlock()
+	if s.orgStore.members.lastOwner == nil {
+		s.orgStore.members.lastOwner = map[string]bool{}
+	}
+	s.orgStore.members.lastOwner[org] = true
+}
+
 // MemberRoles returns email -> role for the org, for assertions on what the
 // fake really stored.
 func (s *Server) MemberRoles(org string) map[string]string {
@@ -207,6 +245,11 @@ func (s *Server) routeMembers(w http.ResponseWriter, r *http.Request, path strin
 		// API's single DELETE ... statement does.
 		s.orgStore.mu.Lock()
 		m, i := s.orgStore.members.find(org, mid)
+		if m != nil && s.orgStore.members.lastOwner[org] && m.role == "owner" && !s.orgStore.members.otherOwner(org, mid) {
+			s.orgStore.mu.Unlock()
+			apiError(w, http.StatusConflict, "last_owner", lastOwnerMessage)
+			return true
+		}
 		if m != nil {
 			l := s.orgStore.members.byOrg[org]
 			s.orgStore.members.byOrg[org] = append(l[:i:i], l[i+1:]...)
@@ -249,7 +292,7 @@ func (s *Server) createMember(w http.ResponseWriter, org string, body []byte) {
 	s.orgStore.mu.Lock()
 	defer s.orgStore.mu.Unlock()
 	for _, m := range s.orgStore.members.byOrg[org] {
-		if m.email == req.Email { // exact, case-sensitive
+		if strings.EqualFold(m.email, req.Email) { // case-insensitive, like lower(email) = lower($2)
 			apiError(w, http.StatusConflict, "conflict", "Member already exists")
 			return
 		}

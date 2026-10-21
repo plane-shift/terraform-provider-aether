@@ -70,6 +70,9 @@ type Server struct {
 	repositories repositoryStore  // see repositories.go; own lock
 	auditLog     auditLogStore    // see audit_log.go; own lock
 	billing      billingReadStore // see billing_reads.go; own lock
+	// refuseWrites, when true, answers every write with 403 insufficient_role
+	// (see RefuseWritesForInsufficientRole); protected by mu.
+	refuseWrites bool
 	// Handlers lets a test override a route: key "METHOD /path" (path after /api/v1).
 	Handlers map[string]http.HandlerFunc
 }
@@ -103,6 +106,21 @@ func (s *Server) BodyReadError() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.bodyReadErr
+}
+
+// insufficientRoleMessage is aether-api's 403 insufficient_role message from
+// the organization role enforcement (internal/api/middleware/org_authz.go).
+const insufficientRoleMessage = "Your role in this organization does not permit this action"
+
+// RefuseWritesForInsufficientRole makes every write (any method other than
+// GET and HEAD) on an authenticated route answer 403 insufficient_role, as
+// aether-api does when the token's organization role is below an operation's
+// minimum. The request is still recorded; nothing is changed. It takes
+// precedence over Handlers. Reads are unaffected.
+func (s *Server) RefuseWritesForInsufficientRole() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refuseWrites = true
 }
 
 func (s *Server) Requests() []Request {
@@ -152,7 +170,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.requests = append(s.requests, Request{Method: r.Method, Path: path, Body: body, Query: r.URL.RawQuery, RawPath: rawPath})
 	h := s.Handlers[r.Method+" "+path]
+	refuse := s.refuseWrites && r.Method != http.MethodGet && r.Method != http.MethodHead && !isPublicRoute(r.Method, path)
 	s.mu.Unlock()
+	if refuse {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{"code": "insufficient_role", "message": insufficientRoleMessage}})
+		return
+	}
 	if h != nil {
 		h(w, r)
 		return

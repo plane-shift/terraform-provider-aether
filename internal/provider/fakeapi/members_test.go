@@ -72,20 +72,33 @@ func TestMemberPostValidationDetails(t *testing.T) {
 	}
 }
 
-// Fails if uniqueness is case-insensitive (Alice@x and alice@x are two rows),
-// or if an exact duplicate is anything but 409 conflict.
-func TestMemberDuplicateIsExactCaseSensitive409(t *testing.T) {
+// Fails if uniqueness is case-sensitive (aether-api compares member emails
+// case-insensitively), if a duplicate in any letter case is anything but 409
+// conflict "Member already exists", or if a refused duplicate changes the
+// stored row (its address or its role).
+func TestMemberDuplicateIsCaseInsensitive409(t *testing.T) {
+	for name, dup := range map[string]string{"exact": "alice@x.io", "case variant": "Alice@X.io"} {
+		t.Run(name, func(t *testing.T) {
+			s := newClusterFake(t)
+			postMember(t, s, `{"email":"alice@x.io","role":"member"}`)
+			resp, m := postMember(t, s, `{"email":"`+dup+`","role":"admin"}`)
+			if resp.StatusCode != http.StatusConflict || errCode(m) != "conflict" || m["error"].(map[string]any)["message"] != "Member already exists" {
+				t.Fatalf("duplicate %q = %d %v, want 409 conflict \"Member already exists\"", dup, resp.StatusCode, m)
+			}
+			if got := s.MemberRoles(testOrg); got["alice@x.io"] != "member" || len(got) != 1 {
+				t.Fatalf("stored = %v: the refused duplicate must not have added a row or changed the role", got)
+			}
+		})
+	}
+	// The stored address is the one written, not a lowered copy: a member
+	// stored with upper case still blocks its lower-case form.
 	s := newClusterFake(t)
-	postMember(t, s, `{"email":"alice@x.io","role":"member"}`)
-	resp, m := postMember(t, s, `{"email":"alice@x.io","role":"admin"}`)
-	if resp.StatusCode != http.StatusConflict || errCode(m) != "conflict" || m["error"].(map[string]any)["message"] != "Member already exists" {
-		t.Fatalf("duplicate = %d %v, want 409 conflict \"Member already exists\"", resp.StatusCode, m)
+	s.SeedMember(testOrg, "Bob@X.io", "viewer")
+	if resp, m := postMember(t, s, `{"email":"bob@x.io","role":"viewer"}`); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("lower-case form of a stored upper-case address = %d %v, want 409", resp.StatusCode, m)
 	}
-	if resp, m := postMember(t, s, `{"email":"Alice@x.io","role":"member"}`); resp.StatusCode != http.StatusCreated {
-		t.Fatalf("case variant = %d %v, want 201 (distinct member)", resp.StatusCode, m)
-	}
-	if got := s.MemberRoles(testOrg); got["alice@x.io"] != "member" || len(got) != 2 {
-		t.Fatalf("stored = %v: the refused duplicate must not have changed the role", got)
+	if got := s.MemberRoles(testOrg); got["Bob@X.io"] != "viewer" || len(got) != 1 {
+		t.Fatalf("stored = %v, want only the verbatim Bob@X.io", got)
 	}
 }
 
@@ -138,8 +151,9 @@ func TestMemberGetAndDeleteLifecycle(t *testing.T) {
 	}
 }
 
-// Fails if the fake refuses to delete the LAST owner (the real API has no
-// guard; the provider must supply it).
+// Fails if the fake refuses to delete the LAST owner by default: unless
+// SetLastOwnerEnforced is called it models an API that does not refuse, so
+// the provider's own guard is what the resource tests exercise.
 func TestMemberDeleteHasNoLastOwnerGuard(t *testing.T) {
 	s := newClusterFake(t)
 	_, m := postMember(t, s, `{"email":"o@x.io","role":"owner"}`)
@@ -317,5 +331,68 @@ func TestSetMemberRoleChangesTheStoredRoleOutOfBand(t *testing.T) {
 	}
 	if n := len(s.Requests()); n != 1 {
 		t.Fatalf("SetMemberRole recorded requests: %d total, want only the one GET", n)
+	}
+}
+
+// Fails if SetLastOwnerEnforced does not refuse removing the only owner with
+// the API's 409 last_owner (keeping the row), or if it also refuses deletes it
+// does not own: an owner while another owner exists, or a non-owner.
+func TestMemberDeleteOfTheLastOwnerIs409WhenEnforced(t *testing.T) {
+	s := newClusterFake(t)
+	s.SetLastOwnerEnforced(testOrg)
+	only := s.SeedMember(testOrg, "o@x.io", "owner")
+	viewer := s.SeedMember(testOrg, "v@x.io", "viewer")
+	resp, b := call(t, s, http.MethodDelete, membersPath+"/"+only, "")
+	m := decode(t, b)
+	if resp.StatusCode != http.StatusConflict || errCode(m) != "last_owner" ||
+		m["error"].(map[string]any)["message"] != "The organization's last owner cannot be removed or demoted — add another owner first" {
+		t.Fatalf("deleting the only owner = %d %s, want 409 last_owner with the API's message", resp.StatusCode, b)
+	}
+	if got := s.MemberRoles(testOrg)["o@x.io"]; got != "owner" {
+		t.Fatalf("refused owner's role = %q, want the row kept as owner", got)
+	}
+	if resp, _ := call(t, s, http.MethodDelete, membersPath+"/"+viewer, ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("deleting a non-owner = %d, want 204", resp.StatusCode)
+	}
+	s.SeedMember(testOrg, "o2@x.io", "owner")
+	if resp, _ := call(t, s, http.MethodDelete, membersPath+"/"+only, ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("deleting an owner while another owner exists = %d, want 204", resp.StatusCode)
+	}
+	// Scoped to the org it was set for.
+	const other = "33333333-3333-4333-8333-333333333333"
+	s.AddOrg(other, "Other", "other")
+	id := s.SeedMember(other, "z@x.io", "owner")
+	if resp, _ := call(t, s, http.MethodDelete, "/organizations/"+other+"/members/"+id, ""); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("deleting the only owner of an org without enforcement = %d, want 204", resp.StatusCode)
+	}
+}
+
+// Fails if RefuseWritesForInsufficientRole lets a write through (or changes
+// anything), answers with another status/code/message, stops recording the
+// request, or also refuses reads.
+func TestRefuseWritesForInsufficientRoleRefusesEveryWriteAndNoRead(t *testing.T) {
+	s := newClusterFake(t)
+	id := s.SeedMember(testOrg, "a@x.io", "viewer")
+	s.RefuseWritesForInsufficientRole()
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPost, membersPath, `{"email":"b@x.io","role":"viewer"}`},
+		{http.MethodDelete, membersPath + "/" + id, ""},
+		{http.MethodPut, orgPath, `{"name":"Renamed"}`},
+	} {
+		resp, b := call(t, s, c.method, c.path, c.body)
+		m := decode(t, b)
+		if resp.StatusCode != http.StatusForbidden || errCode(m) != "insufficient_role" ||
+			m["error"].(map[string]any)["message"] != "Your role in this organization does not permit this action" {
+			t.Fatalf("%s %s = %d %s, want 403 insufficient_role with the API's message", c.method, c.path, resp.StatusCode, b)
+		}
+	}
+	if got := s.MemberRoles(testOrg); len(got) != 1 || got["a@x.io"] != "viewer" {
+		t.Fatalf("members = %v: a refused write changed something", got)
+	}
+	if resp, b := call(t, s, http.MethodGet, membersPath+"/"+id, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET = %d %s, want reads unaffected", resp.StatusCode, b)
+	}
+	if n := len(s.Requests()); n != 4 {
+		t.Fatalf("recorded %d requests, want all 4 (refused writes are still recorded)", n)
 	}
 }
