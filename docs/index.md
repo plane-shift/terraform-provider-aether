@@ -11,7 +11,21 @@ Works with Terraform 1.5+ and OpenTofu 1.6+.
 
 ## Prerequisite: an API token
 
-Create a token in the Aether portal (Settings → API Tokens). The token belongs to one organization; the provider uses that organization for every resource. Tokens are managed in the portal only — this provider has no resource for them.
+Create a token in the Aether portal (Settings → API Tokens). Only an organization **owner** can create API tokens. The token belongs to one organization; the provider uses that organization for every resource. Tokens are managed in the portal only — this provider has no resource for them.
+
+### What a token may do
+
+The API enforces organization roles on every request. An organization API token acts with the `admin` role on every resource and data source of this provider, and it may also manage membership fully: add a member with any role (`owner` included) and remove an owner — except the organization's last owner. A few operations are open only to a signed-in portal user; the API refuses them for any token. The provider reports refusals with a dedicated diagnostic:
+
+| Diagnostic | API answer | Meaning |
+|---|---|---|
+| `The API token's organization role does not allow this operation` | `403 insufficient_role` | The operation needs a higher organization role than the caller has. Perform it in the portal as an owner. |
+| `API tokens cannot perform this operation` | `403 token_not_permitted` | The operation is open to signed-in portal users only. |
+| `Cannot remove the organization's last owner` | `409 last_owner` | Add another owner first, then remove or replace this one in a later apply. |
+
+The diagnostic detail carries the API's message and the request id; quote the request id when contacting support.
+
+An API token is not tied to the member who created it: removing that member, or lowering their role, leaves the token working. After removing an owner, revoke the API tokens they created (Settings → API Tokens).
 
 ## Endpoint
 

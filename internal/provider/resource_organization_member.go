@@ -34,8 +34,11 @@ const memberListPageSize = 100
 // API that repeated a cursor could not spin it until the context expired.
 const memberListMaxPages = 100
 
-// lastOwnerRefusal is the T9-4 diagnostic, verbatim.
-const lastOwnerRefusal = "refusing to remove the last owner: the API has no guard (aether-api #302) and the organization would become unmanageable (roles and deletion need an owner login)"
+// lastOwnerRefusal is the detail of the provider-side last-owner refusal
+// (T9-4). The API refuses the same removal with 409 last_owner where it
+// enforces organization roles; the provider check stays so the refusal comes
+// before any DELETE is sent, and against an API that does not refuse it.
+const lastOwnerRefusal = "refusing to remove the last owner: the organization would become unmanageable (roles and deletion need an owner login)"
 
 // NewOrganizationMemberResource returns the aether_organization_member resource.
 func NewOrganizationMemberResource() resource.Resource { return &organizationMemberResource{} }
@@ -43,7 +46,9 @@ func NewOrganizationMemberResource() resource.Resource { return &organizationMem
 // organizationMemberResource manages one membership of the provider's
 // organization. There is no in-place update: the API refuses every member PUT
 // made with an API token (403 token_not_permitted), so both attributes force a
-// replacement (DELETE, then POST).
+// replacement (DELETE, then POST). An organization API token may add a member
+// with any role, owner included, and may remove an owner - except the last one
+// (409 last_owner).
 type organizationMemberResource struct{ pd *providerData }
 
 // organizationMemberModel is the aether_organization_member state.
@@ -67,12 +72,14 @@ func (r *organizationMemberResource) Schema(_ context.Context, _ resource.Schema
 		MarkdownDescription: "A member of the provider's organization. " +
 			"The API creates the membership only. The address must already have an Aether login account (created through the portal invitation flow; aether-api #302), otherwise the member cannot sign in. Destroying the resource removes the membership and leaves the login account in place. " +
 			"There is no in-place update: changing `email` or `role` replaces the membership (it is removed, then created again with a new `id`). Do not set `create_before_destroy`: the new membership would be created while the old one still holds the address, which the API refuses (409). " +
-			"Removing or replacing the organization's last `owner` is refused, because the API has no such guard and nobody could change roles or delete the organization afterwards. The check reads the member's current role from the API and is serialised within a single run; the platform itself has no guard, so a concurrent removal in the portal or another run is not prevented. " +
+			"Member emails are compared case-insensitively: adding an address that differs from an existing member's only in letter case is refused (409). " +
+			"Removing or replacing the organization's last `owner` is refused, because nobody could change roles or delete the organization afterwards. The provider checks the member's current role before sending the removal, serialised within a single run; the API also refuses to remove the last owner (409 `last_owner`), which covers a concurrent removal in the portal or another run. " +
+			"An API token is not tied to the member who created it: after removing an owner (or replacing their membership with a lower role), revoke the API tokens they created in the portal (**Settings → API Tokens**). " +
 			"Transferring ownership takes two applies: add the new owner first, then demote or remove the old one in a second apply. Doing both in a single apply is refused by the last-owner guard or depends on the order in which Terraform happens to run the two changes.",
 		Attributes: map[string]schema.Attribute{
 			"id": immutableComputed("Membership UUID (not a user id). It changes when the membership is replaced."),
 			"email": schema.StringAttribute{Required: true,
-				MarkdownDescription: "Login email address of the member. It must be lower-case: membership matches the login email exactly. Changing it replaces the membership.",
+				MarkdownDescription: "Login email address of the member, written in lower case (the canonical form the provider manages). The API compares member emails case-insensitively, so an address that differs from an existing member's only in letter case is refused (409). Changing it replaces the membership.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
 				Validators:          []validator.String{memberEmailValidator{}}},
 			"role": schema.StringAttribute{Required: true,
@@ -87,9 +94,12 @@ func (r *organizationMemberResource) Schema(_ context.Context, _ resource.Schema
 	}
 }
 
-// memberEmailValidator refuses upper-case characters (the API stores the
-// address verbatim and matches the login email exactly, case-sensitively)
-// and requires exactly one `@`. No normalisation is done.
+// memberEmailValidator refuses upper-case characters and requires exactly
+// one `@`. The API stores the address as written; the provider manages the
+// canonical lower-case form so the configuration and the stored address never
+// differ only in case (an API that enforces organization roles compares member
+// emails case-insensitively, and an older one matched them exactly). No
+// normalisation is done.
 type memberEmailValidator struct{}
 
 func (memberEmailValidator) Description(context.Context) string {
@@ -107,7 +117,7 @@ func (memberEmailValidator) ValidateString(_ context.Context, req validator.Stri
 	s := req.ConfigValue.ValueString()
 	if strings.ToLower(s) != s {
 		resp.Diagnostics.AddAttributeError(req.Path, "Invalid email",
-			fmt.Sprintf("%q must be lower-case: membership matches the login email exactly.", s))
+			fmt.Sprintf("%q must be lower-case: the provider manages member addresses in their canonical lower-case form.", s))
 	}
 	if strings.Count(s, "@") != 1 {
 		resp.Diagnostics.AddAttributeError(req.Path, "Invalid email",
@@ -208,8 +218,9 @@ func (r *organizationMemberResource) Update(ctx context.Context, req resource.Up
 // manages both of the org's owners) would each see the other as "another
 // owner" and both succeed, leaving the organization with none. The lock is
 // per provider process, i.e. per Terraform run: it cannot serialise against
-// the portal or a second run - the platform itself has no guard (aether-api
-// #302). Non-owner deletes take neither the lock nor the list.
+// the portal or a second run - that case is the API's 409 last_owner, which
+// addAPIError renders as "Cannot remove the organization's last owner".
+// Non-owner deletes take neither the lock nor the list.
 func (r *organizationMemberResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state organizationMemberModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -257,8 +268,9 @@ func (r *organizationMemberResource) Delete(ctx context.Context, req resource.De
 
 // guardLastOwner lists every member (following next_cursor; a repeated cursor
 // or more than memberListMaxPages pages is an error) and refuses with an error when no owner OTHER
-// than id exists: the API has no such guard, and an organization without an
-// owner can no longer change roles or be deleted. gone reports that the
+// than id exists: an organization without an owner can no longer change roles
+// or be deleted (the API refuses it too, with 409 last_owner; checking first
+// means no DELETE is sent). gone reports that the
 // membership is already gone - a 404 during the check, or id absent from the
 // complete list - so there is nothing to delete and no owner to lose. The
 // caller holds providerData.ownerDeleteMu.
@@ -317,7 +329,7 @@ func (r *organizationMemberResource) guardLastOwner(ctx context.Context, id clie
 	if !seen {
 		return true, diags
 	}
-	diags.AddAttributeError(path.Root("role"), "Cannot remove the last owner", lastOwnerRefusal+
+	diags.AddAttributeError(path.Root("role"), "Cannot remove the organization's last owner", lastOwnerRefusal+
 		". Add another owner first (in the portal, or with another aether_organization_member), or remove this membership in the portal.")
 	return false, diags
 }

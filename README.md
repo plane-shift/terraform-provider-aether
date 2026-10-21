@@ -36,6 +36,14 @@ manages that organization's resources (`organization_id` is resolved from the to
 it explicitly is validated against the token). Tokens are created and revoked in the portal
 only — there is deliberately no `aether_api_token` resource.
 
+Only an organization **owner** can create an API token. The API enforces organization roles:
+an organization token acts with the `admin` role on everything this provider manages, and it
+may add members with any role (`owner` included) and remove owners — except the last owner
+(`409 last_owner`). A token is not tied to the member who created it, so after removing an
+owner, revoke the tokens they created. Refusals surface as `The API token's organization role
+does not allow this operation` (`403 insufficient_role`) or `API tokens cannot perform this
+operation` (`403 token_not_permitted`), with the API message and request id in the detail.
+
 ## Endpoint
 
 | Environment | `endpoint` / `AETHER_ENDPOINT`                  |
@@ -65,7 +73,9 @@ the resource page before relying on these:
 - **`aether_cluster_network`** — creating it overwrites the portal policy; destroying it opens
   the endpoint to every source address.
 - **`aether_organization`** — import-only; **`aether_organization_member`** role changes replace
-  the membership and the last owner is protected.
+  the membership, the last owner cannot be removed (checked by the provider and refused by the
+  API), and emails are compared case-insensitively (a case variant of an existing member is a
+  `409`).
 - **`aether_webhook`** — the secret is returned only on create/rotation; rotate with `rotate_secret`.
 - **`aether_registry`** — destroying it deletes every robot account; images are deleted only with
   `purge_on_destroy`. Order robot accounts with `depends_on`.
