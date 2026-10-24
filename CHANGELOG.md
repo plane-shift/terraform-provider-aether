@@ -10,6 +10,7 @@ data source or attribute changes; the provider keeps calling the same routes.
 
 ENHANCEMENTS:
 
+* resource/aether_cluster: `capi_cluster_name` (also on `data.aether_cluster`) is described as the suffixed name the API gives clusters created after 2026-10, `<organization slug>-<name>-<6 random lowercase alphanumerics>`; earlier clusters keep `<organization slug>-<name>`. The API now refuses a new cluster whose organization slug plus name exceeds 22 characters with `422 validation_error` on `name`; existing clusters are unaffected and a rename is not re-checked. Descriptions only, no schema change.
 * provider: an API refusal with `403 insufficient_role` is reported as
   `The API token's organization role does not allow this operation`, and
   `403 token_not_permitted` as `API tokens cannot perform this operation`. The

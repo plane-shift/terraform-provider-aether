@@ -22,7 +22,7 @@ One cluster of the organization, looked up by `id` or by `name`. A cluster that 
 
 ### Read-Only
 
-- `capi_cluster_name` (String) Internal Cluster API name of the cluster.
+- `capi_cluster_name` (String) Internal Cluster API name. For clusters created after 2026-10 it is `<organization slug>-<name>-<6 random lowercase alphanumerics>`; earlier clusters keep `<organization slug>-<name>`. Stored once, never recomputed.
 - `ceph_pool` (String) Storage pool of the cluster.
 - `created_at` (String) Creation time (RFC 3339).
 - `endpoint` (String) API server URL, once the cluster is provisioned far enough to report one.
