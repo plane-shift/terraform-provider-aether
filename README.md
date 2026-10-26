@@ -37,7 +37,8 @@ it explicitly is validated against the token). Tokens are created and revoked in
 only — there is deliberately no `aether_api_token` resource.
 
 Only an organization **owner** can create an API token. The API enforces organization roles:
-an organization token acts with the `admin` role on everything this provider manages, and it
+a token acts with the role chosen when it is created (Viewer, Member or Admin; Admin is the
+default). The provider needs an Admin token because it manages members, including owners: it
 may add members with any role (`owner` included) and remove owners — except the last owner
 (`409 last_owner`). A token is not tied to the member who created it, so after removing an
 owner, revoke the tokens they created. Refusals surface as `The API token's organization role

@@ -15,7 +15,7 @@ Create a token in the Aether portal (Settings → API Tokens). Choose the role *
 
 ### What a token may do
 
-The API enforces organization roles on every request. An organization API token acts with the `admin` role on every resource and data source of this provider, and it may also manage membership fully: add a member with any role (`owner` included) and remove an owner — except the organization's last owner. A few operations are open only to a signed-in portal user; the API refuses them for any token. The provider reports refusals with a dedicated diagnostic:
+The API enforces organization roles on every request. An API token acts with the role chosen when it is created (Viewer, Member or Admin; Admin is the default). The provider needs an Admin token because it manages members, including owners: an Admin token may add a member with any role (`owner` included) and remove an owner — except the organization's last owner. A few operations are open only to a signed-in portal user; the API refuses them for any token. The provider reports refusals with a dedicated diagnostic:
 
 | Diagnostic | API answer | Meaning |
 |---|---|---|
