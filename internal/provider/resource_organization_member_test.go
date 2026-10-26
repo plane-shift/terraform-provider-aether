@@ -59,6 +59,17 @@ func memberWrites(api *fakeapi.Server, n int) []string {
 	return out
 }
 
+// summaryThenDetail matches a diagnostic whose summary is followed by each
+// detail phrase in order, anything in between (terraform's "with ..." source
+// context, a request id), each phrase matched as loose() does.
+func summaryThenDetail(summary string, detail ...string) *regexp.Regexp {
+	re := loose(summary).String()
+	for _, d := range detail {
+		re += `.*` + strings.TrimPrefix(loose(d).String(), `(?is)`)
+	}
+	return regexp.MustCompile(re)
+}
+
 func listCalls(api *fakeapi.Server, n int) int {
 	c := 0
 	for _, r := range requestsSince(api, n) {
@@ -191,8 +202,9 @@ func TestMemberResource_EmailChangePlansReplaceAndRemovesTheOldMembership(t *tes
 // ---------------------------------------------------------------- 15
 
 // Fails if the lower-case validator is missing: an upper-case address would
-// otherwise be POSTed and stored verbatim, and membership matches the login
-// email EXACTLY. Nothing may reach the members API.
+// otherwise be POSTed and stored verbatim, and the provider manages member
+// addresses only in their canonical lower-case form (so configuration and the
+// stored address never differ only in case). Nothing may reach the members API.
 func TestMemberResource_UpperCaseEmailIsRefusedAtPlanWithZeroCalls(t *testing.T) {
 	api := setupFake(t)
 	resource.UnitTest(t, resource.TestCase{
@@ -200,7 +212,7 @@ func TestMemberResource_UpperCaseEmailIsRefusedAtPlanWithZeroCalls(t *testing.T)
 		ProtoV6ProviderFactories: factories(),
 		Steps: []resource.TestStep{{
 			Config:      memberHCL("Alice@Example.com", "viewer"),
-			ExpectError: loose("must be lower-case: membership matches the login email exactly"),
+			ExpectError: loose("must be lower-case: the provider manages member addresses in their canonical lower-case form"),
 		}},
 	})
 	for _, r := range api.Requests() {
@@ -361,8 +373,9 @@ func TestMemberResource_LastOwnerGuardPaginatesToFindAnotherOwner(t *testing.T) 
 
 // ---------------------------------------------------------------- 18
 
-// Fails if the last owner can be removed (the API has no guard), if the
-// refusal drifts from the ruled text, or if any DELETE is sent before the
+// Fails if the last owner can be removed (the provider refuses before sending
+// anything, whether or not the API also refuses), if the refusal's summary or
+// detail drifts from the ruled text, or if any DELETE is sent before the
 // refusal. Recovery afterwards proves the state was left intact.
 func TestMemberResource_DeletingTheLastOwnerIsRefusedAndSendsNoDelete(t *testing.T) {
 	api := setupFake(t)
@@ -373,8 +386,9 @@ func TestMemberResource_DeletingTheLastOwnerIsRefusedAndSendsNoDelete(t *testing
 			{Config: memberHCL("only-owner@example.com", "owner")},
 			{
 				Config: providerOnlyHCL,
-				ExpectError: loose("refusing to remove the last owner: the API has no guard (aether-api #302) " +
-					"and the organization would become unmanageable (roles and deletion need an owner login)"),
+				ExpectError: summaryThenDetail("Cannot remove the organization's last owner",
+					"refusing to remove the last owner: the organization would become unmanageable "+
+						"(roles and deletion need an owner login)"),
 			},
 			{
 				PreConfig: func() {
@@ -913,5 +927,132 @@ func TestMemberResource_ImportWithAMalformedIDIsRefusedWithZeroMemberCalls(t *te
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------- organization role enforcement
+
+// Fails if the API's 409 last_owner on the DELETE is swallowed, reported under
+// another summary, or drops the membership from state. Scenario: the
+// provider's guard lists the members and sees a second owner, and that owner
+// is removed (in the portal, or by another run) before the DELETE arrives -
+// the case the provider guard cannot reach and the API refuses. The handler
+// below serves the guard's list with both owners and removes the second one
+// from the fake as it answers. Exactly one DELETE proves the refusal came
+// from the API, not from the provider guard (which sends none).
+func TestMemberResource_ConcurrentLastOwnerRemovalSurfacesTheAPIRefusalAndKeepsState(t *testing.T) {
+	api := setupFake(t)
+	api.SetLastOwnerEnforced(testOrg)
+	const secondID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	api.SeedMemberWithID(testOrg, secondID, "second-owner@example.com", "owner")
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{
+				Config: memberHCL("first-owner@example.com", "owner"),
+				Check: func(s *terraform.State) error {
+					id = s.RootModule().Resources[memberResource].Primary.Attributes["id"]
+					return nil
+				},
+			},
+			{
+				PreConfig: func() {
+					api.Handlers[memberListRoute] = func(w http.ResponseWriter, r *http.Request) {
+						api.RemoveMember(testOrg, secondID) // removed elsewhere, after this list
+						fakeapi.WriteJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{
+							{"id": id, "org_id": testOrg, "email": "first-owner@example.com", "role": "owner", "created_at": "2026-09-23T00:00:01Z"},
+							{"id": secondID, "org_id": testOrg, "email": "second-owner@example.com", "role": "owner", "created_at": "2026-09-23T00:00:02Z"},
+						}})
+					}
+				},
+				Config: providerOnlyHCL,
+				ExpectError: summaryThenDetail("Cannot remove the organization's last owner",
+					"The organization's last owner cannot be removed or demoted — add another owner first",
+					"Add another owner first, then remove or replace this one in a later apply."),
+			},
+			{
+				PreConfig: func() {
+					delete(api.Handlers, memberListRoute)
+					if d := requestsMatching(api, http.MethodDelete, memberOneRE); len(d) != 1 {
+						t.Errorf("want exactly one DELETE (the one the API refused), got %d: %v", len(d), d)
+					}
+					if got := api.MemberRoles(testOrg)["first-owner@example.com"]; got != "owner" {
+						t.Errorf("fake role = %q, want the refused owner still present", got)
+					}
+					api.SeedMember(testOrg, "third-owner@example.com", "owner") // lets the teardown destroy pass
+				},
+				// State kept: the same configuration plans nothing.
+				Config: memberHCL("first-owner@example.com", "owner"), PlanOnly: true, ExpectNonEmptyPlan: false,
+			},
+		},
+	})
+}
+
+// Fails if the provider treats an address that differs from an existing
+// member's only in letter case as new, swallows the API's 409, or saves state
+// for the refused create. The existing member was stored with upper case out
+// of band (the API stores the address as written); the configuration uses the
+// lower-case form the provider requires.
+func TestMemberResource_CaseVariantOfAnExistingMemberSurfacesThe409AndSavesNothing(t *testing.T) {
+	api := setupFake(t)
+	api.SeedMember(testOrg, "Alice@Example.com", "viewer")
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		Steps: []resource.TestStep{
+			{Config: memberHCL("alice@example.com", "admin"), ExpectError: summaryThenDetail("Conflict", "Member already exists")},
+			{Config: providerOnlyHCL, PlanOnly: true, ExpectNonEmptyPlan: false},
+		},
+	})
+	if posts := requestsMatching(api, http.MethodPost, membersListRE); len(posts) != 1 {
+		t.Fatalf("want exactly one POST, got %d", len(posts))
+	}
+	if d := requestsMatching(api, http.MethodDelete, `.*`); len(d) != 0 {
+		t.Fatalf("a refused create left something to delete: %v", d)
+	}
+	if got := api.MemberRoles(testOrg); len(got) != 1 || got["Alice@Example.com"] != "viewer" {
+		t.Fatalf("fake members = %v, want only the pre-existing Alice@Example.com viewer", got)
+	}
+}
+
+// Fails if a 403 insufficient_role on a write is reported with the generic
+// "Aether API rejected the request ... Check api_token" diagnostic (the token
+// was accepted; its organization role is what is short), or without the
+// API's message. ExpectError cannot assert an absence, so the step's error is
+// inspected by the case's ErrorCheck instead.
+func TestMemberResource_InsufficientRoleOnAWriteSurfacesTheRoleDiagnosticNotTheTokenHint(t *testing.T) {
+	api := setupFake(t)
+	api.RefuseWritesForInsufficientRole()
+	var got error
+	resource.UnitTest(t, resource.TestCase{
+		IsUnitTest:               true,
+		ProtoV6ProviderFactories: factories(),
+		ErrorCheck: func(err error) error {
+			got = err
+			return nil
+		},
+		Steps: []resource.TestStep{{Config: memberHCL("alice@example.com", "viewer")}},
+	})
+	if got == nil {
+		t.Fatal("the apply succeeded although every write is refused")
+	}
+	msg := got.Error()
+	if re := summaryThenDetail("The API token's organization role does not allow this operation",
+		"Your role in this organization does not permit this action",
+		"Use an API token with the Admin role (Settings → API Tokens); changing a member's role is open to no token and must be done in the portal, signed in as an organization owner."); !re.MatchString(msg) {
+		t.Fatalf("error lacks the role diagnostic (%s):\n%s", re, msg)
+	}
+	for _, generic := range []string{"api_token", "Aether API rejected the request"} {
+		if strings.Contains(msg, generic) {
+			t.Fatalf("error carries the generic token diagnostic %q:\n%s", generic, msg)
+		}
+	}
+	if posts := requestsMatching(api, http.MethodPost, membersListRE); len(posts) != 1 {
+		t.Fatalf("want the one refused POST, got %d", len(posts))
+	}
+	if len(api.MemberRoles(testOrg)) != 0 {
+		t.Fatalf("fake members = %v, want none", api.MemberRoles(testOrg))
 	}
 }

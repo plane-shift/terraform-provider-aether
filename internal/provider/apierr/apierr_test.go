@@ -155,3 +155,125 @@ func TestToDiagnostics_NilHeaderParseOmitsRequestIDSuffix(t *testing.T) {
 		t.Fatalf("detail = %q, want no request id suffix when Parse was given a nil header", d[0].Detail())
 	}
 }
+
+// ---------------------------------------------------------------- organization role enforcement
+
+// The three refusals of aether-api's organization role enforcement, with the
+// messages the API sends (aether-api internal/api/middleware/org_authz.go and
+// internal/api/handler/member.go).
+const (
+	insufficientRoleBody  = `{"error":{"code":"insufficient_role","message":"Your role in this organization does not permit this action"}}`
+	tokenNotPermittedBody = `{"error":{"code":"token_not_permitted","message":"API tokens may not perform this action — use an owner or admin login"}}`
+	lastOwnerBody         = `{"error":{"code":"last_owner","message":"The organization's last owner cannot be removed or demoted — add another owner first"}}`
+)
+
+func oneDiag(t *testing.T, status int, h http.Header, body string) diag.Diagnostic {
+	t.Helper()
+	var d diag.Diagnostics
+	ToDiagnostics(Parse(status, h, []byte(body)), &d, path.Empty())
+	if len(d) != 1 {
+		t.Fatalf("diags = %v, want exactly one", d)
+	}
+	if d[0].Severity() != diag.SeverityError {
+		t.Fatalf("severity = %v, want error", d[0].Severity())
+	}
+	return d[0]
+}
+
+// Fails if one of the three role-enforcement refusals loses its dedicated
+// summary (e.g. falls back to the generic auth or Conflict diagnostic), if the
+// detail drops the API's own message, or if a present request id is not
+// surfaced.
+func TestToDiagnostics_RoleEnforcementRefusalsHaveDedicatedSummaries(t *testing.T) {
+	for _, c := range []struct {
+		name, body, summary, apiMessage string
+		status                          int
+	}{
+		{"403 insufficient_role", insufficientRoleBody,
+			"The API token's organization role does not allow this operation",
+			"Your role in this organization does not permit this action", http.StatusForbidden},
+		{"403 token_not_permitted", tokenNotPermittedBody,
+			"API tokens cannot perform this operation",
+			"API tokens may not perform this action — use an owner or admin login", http.StatusForbidden},
+		{"409 last_owner", lastOwnerBody,
+			"Cannot remove the organization's last owner",
+			"The organization's last owner cannot be removed or demoted — add another owner first", http.StatusConflict},
+	} {
+		t.Run(c.name+"/with request id", func(t *testing.T) {
+			d := oneDiag(t, c.status, headerWithRequestID("req-42"), c.body)
+			if d.Summary() != c.summary {
+				t.Fatalf("summary = %q, want %q", d.Summary(), c.summary)
+			}
+			if !strings.Contains(d.Detail(), c.apiMessage) {
+				t.Fatalf("detail = %q, want it to carry the API message %q", d.Detail(), c.apiMessage)
+			}
+			if !strings.Contains(d.Detail(), "(request id req-42)") {
+				t.Fatalf("detail = %q, want the request id surfaced", d.Detail())
+			}
+		})
+		t.Run(c.name+"/without request id", func(t *testing.T) {
+			d := oneDiag(t, c.status, http.Header{}, c.body)
+			if d.Summary() != c.summary {
+				t.Fatalf("summary = %q, want %q", d.Summary(), c.summary)
+			}
+			if !strings.Contains(d.Detail(), c.apiMessage) {
+				t.Fatalf("detail = %q, want it to carry the API message %q", d.Detail(), c.apiMessage)
+			}
+			if strings.Contains(d.Detail(), "(request id") {
+				t.Fatalf("detail = %q, want no request id suffix when the response carried no X-Request-Id header", d.Detail())
+			}
+		})
+	}
+}
+
+// Fails if a role-enforcement 403 still tells the practitioner to check
+// api_token: the token was accepted, so that hint points at the wrong thing.
+func TestToDiagnostics_RoleEnforcement403DetailsDoNotBlameTheToken(t *testing.T) {
+	for name, body := range map[string]string{"insufficient_role": insufficientRoleBody, "token_not_permitted": tokenNotPermittedBody} {
+		t.Run(name, func(t *testing.T) {
+			d := oneDiag(t, http.StatusForbidden, headerWithRequestID("req-1"), body)
+			if strings.Contains(d.Detail(), "api_token") {
+				t.Fatalf("detail = %q, must not send the practitioner to check api_token", d.Detail())
+			}
+		})
+	}
+}
+
+// Fails if the dedicated branches widen to codes they do not own: any other
+// 403 and every 401 keep the generic diagnostic with the api_token hint.
+func TestToDiagnostics_Other401And403KeepTheGenericTokenHint(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		status     int
+	}{
+		{"403 forbidden", `{"error":{"code":"forbidden","message":"no access to this organization for this token"}}`, http.StatusForbidden},
+		{"401 unauthorized", `{"error":{"code":"unauthorized","message":"invalid token"}}`, http.StatusUnauthorized},
+		// The code alone does not select the dedicated diagnostic: only a 403
+		// carrying it does.
+		{"401 token_not_permitted", tokenNotPermittedBody, http.StatusUnauthorized},
+		{"401 insufficient_role", insufficientRoleBody, http.StatusUnauthorized},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d := oneDiag(t, c.status, http.Header{}, c.body)
+			if d.Summary() != "Aether API rejected the request" {
+				t.Fatalf("summary = %q, want the generic %q", d.Summary(), "Aether API rejected the request")
+			}
+			if !strings.Contains(d.Detail(), "api_token") {
+				t.Fatalf("detail = %q, want the api_token hint", d.Detail())
+			}
+		})
+	}
+}
+
+// Fails if the last_owner branch swallows every 409, or if a last_owner code
+// on another status is rendered as the last-owner refusal.
+func TestToDiagnostics_Other409KeepsConflict(t *testing.T) {
+	d := oneDiag(t, http.StatusConflict, http.Header{}, `{"error":{"code":"conflict","message":"Member already exists"}}`)
+	if d.Summary() != "Conflict" || d.Detail() != "Member already exists" {
+		t.Fatalf("diag = %q / %q, want Conflict / the API message", d.Summary(), d.Detail())
+	}
+	d = oneDiag(t, http.StatusUnprocessableEntity, http.Header{}, lastOwnerBody)
+	if d.Summary() == "Cannot remove the organization's last owner" {
+		t.Fatalf("a 422 carrying last_owner was rendered as the 409 last-owner refusal: %q", d.Detail())
+	}
+}

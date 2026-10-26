@@ -86,7 +86,7 @@ func clusterDataAttributes(lookup bool) map[string]schema.Attribute {
 		"status_message":              computed("Human explanation accompanying the status, when the API offers one."),
 		"endpoint":                    computed("API server URL, once the cluster is provisioned far enough to report one."),
 		"observed_kubernetes_version": computed("Kubernetes version the control plane reports once a rollout settles."),
-		"capi_cluster_name":           computed("Internal Cluster API name of the cluster."),
+		"capi_cluster_name":           computed("Internal Cluster API name. For clusters created after 2026-10 it is `<organization slug>-<name>-<6 random lowercase alphanumerics>`; earlier clusters keep `<organization slug>-<name>`. Stored once, never recomputed."),
 		"keycloak_realm":              computed("Identity realm of the cluster."),
 		"harbor_project":              computed("Registry project associated with the cluster."),
 		"ceph_pool":                   computed("Storage pool of the cluster."),

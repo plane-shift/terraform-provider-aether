@@ -64,7 +64,7 @@ output "kubeconfig" {
 ### Required
 
 - `k8s_version` (String) `MAJOR.MINOR` (the platform resolves it to the latest offered patch) or an explicit `MAJOR.MINOR.PATCH` of an offered minor. A bare `1.37` is treated as equal to whichever `1.37.x` the platform resolved it to, so the resolved patch never shows as drift. Changes go through an in-place upgrade, which must move forward and be INCREMENTAL: a higher patch of the same minor, or exactly the next minor. A backwards move is refused at plan; a skipped minor is rejected by the API at apply. After `terraform import`, state holds the resolved `MAJOR.MINOR.PATCH`, so if the configuration says `MAJOR.MINOR` the first plan shows a one-time in-place update of the version spelling; applying it changes nothing in the platform (the provider only re-reads the cluster).
-- `name` (String) Cluster name. Changing it renames the cluster in place.
+- `name` (String) Cluster name. Changing it renames the cluster in place. The organization slug plus the name may not exceed 22 characters (the API answers 422 otherwise).
 - `region` (String) Region id from `data.aether_regions` (e.g. `eu-fi`). Changing it replaces the cluster.
 
 ### Optional
@@ -75,7 +75,7 @@ output "kubeconfig" {
 
 ### Read-Only
 
-- `capi_cluster_name` (String) Internal Cluster API name of the cluster.
+- `capi_cluster_name` (String) Internal Cluster API name. For clusters created after 2026-10 it is `<organization slug>-<name>-<6 random lowercase alphanumerics>`; earlier clusters keep `<organization slug>-<name>`. Stored once, never recomputed.
 - `ceph_pool` (String) Storage pool of the cluster.
 - `created_at` (String) Creation time (RFC 3339).
 - `endpoint` (String) API server URL, once the cluster is provisioned far enough to report one.

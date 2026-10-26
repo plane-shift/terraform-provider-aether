@@ -48,3 +48,50 @@ func Test_organizationMember_RoleDescriptionStatesOnlyTheLastOwnerIsProtected(t 
 		t.Fatalf("role description does not mention the last owner: %s", role)
 	}
 }
+
+// Fails if the resource description stops saying that member emails are
+// compared case-insensitively (a case variant of an existing member is
+// refused), or reverts to the retired claim that membership matches the login
+// email exactly. The email attribute must say the same.
+func Test_organizationMember_DescriptionsStateCaseInsensitiveEmails(t *testing.T) {
+	desc, _ := memberSchemaDescriptions(t)
+	const want = "Member emails are compared case-insensitively: adding an address that differs from an existing member's only in letter case is refused (409)."
+	if !strings.Contains(desc, want) {
+		t.Fatalf("resource description lacks the case-insensitive sentence verbatim:\n%s", desc)
+	}
+	var resp resource.SchemaResponse
+	NewOrganizationMemberResource().Schema(context.Background(), resource.SchemaRequest{}, &resp)
+	email := resp.Schema.Attributes["email"].GetMarkdownDescription()
+	if !strings.Contains(email, "The API compares member emails case-insensitively") {
+		t.Fatalf("email description does not state the case-insensitive comparison: %s", email)
+	}
+	for name, d := range map[string]string{"resource": desc, "email": email} {
+		if strings.Contains(d, "matches the login email exactly") {
+			t.Fatalf("%s description keeps the retired exact-match claim: %s", name, d)
+		}
+	}
+}
+
+// Fails if the resource description drops the instruction to revoke a removed
+// owner's API tokens (a token outlives the membership of whoever created it),
+// or the portal path where that is done.
+func Test_organizationMember_DescriptionTellsToRevokeARemovedOwnersTokens(t *testing.T) {
+	desc, _ := memberSchemaDescriptions(t)
+	const want = "An API token is not tied to the member who created it: after removing an owner " +
+		"(or replacing their membership with a lower role), revoke the API tokens they created in the portal (**Settings → API Tokens**)."
+	if !strings.Contains(desc, want) {
+		t.Fatalf("resource description lacks the revoke-tokens sentence verbatim:\n%s", desc)
+	}
+}
+
+// Fails if the resource description keeps the retired claim that the
+// platform has no last-owner guard, or stops naming the API's refusal.
+func Test_organizationMember_DescriptionNamesTheAPILastOwnerRefusal(t *testing.T) {
+	desc, _ := memberSchemaDescriptions(t)
+	if strings.Contains(desc, "has no guard") || strings.Contains(desc, "has no such guard") {
+		t.Fatalf("resource description keeps the retired no-guard claim:\n%s", desc)
+	}
+	if !strings.Contains(desc, "the API also refuses to remove the last owner (409 `last_owner`)") {
+		t.Fatalf("resource description does not name the API's 409 last_owner refusal:\n%s", desc)
+	}
+}

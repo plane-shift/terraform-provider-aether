@@ -30,11 +30,20 @@ same address on `registry.opentofu.org`. No other change is needed to switch eng
 
 ## Prerequisite: an API token
 
-Create an API token in the Aether portal (Settings → API Tokens) and pass it as
+Create an API token in the Aether portal (Settings → API Tokens). Choose the role **Admin** (the default): the provider manages members, including owners, and an admin token is the only role that may. Pass it as
 `api_token` or `AETHER_API_TOKEN`. A token belongs to one organization, and the provider
 manages that organization's resources (`organization_id` is resolved from the token; setting
 it explicitly is validated against the token). Tokens are created and revoked in the portal
 only — there is deliberately no `aether_api_token` resource.
+
+Only an organization **owner** can create an API token. The API enforces organization roles:
+a token acts with the role chosen when it is created (Viewer, Member or Admin; Admin is the
+default). The provider needs an Admin token because it manages members, including owners: it
+may add members with any role (`owner` included) and remove owners — except the last owner
+(`409 last_owner`). A token is not tied to the member who created it, so after removing an
+owner, revoke the tokens they created. Refusals surface as `The API token's organization role
+does not allow this operation` (`403 insufficient_role`) or `API tokens cannot perform this
+operation` (`403 token_not_permitted`), with the API message and request id in the detail. For `insufficient_role`, use an API token with the Admin role (Settings → API Tokens); changing a member's role is open to no token and must be done in the portal, signed in as an organization owner.
 
 ## Endpoint
 
@@ -65,7 +74,9 @@ the resource page before relying on these:
 - **`aether_cluster_network`** — creating it overwrites the portal policy; destroying it opens
   the endpoint to every source address.
 - **`aether_organization`** — import-only; **`aether_organization_member`** role changes replace
-  the membership and the last owner is protected.
+  the membership, the last owner cannot be removed (checked by the provider and refused by the
+  API), and emails are compared case-insensitively (a case variant of an existing member is a
+  `409`).
 - **`aether_webhook`** — the secret is returned only on create/rotation; rotate with `rotate_secret`.
 - **`aether_registry`** — destroying it deletes every robot account; images are deleted only with
   `purge_on_destroy`. Order robot accounts with `depends_on`.

@@ -31,6 +31,20 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 )
 
+// error.code values the provider renders with a dedicated diagnostic. They
+// come from the organization role enforcement in aether-api (the
+// Authorization section of api/openapi.yaml).
+const (
+	// CodeInsufficientRole: 403, the caller's organization role is below the
+	// operation's minimum.
+	CodeInsufficientRole = "insufficient_role"
+	// CodeTokenNotPermitted: 403, the operation refuses API-token callers.
+	CodeTokenNotPermitted = "token_not_permitted"
+	// CodeLastOwner: 409, the request would remove or demote the
+	// organization's last owner.
+	CodeLastOwner = "last_owner"
+)
+
 // FieldError is one entry of the 422 error.details list.
 type FieldError struct {
 	Field   string
@@ -116,6 +130,17 @@ func ToDiagnostics(err error, diags *diag.Diagnostics, attrPrefix path.Path) {
 		rid = " (request id " + e.RequestID + ")"
 	}
 	switch {
+	// Organization role enforcement (aether-api, Authorization section of
+	// api/openapi.yaml): these two 403 codes mean the token was ACCEPTED and
+	// the operation itself is not open to it, so "check api_token" would send
+	// the practitioner after the wrong thing. Matched on error.code; every
+	// other 401/403 keeps the token hint below.
+	case e.Status == http.StatusForbidden && e.Code == CodeInsufficientRole:
+		diags.AddError("The API token's organization role does not allow this operation",
+			fmt.Sprintf("%s%s. Use an API token with the Admin role (Settings → API Tokens); changing a member's role is open to no token and must be done in the portal, signed in as an organization owner.", e.Message, rid))
+	case e.Status == http.StatusForbidden && e.Code == CodeTokenNotPermitted:
+		diags.AddError("API tokens cannot perform this operation",
+			fmt.Sprintf("%s%s. Perform this operation in the portal, signed in with an account that has the required organization role.", e.Message, rid))
 	case e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden:
 		diags.AddError("Aether API rejected the request",
 			fmt.Sprintf("%d %s%s. Check api_token (created in the portal) and, if set, organization_id.", e.Status, e.Message, rid))
@@ -124,6 +149,9 @@ func ToDiagnostics(err error, diags *diag.Diagnostics, attrPrefix path.Path) {
 			diags.AddAttributeError(fieldPath(attrPrefix, f.Field), "Invalid value",
 				fmt.Sprintf("%s (%s)%s", f.Message, f.Code, rid))
 		}
+	case e.Status == http.StatusConflict && e.Code == CodeLastOwner:
+		diags.AddError("Cannot remove the organization's last owner",
+			fmt.Sprintf("%s%s. Add another owner first, then remove or replace this one in a later apply.", e.Message, rid))
 	case e.Status == http.StatusConflict:
 		diags.AddError("Conflict", e.Message+rid)
 	default:

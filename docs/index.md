@@ -11,7 +11,21 @@ Works with Terraform 1.5+ and OpenTofu 1.6+.
 
 ## Prerequisite: an API token
 
-Create a token in the Aether portal (Settings → API Tokens). The token belongs to one organization; the provider uses that organization for every resource. Tokens are managed in the portal only — this provider has no resource for them.
+Create a token in the Aether portal (Settings → API Tokens). Choose the role **Admin** (the default): the provider manages members, including owners, and an admin token is the only role that may. Only an organization **owner** can create API tokens. The token belongs to one organization; the provider uses that organization for every resource. Tokens are managed in the portal only — this provider has no resource for them.
+
+### What a token may do
+
+The API enforces organization roles on every request. An API token acts with the role chosen when it is created (Viewer, Member or Admin; Admin is the default). The provider needs an Admin token because it manages members, including owners: an Admin token may add a member with any role (`owner` included) and remove an owner — except the organization's last owner. A few operations are open only to a signed-in portal user; the API refuses them for any token. The provider reports refusals with a dedicated diagnostic:
+
+| Diagnostic | API answer | Meaning |
+|---|---|---|
+| `The API token's organization role does not allow this operation` | `403 insufficient_role` | The operation needs a higher organization role than the caller has. Use an API token with the Admin role (Settings → API Tokens); changing a member's role is open to no token and needs the portal, signed in as an owner. |
+| `API tokens cannot perform this operation` | `403 token_not_permitted` | The operation is open to signed-in portal users only. |
+| `Cannot remove the organization's last owner` | `409 last_owner` | Add another owner first, then remove or replace this one in a later apply. |
+
+The diagnostic detail carries the API's message and the request id; quote the request id when contacting support.
+
+An API token is not tied to the member who created it: removing that member, or lowering their role, leaves the token working. After removing an owner, revoke the API tokens they created (Settings → API Tokens).
 
 ## Endpoint
 
@@ -49,7 +63,7 @@ variable "aether_api_token" {
   default   = null # unset here so the provider falls back to AETHER_API_TOKEN
 }
 
-# Create an API token in the Aether portal first (Settings → API Tokens).
+# Create an API token in the Aether portal first (Settings → API Tokens). Role: Admin (the default).
 provider "aether" {
   api_token = var.aether_api_token # or AETHER_API_TOKEN
   # endpoint defaults to https://api.aetherplatform.cloud (production);
