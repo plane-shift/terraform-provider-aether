@@ -11,7 +11,7 @@ Works with Terraform 1.5+ and OpenTofu 1.6+.
 
 ## Prerequisite: an API token
 
-Create a token in the Aether portal (Settings → API Tokens). Only an organization **owner** can create API tokens. The token belongs to one organization; the provider uses that organization for every resource. Tokens are managed in the portal only — this provider has no resource for them.
+Create a token in the Aether portal (Settings → API Tokens). Choose the role **Admin** (the default): the provider manages members, including owners, and an admin token is the only role that may. Only an organization **owner** can create API tokens. The token belongs to one organization; the provider uses that organization for every resource. Tokens are managed in the portal only — this provider has no resource for them.
 
 ### What a token may do
 
@@ -63,7 +63,7 @@ variable "aether_api_token" {
   default   = null # unset here so the provider falls back to AETHER_API_TOKEN
 }
 
-# Create an API token in the Aether portal first (Settings → API Tokens).
+# Create an API token in the Aether portal first (Settings → API Tokens). Role: Admin (the default).
 provider "aether" {
   api_token = var.aether_api_token # or AETHER_API_TOKEN
   # endpoint defaults to https://api.aetherplatform.cloud (production);
