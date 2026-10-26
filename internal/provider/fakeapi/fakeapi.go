@@ -173,7 +173,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	refuse := s.refuseWrites && r.Method != http.MethodGet && r.Method != http.MethodHead && !isPublicRoute(r.Method, path)
 	s.mu.Unlock()
 	if refuse {
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{"code": "insufficient_role", "message": insufficientRoleMessage}})
+		apiError(w, http.StatusForbidden, "insufficient_role", insufficientRoleMessage)
 		return
 	}
 	if h != nil {

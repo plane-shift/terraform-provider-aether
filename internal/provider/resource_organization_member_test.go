@@ -1041,7 +1041,7 @@ func TestMemberResource_InsufficientRoleOnAWriteSurfacesTheRoleDiagnosticNotTheT
 	msg := got.Error()
 	if re := summaryThenDetail("The API token's organization role does not allow this operation",
 		"Your role in this organization does not permit this action",
-		"Perform this operation in the portal, signed in as an organization owner."); !re.MatchString(msg) {
+		"Use an API token with the Admin role (Settings → API Tokens); changing a member's role is open to no token and must be done in the portal, signed in as an organization owner."); !re.MatchString(msg) {
 		t.Fatalf("error lacks the role diagnostic (%s):\n%s", re, msg)
 	}
 	for _, generic := range []string{"api_token", "Aether API rejected the request"} {

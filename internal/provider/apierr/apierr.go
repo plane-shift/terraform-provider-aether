@@ -137,7 +137,7 @@ func ToDiagnostics(err error, diags *diag.Diagnostics, attrPrefix path.Path) {
 	// other 401/403 keeps the token hint below.
 	case e.Status == http.StatusForbidden && e.Code == CodeInsufficientRole:
 		diags.AddError("The API token's organization role does not allow this operation",
-			fmt.Sprintf("%s%s. Perform this operation in the portal, signed in as an organization owner.", e.Message, rid))
+			fmt.Sprintf("%s%s. Use an API token with the Admin role (Settings → API Tokens); changing a member's role is open to no token and must be done in the portal, signed in as an organization owner.", e.Message, rid))
 	case e.Status == http.StatusForbidden && e.Code == CodeTokenNotPermitted:
 		diags.AddError("API tokens cannot perform this operation",
 			fmt.Sprintf("%s%s. Perform this operation in the portal, signed in with an account that has the required organization role.", e.Message, rid))

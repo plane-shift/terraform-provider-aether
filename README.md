@@ -42,7 +42,7 @@ may add members with any role (`owner` included) and remove owners — except th
 (`409 last_owner`). A token is not tied to the member who created it, so after removing an
 owner, revoke the tokens they created. Refusals surface as `The API token's organization role
 does not allow this operation` (`403 insufficient_role`) or `API tokens cannot perform this
-operation` (`403 token_not_permitted`), with the API message and request id in the detail.
+operation` (`403 token_not_permitted`), with the API message and request id in the detail. For `insufficient_role`, use an API token with the Admin role (Settings → API Tokens); changing a member's role is open to no token and must be done in the portal, signed in as an organization owner.
 
 ## Endpoint
 

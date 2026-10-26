@@ -19,7 +19,7 @@ The API enforces organization roles on every request. An organization API token 
 
 | Diagnostic | API answer | Meaning |
 |---|---|---|
-| `The API token's organization role does not allow this operation` | `403 insufficient_role` | The operation needs a higher organization role than the caller has. Perform it in the portal as an owner. |
+| `The API token's organization role does not allow this operation` | `403 insufficient_role` | The operation needs a higher organization role than the caller has. Use an API token with the Admin role (Settings → API Tokens); changing a member's role is open to no token and needs the portal, signed in as an owner. |
 | `API tokens cannot perform this operation` | `403 token_not_permitted` | The operation is open to signed-in portal users only. |
 | `Cannot remove the organization's last owner` | `409 last_owner` | Add another owner first, then remove or replace this one in a later apply. |
 
